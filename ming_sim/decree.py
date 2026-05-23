@@ -144,7 +144,7 @@ def resolve_directives(
 
     # 3) 结算 agent: 读邸报抽 JSON
     tlog("结算 3/4 结算 agent（抽 JSON）")
-    _emit("stage", "抽取数值结算")
+    _emit("stage", "数值推演结算")
     extractor = create_score_extractor_agent(llm_config, agno_db)
     sanitizer = create_json_sanitizer_agent(llm_config, agno_db)
     extractor_input = ""

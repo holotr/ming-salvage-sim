@@ -24,6 +24,16 @@ def _table(rows: List[Dict[str, object]], cols: List[str]) -> Dict[str, object]:
     }
 
 
+def _auto_table(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    """同 _table，但自动取首行 keys。空列表返回空 cols/rows。"""
+    if not rows:
+        return {"cols": [], "rows": []}
+    cols = list(rows[0].keys())
+    return _table(rows, cols)
+
+
+
+
 def simulate_season_with_agno(
     agent: Agent,
     state: GameState,
@@ -37,13 +47,12 @@ def simulate_season_with_agno(
     on_thinking: Optional[Callable[[str], None]] = None,
     on_text: Optional[Callable[[str], None]] = None,
 ) -> str:
-    """推演 agent: 输入一坨,输出一篇邸报纯文字。"""
+    """推演 agent: 全量盘面塞 user payload，无 tool。"""
     active = db.list_active_issues()
     issues_payload = [
         issue_to_payload(row, db.list_recent_issue_advances(int(row["id"]), 1))
         for row in active
     ]
-    # 程序已按 trigger 时间 / trigger_gate 阈值筛过的候选事件，交推演 agent 因果判定是否触发。
     candidate_events = [
         {
             "id": ev.id,
@@ -57,8 +66,6 @@ def simulate_season_with_agno(
         }
         for ev in gather_candidate_events(state, db)
     ]
-    # 全量快照单发：地区/军队/建筑全表用 header+二维数组塞进 payload，推演官不再调 tool。
-    # 去掉 21 次 tool round-trip 后每月推演 prompt 从 ~69k 降到 ~12k。
     region_rows = [
         dict(r) for r in db.conn.execute(
             "SELECT name,kind,population,public_support,unrest,natural_disaster,"
@@ -88,17 +95,13 @@ def simulate_season_with_agno(
         "previous_narrative_tail": previous_narrative[-1500:] if previous_narrative else "",
         "historical_anchor": historical_anchor_for_month(state.year, state.period),
         "victory_status": victory_status(db, state),
-        "regions": _table(region_rows, list(region_rows[0].keys()) if region_rows else []),
-        "armies": _table(army_rows, list(army_rows[0].keys()) if army_rows else []),
-        "buildings": db.building_payload(),
+        "regions": _auto_table(region_rows),
+        "armies": _auto_table(army_rows),
+        "buildings": _auto_table(db.building_payload()),
         "fixed_flows": fixed_flows or [],
         "deaths_this_turn": deaths_this_turn or [],
         "debuts_this_turn": debuts_this_turn or [],
-        "data_note": (
-            "以上为本月全量盘面：regions/armies 是 header+二维数组（cols 列名 + rows 数据），"
-            "buildings 是建筑全表。所有地区/军队/建筑/派系/阶级/外部势力数值均已在册，"
-            "直接据此写邸报，不需另查。"
-        ),
+        "data_note": "regions/armies/buildings 均为 header+二维数组（cols 列名 + rows 数据）。",
     }
     raw = run_agent_stream_text(
         agent,
@@ -118,17 +121,8 @@ def extract_scores_with_agno(
     decree_text: str = "",
     sanitizer: Optional[Agent] = None,
 ) -> tuple[Dict[str, object], str, str]:
-    """结算 agent: 读邸报抽 JSON。
-
-    返回 (解析后的 dict, extractor 原始输出串, extractor 输入 payload 串)，
-    后两项供调用方留痕到 turn_extractions。
-    """
+    """结算 agent: 读邸报抽 JSON。"""
     active = db.list_active_issues()
-
-    def _cond(r: sqlite3.Row, key: str) -> str:
-        keys = r.keys() if hasattr(r, "keys") else []
-        return r[key] if key in keys else ""
-
     issues_brief = [
         {
             "issue_id": int(r["id"]),
@@ -137,8 +131,8 @@ def extract_scores_with_agno(
             "inertia": int(r["inertia"]),
             "stage_text": r["stage_text"],
             "cancellable": r["cancellable"],
-            "resolve_condition": _cond(r, "resolve_condition") or "(未填)",
-            "fail_condition": _cond(r, "fail_condition") or "(未填)",
+            "resolve_condition": (r["resolve_condition"] if "resolve_condition" in r.keys() else "") or "(未填)",
+            "fail_condition": (r["fail_condition"] if "fail_condition" in r.keys() else "") or "(未填)",
         }
         for r in active
     ]
@@ -147,6 +141,31 @@ def extract_scores_with_agno(
     candidate_events = [
         {"id": ev.id, "title": ev.title}
         for ev in gather_candidate_events(state, db)
+    ]
+    region_rows = [
+        dict(r) for r in db.conn.execute(
+            "SELECT id,name,kind,population,public_support,unrest,natural_disaster,"
+            "human_disaster,registered_land,hidden_land,tax_per_turn,grain_security,"
+            "gentry_resistance,military_pressure,status FROM regions ORDER BY id"
+        ).fetchall()
+    ]
+    army_rows = [
+        dict(r) for r in db.conn.execute(
+            "SELECT id,name,station,theater,commander,controller,troop_type,manpower,"
+            "maintenance_per_turn,supply,morale,training,equipment,arrears,mobility,"
+            "loyalty,status FROM armies ORDER BY id"
+        ).fetchall()
+    ]
+    active_ministers = [
+        dict(r) for r in db.conn.execute(
+            "SELECT name,office,faction FROM characters WHERE status='active' ORDER BY name"
+        ).fetchall()
+    ]
+    offstage_ministers = [
+        dict(r) for r in db.conn.execute(
+            "SELECT name,office,faction,debut_year,debut_month "
+            "FROM characters WHERE status='offstage' ORDER BY name"
+        ).fetchall()
     ]
     payload = {
         "turn": {"year": state.year, "period": state.period, "turn": state.turn},
@@ -157,14 +176,21 @@ def extract_scores_with_agno(
         "current_state": dict(state.metrics),
         "factions": db.faction_report(),
         "classes": db.class_report(),
-        "external_powers": db.external_power_payload(),
+        "external_powers": _auto_table(db.external_power_payload()),
+        "regions": _auto_table(region_rows),
+        "armies": _auto_table(army_rows),
+        "buildings": _auto_table(db.building_payload()),
+        "active_ministers": _auto_table(active_ministers),
+        "offstage_ministers": _auto_table(offstage_ministers),
         "region_ids": region_ids,
         "army_ids": army_ids,
         "class_names": [r["name"] for r in db.conn.execute("SELECT DISTINCT name FROM classes ORDER BY name").fetchall()],
         "external_power_ids": [str(r["id"]) for r in db.conn.execute("SELECT id FROM external_powers").fetchall()],
         "fiscal_config": db.get_fiscal_config(),
+        "_format_note": "regions/armies/buildings/external_powers/active_ministers/offstage_ministers 均为 header+二维数组（cols 列名 + rows 数据）",
     }
     payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
+    tlog(f"[extractor] user payload total={len(payload_json)} chars (~{len(payload_json)//1.5:.0f} tok)")
     raw = run_agent_text(agent, payload_json, tag="extractor")
     try:
         return parse_agent_json(raw, "结算抽取"), raw, payload_json

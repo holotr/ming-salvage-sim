@@ -963,7 +963,7 @@ function SettlementLock({
       <div className="settlement-lock-card">
         <Loader2 className="settlement-spin" size={28} />
         <h2>月末结算中</h2>
-        <p>{stage ? `当前：${stage}` : "朝廷推演钱粮、地方、军务，请勿操作。"}</p>
+        <p>{stage === "数值推演结算" ? "档房核账中，钱粮、地方、军务落账，请稍候。" : stage ? `当前：${stage}` : "朝廷推演钱粮、地方、军务，请勿操作。"}</p>
         {thinking && (
           <div className="settlement-stream-block">
             <div className="settlement-stream-label">邸报房推敲</div>

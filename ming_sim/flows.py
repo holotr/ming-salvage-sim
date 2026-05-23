@@ -171,14 +171,15 @@ def apply_fixed_period_flows(db: GameDB, state: GameState) -> List[Dict[str, obj
 
     # ── 建筑：固定产出 + 固定维护（纯程序化，不调 LLM）─────────────────────────
     # buildings 表 maintenance/output_amount 已是月值，不过 monthly_amount。
-    # 产出按 condition/100 折算；钱粮类（国库/内库）统一走内库（皇庄/织造性质，归皇室），
-    # 民心/皇威直改量表。
+    # 产出按 condition/100 折算；output_metric 按建筑自报去向落（国库/内库/民心/皇威）。
+    # 维护按 category 分账：内廷类(皇庄/织造/御窑等) 扣内库；其它(财政/军事/民生/科技/交通) 扣国库。
     building_rows = db.conn.execute(
-        "SELECT id, name, condition, maintenance, output_metric, output_amount FROM buildings"
+        "SELECT id, name, category, condition, maintenance, output_metric, output_amount FROM buildings"
     ).fetchall()
     for row in building_rows:
         bid = str(row["id"])
         name = str(row["name"])
+        category = str(row["category"])
         condition = max(0, min(100, int(row["condition"])))
         maintenance = max(0, int(row["maintenance"]))
         metric = str(row["output_metric"])
@@ -187,8 +188,8 @@ def apply_fixed_period_flows(db: GameDB, state: GameState) -> List[Dict[str, obj
 
         if metric in ("国库", "内库"):
             if produced > 0:
-                db.record_issue_economy_move(state, "内库", produced, "建筑产出", f"{name}{TURN_UNIT}产出")
-                flows.append({"dir": "income", "account": "内库", "category": "建筑产出",
+                db.record_issue_economy_move(state, metric, produced, "建筑产出", f"{name}{TURN_UNIT}产出")
+                flows.append({"dir": "income", "account": metric, "category": "建筑产出",
                               "building": name, "amount": produced})
         elif metric in ("民心", "皇威"):
             if produced > 0:
@@ -198,9 +199,10 @@ def apply_fixed_period_flows(db: GameDB, state: GameState) -> List[Dict[str, obj
                               "building": name, "amount": state.metrics[metric] - before})
 
         if maintenance > 0:
-            paid = db.record_issue_economy_move(state, "内库", -maintenance, "建筑维护",
+            maint_account = "内库" if category == "内廷" else "国库"
+            paid = db.record_issue_economy_move(state, maint_account, -maintenance, "建筑维护",
                                                 f"{name}{TURN_UNIT}维护费")
-            flows.append({"dir": "expense", "account": "内库", "category": "建筑维护",
+            flows.append({"dir": "expense", "account": maint_account, "category": "建筑维护",
                           "building": name, "needed": maintenance, "paid": abs(paid),
                           "shortfall": maintenance - abs(paid)})
 

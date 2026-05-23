@@ -468,45 +468,71 @@ class GameDB:
         self.init_fiscal_config()
 
     def init_fiscal_config(self) -> None:
+        # base/rate 单位为季度万两/%。flows.py 用 monthly_amount(x)=round(x/3) 换月度。
+        # 开局目标：国库月净 ~-13 万、内库月净 ~+18 万；玩家主要破局点：
+        # 查隐田(田赋_rate↑)、加商税/钞关(商税_base↑)、查盐课(盐税_base↑)、减宗室(宗室禄米_rate↓)。
         rows = [
-            ("田赋_rate",    65,  "rate", "各省田赋实收率%，账面845×此率/100"),
-            ("辽饷_base",   130,  "base", "辽东加派月额，万两"),
-            ("辽饷_rate",    60,  "rate", "辽饷实收率%，地方截留严重"),
-            ("盐税_base",    55,  "base", "两淮两浙盐引月度定额，万两"),
+            ("田赋_rate",    68,  "rate", "各省田赋实收率%，账面845×此率/100。可升至 85（查隐田+清丈）"),
+            ("辽饷_base",   130,  "base", "辽东加派季额，万两"),
+            ("辽饷_rate",   100,  "rate", "辽饷实收率%"),
+            ("盐税_base",    70,  "base", "两淮两浙盐引季度定额，万两。查私盐可拉到 120"),
             ("盐税_rate",   100,  "rate", "盐税实收率%"),
-            ("商税_base",     8,  "base", "各地关卡店税月额，万两"),
+            ("商税_base",    22,  "base", "各地关卡店税季额，万两。加钞关/抽分可拉到 60"),
             ("商税_rate",   100,  "rate", "商税实收率%"),
-            ("宗室禄米_base", 80,  "base", "诸藩宗室禄米月度实发额，万两"),
-            ("宗室禄米_rate",100,  "rate", "宗室禄米发放率%"),
-            ("官俸_base",    35,  "base", "在京百官俸禄月额，万两"),
+            ("宗室禄米_base",100,  "base", "诸藩宗室禄米季度账面额，万两"),
+            ("宗室禄米_rate", 70,  "rate", "宗室禄米实发率%。砍宗室可降到 30~50"),
+            ("官俸_base",    35,  "base", "在京百官俸禄季额，万两"),
             ("官俸_rate",   100,  "rate", "官俸发放率%"),
-            ("工程_base",    22,  "base", "工部月度维护支出，万两"),
+            ("工程_base",    15,  "base", "工部季度维护支出，万两"),
             ("工程_rate",   100,  "rate", "工程维护率%"),
-            ("赈灾_base",    25,  "base", "制度性赈灾备用，万两"),
+            ("赈灾_base",    15,  "base", "制度性赈灾备用，万两"),
             ("赈灾_rate",   100,  "rate", "赈灾拨付率%"),
-            ("九边补给_base",130,  "base", "九边粮草月度补给（非军饷），万两"),
-            ("九边补给_rate",100,  "rate", "九边补给执行率%"),
-            ("皇庄_base",    18,  "base", "皇庄地租月度上缴内库，万两"),
+            ("九边补给_base",110,  "base", "九边粮草季度补给（非军饷），万两"),
+            ("九边补给_rate", 90,  "rate", "九边补给执行率%"),
+            ("皇庄_base",    60,  "base", "皇庄地租季度上缴内库，万两"),
             ("皇庄_rate",   100,  "rate", "皇庄收益率%"),
-            ("织造_base",    12,  "base", "苏杭织造局月度上缴内库，万两"),
+            ("织造_base",    35,  "base", "苏杭织造局季度上缴内库，万两"),
             ("织造_rate",   100,  "rate", "织造收益率%"),
-            ("矿税_base",     5,  "base", "矿税残余月额，万两"),
+            ("矿税_base",    10,  "base", "矿税残余季额，万两"),
             ("矿税_rate",   100,  "rate", "矿税实收率%"),
-            ("宫廷_base",    18,  "base", "皇室日常用度月额，万两"),
+            ("宫廷_base",    22,  "base", "皇室日常用度季额，万两"),
             ("宫廷_rate",   100,  "rate", "宫廷开支率%"),
-            ("内廷俸_base",  12,  "base", "太监宫女俸禄月额，万两"),
+            ("内廷俸_base",  15,  "base", "太监宫女俸禄季额，万两"),
             ("内廷俸_rate", 100,  "rate", "内廷俸禄率%"),
-            ("妃嫔_base",     8,  "base", "后宫妃嫔月度供奉，万两"),
+            ("妃嫔_base",    10,  "base", "后宫妃嫔季度供奉，万两"),
             ("妃嫔_rate",   100,  "rate", "妃嫔供奉率%"),
         ]
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO fiscal_config (key, value, kind, note) VALUES (?, ?, ?, ?)",
-            rows,
-        )
+        # schema 版本：旧 DB 用 INSERT OR IGNORE 保留玩家中途的 set_fiscal_config 改动；
+        # 默认值整体重平衡时升 SCHEMA_VERSION，旧库走 UPDATE 路径全量覆盖。
+        SCHEMA_VERSION = 2
+        cur_ver_row = self.conn.execute(
+            "SELECT value FROM fiscal_config WHERE key = '__schema_version'"
+        ).fetchone()
+        cur_ver = int(cur_ver_row["value"]) if cur_ver_row else 0
+        if cur_ver < SCHEMA_VERSION:
+            for key, value, kind, note in rows:
+                self.conn.execute(
+                    "INSERT INTO fiscal_config (key, value, kind, note) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, note=excluded.note",
+                    (key, value, kind, note),
+                )
+            self.conn.execute(
+                "INSERT INTO fiscal_config (key, value, kind, note) VALUES "
+                "('__schema_version', ?, 'meta', '财政默认值大版本号，升即重置玩家未改动的默认值') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (SCHEMA_VERSION,),
+            )
+        else:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO fiscal_config (key, value, kind, note) VALUES (?, ?, ?, ?)",
+                rows,
+            )
         self.conn.commit()
 
     def get_fiscal_config(self) -> Dict[str, int]:
-        rows = self.conn.execute("SELECT key, value FROM fiscal_config").fetchall()
+        rows = self.conn.execute(
+            "SELECT key, value FROM fiscal_config WHERE key NOT LIKE '\\_\\_%' ESCAPE '\\'"
+        ).fetchall()
         return {str(r["key"]): int(r["value"]) for r in rows}
 
     def set_fiscal_config(self, key: str, value: int) -> None:
@@ -1059,36 +1085,62 @@ class GameDB:
         land_base = self.conn.execute("SELECT SUM(tax_per_turn) FROM regions").fetchone()[0] or 0
         army_total = self.conn.execute("SELECT SUM(maintenance_per_turn) FROM armies").fetchone()[0] or 0
         gk_in = (
-            round(land_base * cfg.get("田赋_rate", 65) / 100)
-            + round(cfg.get("辽饷_base", 130) * cfg.get("辽饷_rate", 60) / 100)
-            + round(cfg.get("盐税_base", 55) * cfg.get("盐税_rate", 100) / 100)
-            + round(cfg.get("商税_base", 8) * cfg.get("商税_rate", 100) / 100)
+            round(land_base * cfg.get("田赋_rate", 68) / 100)
+            + round(cfg.get("辽饷_base", 130) * cfg.get("辽饷_rate", 100) / 100)
+            + round(cfg.get("盐税_base", 70) * cfg.get("盐税_rate", 100) / 100)
+            + round(cfg.get("商税_base", 22) * cfg.get("商税_rate", 100) / 100)
         )
         gk_out = (
             int(army_total)
-            + round(cfg.get("宗室禄米_base", 80) * cfg.get("宗室禄米_rate", 100) / 100)
+            + round(cfg.get("宗室禄米_base", 100) * cfg.get("宗室禄米_rate", 70) / 100)
             + round(cfg.get("官俸_base", 35) * cfg.get("官俸_rate", 100) / 100)
-            + round(cfg.get("工程_base", 22) * cfg.get("工程_rate", 100) / 100)
-            + round(cfg.get("赈灾_base", 25) * cfg.get("赈灾_rate", 100) / 100)
-            + round(cfg.get("九边补给_base", 130) * cfg.get("九边补给_rate", 100) / 100)
+            + round(cfg.get("工程_base", 15) * cfg.get("工程_rate", 100) / 100)
+            + round(cfg.get("赈灾_base", 15) * cfg.get("赈灾_rate", 100) / 100)
+            + round(cfg.get("九边补给_base", 110) * cfg.get("九边补给_rate", 90) / 100)
         )
         nk_in = (
-            round(cfg.get("皇庄_base", 18) * cfg.get("皇庄_rate", 100) / 100)
-            + round(cfg.get("织造_base", 12) * cfg.get("织造_rate", 100) / 100)
-            + round(cfg.get("矿税_base", 5) * cfg.get("矿税_rate", 100) / 100)
+            round(cfg.get("皇庄_base", 60) * cfg.get("皇庄_rate", 100) / 100)
+            + round(cfg.get("织造_base", 35) * cfg.get("织造_rate", 100) / 100)
+            + round(cfg.get("矿税_base", 10) * cfg.get("矿税_rate", 100) / 100)
         )
         nk_out = (
-            round(cfg.get("宫廷_base", 18) * cfg.get("宫廷_rate", 100) / 100)
-            + round(cfg.get("内廷俸_base", 12) * cfg.get("内廷俸_rate", 100) / 100)
-            + round(cfg.get("妃嫔_base", 8) * cfg.get("妃嫔_rate", 100) / 100)
+            round(cfg.get("宫廷_base", 22) * cfg.get("宫廷_rate", 100) / 100)
+            + round(cfg.get("内廷俸_base", 15) * cfg.get("内廷俸_rate", 100) / 100)
+            + round(cfg.get("妃嫔_base", 10) * cfg.get("妃嫔_rate", 100) / 100)
         )
-        gk_net = gk_in - gk_out
-        nk_net = nk_in - nk_out
+        # 建筑：maintenance/output_amount 已是月值，不过 monthly_amount。
+        # 维护按 category 分账：内廷扣内库，其它扣国库。产出按 output_metric 走。
+        build_rows = self.conn.execute(
+            "SELECT category, condition, maintenance, output_metric, output_amount FROM buildings"
+        ).fetchall()
+        b_gk_out = b_nk_out = b_gk_in = b_nk_in = 0
+        for r in build_rows:
+            maint = max(0, int(r["maintenance"]))
+            if str(r["category"]) == "内廷":
+                b_nk_out += maint
+            else:
+                b_gk_out += maint
+            metric = str(r["output_metric"])
+            cond = max(0, min(100, int(r["condition"])))
+            out = max(0, int(r["output_amount"]))
+            produced = round(out * cond / 100) if metric and out else 0
+            if metric == "国库":
+                b_gk_in += produced
+            elif metric == "内库":
+                b_nk_in += produced
+
+        gk_net = monthly_amount(gk_in) + b_gk_in - monthly_amount(gk_out) - b_gk_out
+        nk_net = monthly_amount(nk_in) + b_nk_in - monthly_amount(nk_out) - b_nk_out
         return (
-            f"{TURN_UNIT}度预算基准：国库入{format_money(monthly_amount(gk_in))}（田赋+辽饷+盐税+商税）"
-            f"出{format_money(monthly_amount(gk_out))}（军饷{format_money(monthly_amount(int(army_total)))}+宗室+官俸+补给）"
-            f"净{format_money_delta(monthly_amount(gk_net))}；"
-            f"内库入{format_money(monthly_amount(nk_in))}出{format_money(monthly_amount(nk_out))}净{format_money_delta(monthly_amount(nk_net))}。"
+            f"{TURN_UNIT}度预算基准：国库入{format_money(monthly_amount(gk_in) + b_gk_in)}"
+            f"（田赋+辽饷+盐税+商税+建筑产出{format_money(b_gk_in)}）"
+            f"出{format_money(monthly_amount(gk_out) + b_gk_out)}"
+            f"（军饷{format_money(monthly_amount(int(army_total)))}+宗室+官俸+补给+建筑维护{format_money(b_gk_out)}）"
+            f"净{format_money_delta(gk_net)}；"
+            f"内库入{format_money(monthly_amount(nk_in) + b_nk_in)}"
+            f"出{format_money(monthly_amount(nk_out) + b_nk_out)}"
+            f"（内廷维护{format_money(b_nk_out)}）"
+            f"净{format_money_delta(nk_net)}。"
         )
 
     def treasury_report(self, state: GameState, limit: int = 6) -> str:

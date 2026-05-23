@@ -242,13 +242,8 @@ def create_season_simulator_agent(
     state: Optional[GameState] = None,
     db: Optional[object] = None,
 ) -> Agent:
-    """月末推演日讲官。
-
-    全量盘面（地区/军队/建筑/派系/阶级/外部势力）由 simulate_season_with_agno 单发塞进
-    payload，推演官不再挂只读 tool —— 去掉 tool round-trip 后每月 prompt 从 ~69k 降到 ~12k。
-    state/db 参数保留兼容旧调用，已不使用。
-    """
-    del state, db  # 全量盘面走 payload，不再建 tool
+    """月末推演日讲官。全量盘面走 user payload，无 tool。"""
+    del state, db
     return Agent(
         name="月末推演日讲官",
         id="season-simulator",
@@ -262,8 +257,6 @@ def create_season_simulator_agent(
 
 
 def create_score_extractor_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agent:
-    # 走 OpenAI 兼容 response_format=json_object（deepseek/qwen 均支持），
-    # API 层保证输出合法 JSON——免去 sanitizer/parser 多级容错负担。
     return Agent(
         name="档房书办",
         id="score-extractor",
@@ -273,7 +266,7 @@ def create_score_extractor_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Ag
             llm_config,
             temperature=0.1,
             top_p=0.7,
-            max_tokens=8000,
+            max_tokens=10000,
             enable_thinking=False,
             force_json_output=True,
         ),
