@@ -4325,9 +4325,8 @@ function ApiSettingsModal({
     setBusy(true);
     setErr("");
     try {
-      const response = await fetch("/api/menu/llm", {
+      await api("/api/menu/llm", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base_url: baseUrl.trim(),
           model: model.trim(),
@@ -4339,15 +4338,10 @@ function ApiSettingsModal({
           advanced_api_key: advancedApiKey.trim(),
         }),
       });
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({ detail: response.statusText }));
-        const detail = normalizeApiError(payload, response.statusText);
-        setErr(`code: ${detail.code || "unknown"}\nmessage: ${detail.message || response.statusText}`);
-        return;
-      }
       await onSaved();
-    } catch (e: any) {
-      setErr(`code: request_failed\nmessage: ${e?.message || String(e)}`);
+    } catch (e) {
+      const detail = e instanceof ApiRequestError ? e.detail : null;
+      setErr(detail ? `code: ${detail.code || "unknown"}\nmessage: ${detail.message || String(e)}` : `code: request_failed\nmessage: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(false);
     }
