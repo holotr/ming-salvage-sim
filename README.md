@@ -32,7 +32,7 @@
 - 一个可用于 AI 对话的 API Key
 
 ```bash
-git clone https://github.com/wangwei-ying3/ming-salvage-sim.git
+git clone https://github.com/holotr/ming-salvage-sim.git
 cd ming-salvage-sim
 
 python3 -m venv .venv
@@ -72,6 +72,44 @@ python3 -m uvicorn web_app:app --host 127.0.0.1 --port 8010
 打开 <http://127.0.0.1:8010>。
 
 第一次打开会要求创建管理员账号。创建后进入菜单，在「设置 API」里填写 DeepSeek/OpenAI 兼容接口；API Key 会加密保存到 `data/app_auth.db`，不会回传到前端。若旧版 `data/runtime_llm.json` 里已有明文 Key，首次创建管理员时会迁入该管理员账号并清除旧文件里的明文。
+
+## Docker / GHCR
+
+主线会通过 GitHub Actions 构建并推送 Docker 镜像到 GHCR：
+
+```text
+ghcr.io/holotr/ming-salvage-sim:latest
+```
+
+镜像标签规则：
+
+- `latest` / `main`：每次推送 `main` 自动更新。
+- `sha-<commit>`：每次构建对应的提交镜像。
+- `vX.Y.Z` / `X.Y.Z` / `X.Y`：推送版本 tag 时生成。
+
+本机或服务器运行：
+
+```bash
+export MING_SIM_SECRET_KEY="换成固定的32字节base64主密钥"
+export MING_SIM_SETUP_TOKEN="换成首次创建管理员的一次性口令"
+
+docker run -d \
+  --name ming-salvage-sim \
+  --restart unless-stopped \
+  -p 8010:8010 \
+  -v ming-salvage-data:/app/data \
+  -e MING_SIM_SECRET_KEY \
+  -e MING_SIM_SETUP_TOKEN \
+  ghcr.io/holotr/ming-salvage-sim:latest
+```
+
+`MING_SIM_SECRET_KEY` 必须长期固定并备份；它丢失后，数据库里的用户 API Key 将无法解密。公网部署建议放在 HTTPS 反代后面。
+
+也可以本地构建：
+
+```bash
+docker build -t ming-salvage-sim .
+```
 
 也可以跑纯文本版本：
 
