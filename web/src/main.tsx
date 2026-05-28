@@ -289,11 +289,31 @@ type ChatResponse = {
   secret_order_id?: number;
 };
 
+const cookieValue = (name: string) => {
+  const item = document.cookie.split("; ").find((part) => part.startsWith(`${name}=`));
+  return item ? decodeURIComponent(item.slice(name.length + 1)) : "";
+};
+
+const csrfHeaders = (): Record<string, string> => {
+  const token = cookieValue("csrf_token");
+  return token ? { "X-CSRF-Token": token } : {};
+};
+
 const api = async <T,>(path: string, options?: RequestInit): Promise<T> => {
+  const method = (options?.method || "GET").toUpperCase();
+  const headers = new Headers(options?.headers || undefined);
+  headers.set("Content-Type", "application/json");
+  if (method !== "GET" && method !== "HEAD") {
+    for (const [key, value] of Object.entries(csrfHeaders())) headers.set(key, value);
+  }
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options?.headers || {}) },
     ...options,
+    credentials: "include",
+    headers,
   });
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent("ming-auth-unauthorized"));
+  }
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: response.statusText }));
     throw new Error(error.detail || response.statusText);
@@ -323,9 +343,13 @@ const streamChat = async (
 ): Promise<ChatResponse> => {
   const response = await fetch(`/api/ministers/${encodeURIComponent(ministerName)}/chat/stream`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
     body: JSON.stringify({ message }),
   });
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent("ming-auth-unauthorized"));
+  }
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: response.statusText }));
     throw new Error(error.detail || response.statusText);
@@ -467,7 +491,26 @@ const getMapIntelStyle = (node: MapNode): React.CSSProperties => {
   return style;
 };
 
-type AppView = "menu" | "game";
+type AppView = "loading" | "setup" | "login" | "menu" | "game";
+
+type AuthUser = {
+  id: number;
+  username: string;
+  role: "admin" | "user";
+  status: string;
+};
+
+type AuthInfo = {
+  authenticated: boolean;
+  requires_setup: boolean;
+  user: AuthUser | null;
+};
+
+type AdminUser = AuthUser & {
+  created_at: number;
+  updated_at: number;
+  last_login_at: number;
+};
 
 type MenuStatus = {
   has_api_key: boolean;
@@ -486,7 +529,8 @@ type MenuStatus = {
 };
 
 function App() {
-  const [appView, setAppView] = React.useState<AppView>("menu");
+  const [appView, setAppView] = React.useState<AppView>("loading");
+  const [currentUser, setCurrentUser] = React.useState<AuthUser | null>(null);
   const [menuStatus, setMenuStatus] = React.useState<MenuStatus | null>(null);
   const [state, setState] = React.useState<GameState | null>(null);
   const [selectedNodeId, setSelectedNodeId] = React.useState<string>("");
@@ -549,6 +593,8 @@ function App() {
     form.append("file", file);
     const resp = await fetch(`/api/consorts/${encodeURIComponent(ministerName)}/portrait`, {
       method: "POST",
+      credentials: "include",
+      headers: csrfHeaders(),
       body: form,
     });
     if (!resp.ok) {
@@ -564,16 +610,45 @@ function App() {
     return s;
   }, []);
 
-  React.useEffect(() => {
-    refreshMenuStatus()
-      .then((s) => {
-        if (s.has_running_game) {
-          setAppView("game");
-          loadState().catch((err) => setError(err.message));
-        }
-      })
-      .catch((err) => setError(err.message));
+  const enterForAuthenticatedUser = React.useCallback(async (user: AuthUser) => {
+    setCurrentUser(user);
+    setAppView("menu");
+    const s = await refreshMenuStatus();
+    if (s.has_running_game) {
+      setAppView("game");
+      await loadState();
+    }
   }, [refreshMenuStatus, loadState]);
+
+  React.useEffect(() => {
+    api<AuthInfo>("/api/auth/me")
+      .then(async (info) => {
+        if (info.requires_setup) {
+          setAppView("setup");
+          return;
+        }
+        if (!info.authenticated || !info.user) {
+          setAppView("login");
+          return;
+        }
+        await enterForAuthenticatedUser(info.user);
+      })
+      .catch((err) => {
+        setError(err.message);
+        setAppView("login");
+      });
+  }, [enterForAuthenticatedUser]);
+
+  React.useEffect(() => {
+    const handler = () => {
+      setCurrentUser(null);
+      setState(null);
+      setMenuStatus(null);
+      setAppView("login");
+    };
+    window.addEventListener("ming-auth-unauthorized", handler);
+    return () => window.removeEventListener("ming-auth-unauthorized", handler);
+  }, []);
 
   const enterGameAfterMenu = React.useCallback(async () => {
     setAppView("game");
@@ -581,11 +656,19 @@ function App() {
   }, [loadState]);
 
   const exitToMenu = React.useCallback(async () => {
-    await fetch("/api/menu/exit_to_menu", { method: "POST" });
+    await fetch("/api/menu/exit_to_menu", { method: "POST", credentials: "include", headers: csrfHeaders() });
     setState(null);
     setAppView("menu");
     await refreshMenuStatus();
   }, [refreshMenuStatus]);
+
+  const logout = React.useCallback(async () => {
+    await api<{ ok: boolean }>("/api/auth/logout", { method: "POST" }).catch(() => ({ ok: true }));
+    setCurrentUser(null);
+    setState(null);
+    setMenuStatus(null);
+    setAppView("login");
+  }, []);
 
   React.useEffect(() => {
     if (!state) return;
@@ -666,12 +749,33 @@ function App() {
     return () => window.removeEventListener("keydown", handler);
   }, [activeModal, drawerOpen, haremDrawerOpen, mapIntelOpen]);
 
+  if (appView === "loading") {
+    return (
+      <div className="loading-screen">
+        <div className="loading-panel">
+          <Crown size={28} />
+          <p>正在校验登录状态...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (appView === "setup") {
+    return <SetupPage error={error} setError={setError} onAuthed={enterForAuthenticatedUser} />;
+  }
+
+  if (appView === "login") {
+    return <LoginPage error={error} setError={setError} onAuthed={enterForAuthenticatedUser} />;
+  }
+
   if (appView === "menu") {
     return (
       <MenuPage
         status={menuStatus}
+        user={currentUser}
         onRefresh={refreshMenuStatus}
         onEnterGame={enterGameAfterMenu}
+        onLogout={logout}
         error={error}
         setError={setError}
       />
@@ -913,7 +1017,11 @@ function App() {
     setSettleNarrative("");
     setError("");
     try {
-      const response = await fetch("/api/decree/issue/stream", { method: "POST" });
+      const response = await fetch("/api/decree/issue/stream", {
+        method: "POST",
+        credentials: "include",
+        headers: csrfHeaders(),
+      });
       if (!response.ok || !response.body) {
         throw new Error(`颁诏失败：HTTP ${response.status}`);
       }
@@ -1270,7 +1378,7 @@ function defaultCourtPct(index: number, total: number): { px: number; py: number
 // 坐标存百分比（0-1），持久化到服务端 db（按存档隔离）
 async function loadCourtPos(): Promise<Record<string, { px: number; py: number }>> {
   try {
-    const r = await fetch("/api/court_layout");
+    const r = await fetch("/api/court_layout", { credentials: "include" });
     if (!r.ok) return {};
     const d = await r.json();
     return JSON.parse(d.layout || "{}");
@@ -1279,7 +1387,8 @@ async function loadCourtPos(): Promise<Record<string, { px: number; py: number }
 function saveCourtPos(pos: Record<string, { px: number; py: number }>) {
   fetch("/api/court_layout", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
     body: JSON.stringify({ layout: JSON.stringify(pos) }),
   }).catch(() => {});
 }
@@ -2133,7 +2242,7 @@ function ExtractionModal({ onClose }: { onClose: () => void }) {
     let alive = true;
     (async () => {
       try {
-        const resp = await fetch("/api/turn_extraction");
+        const resp = await fetch("/api/turn_extraction", { credentials: "include" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         if (alive) setExtraction(data);
@@ -2205,7 +2314,7 @@ function HistoryModal({ onClose }: { onClose: () => void }) {
     let alive = true;
     (async () => {
       try {
-        const resp = await fetch("/api/history/turns");
+        const resp = await fetch("/api/history/turns", { credentials: "include" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         if (!alive) return;
@@ -2228,7 +2337,7 @@ function HistoryModal({ onClose }: { onClose: () => void }) {
     setDetailError("");
     (async () => {
       try {
-        const resp = await fetch(`/api/history/turn/${selectedTurn}`);
+        const resp = await fetch(`/api/history/turn/${selectedTurn}`, { credentials: "include" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         if (alive) setDetail(data);
@@ -2538,7 +2647,7 @@ function ShutdownTab() {
     setBusy(true);
     setErr("");
     try {
-      await fetch("/api/menu/shutdown", { method: "POST" });
+      await fetch("/api/menu/shutdown", { method: "POST", credentials: "include", headers: csrfHeaders() });
       // server 已发 SIGTERM 给自己；前端尝试关页面（浏览器可能拦截），否则提示用户。
       setTimeout(() => {
         try { window.close(); } catch { /* noop */ }
@@ -2660,7 +2769,7 @@ function LLMConfigTab() {
       setInfo((cur) => (cur ? { ...cur, ...data } : null));
       setApiKey("");
       setAdvancedApiKey("");
-      setMsg("已生效并写入 data/runtime_llm.json。");
+      setMsg("已生效，并已加密保存到当前账号。");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -2672,7 +2781,7 @@ function LLMConfigTab() {
     <section className="menu-section">
       <h3>LLM 配置</h3>
       <p className="menu-hint">
-        立即生效并写入 <code>data/runtime_llm.json</code>，重启进程后自动加载。api_key 留空保留当前。
+        立即生效并加密保存到当前账号。api_key 留空保留当前。
       </p>
       <label className="menu-field">
         <span>Base URL</span>
@@ -3885,22 +3994,140 @@ function Info({ label, value, tone }: { label: string; value: React.ReactNode; t
   );
 }
 
+function SetupPage({
+  error,
+  setError,
+  onAuthed,
+}: {
+  error: string;
+  setError: (msg: string) => void;
+  onAuthed: (user: AuthUser) => Promise<void>;
+}) {
+  const [setupToken, setSetupToken] = React.useState("");
+  const [username, setUsername] = React.useState("admin");
+  const [password, setPassword] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  const submit = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api<{ user: AuthUser; migrated_runtime_llm: boolean }>("/api/auth/setup", {
+        method: "POST",
+        body: JSON.stringify({ setup_token: setupToken, username, password }),
+      });
+      await onAuthed(data.user);
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="menu-screen">
+      <div className="menu-panel">
+        <h1 className="menu-title">初始化管理员</h1>
+        <p className="menu-subtitle">首次公网部署需要先创建管理员账号</p>
+        {error && <div className="menu-error">{error}</div>}
+        <label className="menu-field">
+          <span>Setup Token</span>
+          <input className="menu-input" type="password" value={setupToken} onChange={(e) => setSetupToken(e.target.value)} />
+        </label>
+        <label className="menu-field">
+          <span>用户名</span>
+          <input className="menu-input" value={username} onChange={(e) => setUsername(e.target.value)} />
+        </label>
+        <label className="menu-field">
+          <span>密码</span>
+          <input className="menu-input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        <div className="menu-buttons">
+          <button className="menu-btn primary" disabled={busy || !setupToken || !username || password.length < 8} onClick={submit}>
+            {busy ? "创建中..." : "创建管理员"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoginPage({
+  error,
+  setError,
+  onAuthed,
+}: {
+  error: string;
+  setError: (msg: string) => void;
+  onAuthed: (user: AuthUser) => Promise<void>;
+}) {
+  const [username, setUsername] = React.useState("");
+  const [password, setPassword] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  const submit = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api<{ user: AuthUser }>("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ username, password }),
+      });
+      await onAuthed(data.user);
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="menu-screen">
+      <div className="menu-panel">
+        <h1 className="menu-title">明末力挽狂澜</h1>
+        <p className="menu-subtitle">登录后进入你的存档与 API 配置</p>
+        {error && <div className="menu-error">{error}</div>}
+        <label className="menu-field">
+          <span>用户名</span>
+          <input className="menu-input" value={username} onChange={(e) => setUsername(e.target.value)} />
+        </label>
+        <label className="menu-field">
+          <span>密码</span>
+          <input className="menu-input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => {
+            if (e.key === "Enter" && username && password) submit();
+          }} />
+        </label>
+        <div className="menu-buttons">
+          <button className="menu-btn primary" disabled={busy || !username || !password} onClick={submit}>
+            {busy ? "登录中..." : "登录"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MenuPage({
   status,
+  user,
   onRefresh,
   onEnterGame,
+  onLogout,
   error,
   setError,
 }: {
   status: MenuStatus | null;
+  user: AuthUser | null;
   onRefresh: () => Promise<MenuStatus>;
   onEnterGame: () => Promise<void>;
+  onLogout: () => Promise<void>;
   error: string;
   setError: (msg: string) => void;
 }) {
   const [busy, setBusy] = React.useState<string>("");
   const [showApiForm, setShowApiForm] = React.useState(false);
   const [showSaveList, setShowSaveList] = React.useState(false);
+  const [showUsers, setShowUsers] = React.useState(false);
 
   const guard = async (label: string, fn: () => Promise<void>) => {
     setBusy(label);
@@ -3942,6 +4169,7 @@ function MenuPage({
       <div className="menu-panel">
         <h1 className="menu-title">明末力挽狂澜</h1>
         <p className="menu-subtitle">崇祯元年正月 · 召大臣议天下事</p>
+        <div className="menu-llm-info">当前账号：{user?.username || "未登录"}{user?.role === "admin" ? " · 管理员" : ""}</div>
 
         {!hasKey && (
           <div className="menu-notice">尚未配置 API 接口。请先「设置 API」。</div>
@@ -3960,6 +4188,14 @@ function MenuPage({
           </button>
           <button className="menu-btn" disabled={!!busy} onClick={() => setShowApiForm(true)}>
             设置 API {hasKey ? "" : "（必需）"}
+          </button>
+          {user?.role === "admin" && (
+            <button className="menu-btn" disabled={!!busy} onClick={() => setShowUsers(true)}>
+              用户管理
+            </button>
+          )}
+          <button className="menu-btn" disabled={!!busy} onClick={onLogout}>
+            退出登录
           </button>
         </div>
 
@@ -3991,6 +4227,10 @@ function MenuPage({
             await onLoadSave(name);
           }}
         />
+      )}
+
+      {showUsers && user?.role === "admin" && (
+        <AdminUsersModal onClose={() => setShowUsers(false)} />
       )}
     </div>
   );
@@ -4051,7 +4291,7 @@ function ApiSettingsModal({
     <div className="menu-modal-bg" onClick={onClose}>
       <div className="menu-modal" onClick={(e) => e.stopPropagation()}>
         <h2>设置 API</h2>
-        <p className="menu-hint">推荐 DeepSeek（中文好、价格便宜）。配置写入本地，不上传。</p>
+        <p className="menu-hint">推荐 DeepSeek。API Key 会加密保存到当前账号，只在服务端调用模型时解密使用。</p>
         <label>
           Base URL
           <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.deepseek.com" />
@@ -4087,6 +4327,97 @@ function ApiSettingsModal({
           <button className="primary" onClick={onSave} disabled={busy || !baseUrl.trim() || !model.trim() || (!apiKey.trim() && !initial?.has_api_key)}>
             {busy ? "保存中..." : "保存"}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdminUsersModal({ onClose }: { onClose: () => void }) {
+  const [users, setUsers] = React.useState<AdminUser[]>([]);
+  const [username, setUsername] = React.useState("");
+  const [password, setPassword] = React.useState("");
+  const [role, setRole] = React.useState<"user" | "admin">("user");
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState("");
+
+  const load = React.useCallback(async () => {
+    const data = await api<{ users: AdminUser[] }>("/api/admin/users");
+    setUsers(data.users);
+  }, []);
+
+  React.useEffect(() => {
+    load().catch((e) => setErr(e instanceof Error ? e.message : String(e)));
+  }, [load]);
+
+  const createUser = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      const data = await api<{ users: AdminUser[] }>("/api/admin/users", {
+        method: "POST",
+        body: JSON.stringify({ username, password, role }),
+      });
+      setUsers(data.users);
+      setUsername("");
+      setPassword("");
+      setRole("user");
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setStatus = async (userId: number, status: "active" | "disabled") => {
+    setBusy(true);
+    setErr("");
+    try {
+      const data = await api<{ users: AdminUser[] }>(`/api/admin/users/${userId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status }),
+      });
+      setUsers(data.users);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="menu-modal-bg" onClick={onClose}>
+      <div className="menu-modal" onClick={(e) => e.stopPropagation()}>
+        <h2>用户管理</h2>
+        {err && <div className="menu-error">{err}</div>}
+        <div className="menu-row">
+          <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="用户名" />
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="初始密码" />
+          <select value={role} onChange={(e) => setRole(e.target.value as "user" | "admin")}>
+            <option value="user">用户</option>
+            <option value="admin">管理员</option>
+          </select>
+          <button className="primary" disabled={busy || username.length < 3 || password.length < 8} onClick={createUser}>创建</button>
+        </div>
+        <ul className="menu-save-list">
+          {users.map((u) => (
+            <li key={u.id}>
+              <div>
+                <span className="save-name">{u.username} · {u.role}</span>
+                <span className="save-meta">{u.status === "active" ? "启用" : "禁用"} · 上次登录 {u.last_login_at ? new Date(u.last_login_at * 1000).toLocaleString("zh-CN") : "从未"}</span>
+              </div>
+              <div className="saves-actions">
+                {u.status === "active" ? (
+                  <button className="menu-btn danger" disabled={busy} onClick={() => setStatus(u.id, "disabled")}>禁用</button>
+                ) : (
+                  <button className="menu-btn primary" disabled={busy} onClick={() => setStatus(u.id, "active")}>启用</button>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+        <div className="menu-modal-actions">
+          <button onClick={onClose}>关闭</button>
         </div>
       </div>
     </div>
