@@ -24,6 +24,7 @@ SESSION_DAYS_DEFAULT = 7
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_TOKENS = 8000
+DEFAULT_TIMEOUT_SECONDS = 180.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class AuthStore:
                     base_url TEXT NOT NULL,
                     model TEXT NOT NULL,
                     max_tokens INTEGER NOT NULL DEFAULT 8000,
+                    timeout_seconds REAL NOT NULL DEFAULT 180,
                     advanced_model TEXT NOT NULL DEFAULT '',
                     advanced_base_url TEXT NOT NULL DEFAULT '',
                     encrypted_api_key TEXT NOT NULL DEFAULT '',
@@ -105,6 +107,14 @@ class AuthStore:
                 );
                 """
             )
+            try:
+                self.conn.execute(
+                    "ALTER TABLE user_llm_configs "
+                    "ADD COLUMN timeout_seconds REAL NOT NULL DEFAULT 180"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
             self.conn.commit()
 
     def has_users(self) -> bool:
@@ -344,6 +354,7 @@ class AuthStore:
                 "base_url": DEFAULT_BASE_URL,
                 "model": DEFAULT_MODEL,
                 "max_tokens": DEFAULT_MAX_TOKENS,
+                "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
                 "advanced_model": "",
                 "advanced_base_url": "",
                 "has_api_key": False,
@@ -360,6 +371,7 @@ class AuthStore:
             "base_url": str(row["base_url"] or DEFAULT_BASE_URL),
             "model": str(row["model"] or DEFAULT_MODEL),
             "max_tokens": int(row["max_tokens"] or DEFAULT_MAX_TOKENS),
+            "timeout_seconds": float(row["timeout_seconds"] or DEFAULT_TIMEOUT_SECONDS),
             "advanced_model": str(row["advanced_model"] or ""),
             "advanced_base_url": str(row["advanced_base_url"] or ""),
             "has_api_key": bool(row["encrypted_api_key"]),
@@ -375,6 +387,7 @@ class AuthStore:
             base_url=normalize_openai_base_url(str(cfg["base_url"] or DEFAULT_BASE_URL)),
             model=str(cfg["model"] or DEFAULT_MODEL),
             max_tokens=int(cfg["max_tokens"] or DEFAULT_MAX_TOKENS),
+            timeout_seconds=float(cfg["timeout_seconds"] or DEFAULT_TIMEOUT_SECONDS),
             advanced_model=str(cfg["advanced_model"] or ""),
             advanced_base_url=normalize_openai_base_url(str(cfg["advanced_base_url"]))
             if str(cfg["advanced_base_url"] or "").strip()
@@ -391,6 +404,7 @@ class AuthStore:
         model: str,
         api_key: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         advanced_model: str = "",
         advanced_base_url: str = "",
         advanced_api_key: Optional[str] = None,
@@ -416,15 +430,16 @@ class AuthStore:
                 self.conn.execute(
                     """
                     INSERT INTO user_llm_configs
-                        (user_id, base_url, model, max_tokens, advanced_model, advanced_base_url,
+                        (user_id, base_url, model, max_tokens, timeout_seconds, advanced_model, advanced_base_url,
                          encrypted_api_key, encrypted_advanced_api_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         int(user_id),
                         clean_base,
                         clean_model,
                         int(max_tokens or DEFAULT_MAX_TOKENS),
+                        float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS),
                         (advanced_model or "").strip(),
                         clean_adv_base,
                         encrypted_api_key or "",
@@ -438,6 +453,7 @@ class AuthStore:
                     "base_url = ?",
                     "model = ?",
                     "max_tokens = ?",
+                    "timeout_seconds = ?",
                     "advanced_model = ?",
                     "advanced_base_url = ?",
                     "updated_at = ?",
@@ -446,6 +462,7 @@ class AuthStore:
                     clean_base,
                     clean_model,
                     int(max_tokens or DEFAULT_MAX_TOKENS),
+                    float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS),
                     (advanced_model or "").strip(),
                     clean_adv_base,
                     int(time.time()),

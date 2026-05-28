@@ -245,6 +245,7 @@ type LLMConfigInfo = {
   base_url: string;
   model: string;
   max_tokens: number;
+  timeout_seconds: number;
   advanced_model: string;
   advanced_base_url: string;
   has_advanced_api_key: boolean;
@@ -254,6 +255,7 @@ type LLMConfigInfo = {
     model: string;
     has_api_key: boolean;
     max_tokens: number;
+    timeout_seconds: number;
     advanced_model: string;
     advanced_base_url: string;
     has_advanced_api_key: boolean;
@@ -299,6 +301,42 @@ const csrfHeaders = (): Record<string, string> => {
   return token ? { "X-CSRF-Token": token } : {};
 };
 
+type ApiErrorDetail = {
+  code?: string;
+  message?: string;
+  provider_message?: string;
+  status_code?: number | null;
+};
+
+class ApiRequestError extends Error {
+  detail: ApiErrorDetail;
+
+  constructor(detail: ApiErrorDetail, fallback: string) {
+    const message = detail.message || fallback;
+    super(detail.code ? `[${detail.code}] ${message}` : message);
+    this.name = "ApiRequestError";
+    this.detail = detail;
+  }
+}
+
+const normalizeApiError = (error: any, fallback: string): ApiErrorDetail => {
+  const detail = error?.detail ?? error;
+  if (detail && typeof detail === "object") {
+    return {
+      code: detail.code,
+      message: detail.message || detail.detail || fallback,
+      provider_message: detail.provider_message,
+      status_code: detail.status_code,
+    };
+  }
+  return { message: String(detail || fallback) };
+};
+
+const formatApiError = (error: any, fallback: string) => {
+  const detail = error instanceof ApiRequestError ? error.detail : normalizeApiError(error, fallback);
+  return detail.code ? `[${detail.code}] ${detail.message || fallback}` : detail.message || fallback;
+};
+
 const api = async <T,>(path: string, options?: RequestInit): Promise<T> => {
   const method = (options?.method || "GET").toUpperCase();
   const headers = new Headers(options?.headers || undefined);
@@ -316,7 +354,7 @@ const api = async <T,>(path: string, options?: RequestInit): Promise<T> => {
   }
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(error.detail || response.statusText);
+    throw new ApiRequestError(normalizeApiError(error, response.statusText), response.statusText);
   }
   return response.json();
 };
@@ -352,7 +390,7 @@ const streamChat = async (
   }
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(error.detail || response.statusText);
+    throw new ApiRequestError(normalizeApiError(error, response.statusText), response.statusText);
   }
   if (!response.body) {
     throw new Error("浏览器不支持流式回复。");
@@ -377,7 +415,7 @@ const streamChat = async (
       } else if (parsed.event === "done") {
         return payload as ChatResponse;
       } else if (parsed.event === "error") {
-        throw new Error(payload.message || "流式回复失败。");
+        throw new ApiRequestError(normalizeApiError(payload, "流式回复失败。"), "流式回复失败。");
       }
     }
 
@@ -522,6 +560,7 @@ type MenuStatus = {
     model: string;
     has_api_key: boolean;
     max_tokens: number;
+    timeout_seconds: number;
     advanced_model: string;
     advanced_base_url: string;
     has_advanced_api_key: boolean;
@@ -2494,7 +2533,8 @@ function SaveTab() {
       setName("");
       await refresh();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      const detail = e instanceof ApiRequestError ? e.detail : null;
+      setErr(detail ? `code: ${detail.code || "unknown"}\nmessage: ${detail.message || (e instanceof Error ? e.message : String(e))}` : e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -2731,6 +2771,7 @@ function LLMConfigTab() {
   const [advancedApiKey, setAdvancedApiKey] = React.useState("");
   const [apiKey, setApiKey] = React.useState("");
   const [maxTokens, setMaxTokens] = React.useState("8000");
+  const [timeoutSeconds, setTimeoutSeconds] = React.useState("180");
   const [show, setShow] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [msg, setMsg] = React.useState("");
@@ -2745,6 +2786,7 @@ function LLMConfigTab() {
         setAdvancedModel(data.advanced_model || "");
         setAdvancedBaseUrl(data.advanced_base_url || "");
         setMaxTokens(String(data.max_tokens || 8000));
+        setTimeoutSeconds(String(data.timeout_seconds || 180));
       })
       .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
   }, []);
@@ -2761,6 +2803,7 @@ function LLMConfigTab() {
           model,
           api_key: apiKey,
           max_tokens: parseInt(maxTokens) || 8000,
+          timeout_seconds: parseFloat(timeoutSeconds) || 180,
           advanced_model: advancedModel,
           advanced_base_url: advancedBaseUrl,
           advanced_api_key: advancedApiKey.trim() ? advancedApiKey : "__keep__",
@@ -2771,7 +2814,8 @@ function LLMConfigTab() {
       setAdvancedApiKey("");
       setMsg("已生效，并已加密保存到当前账号。");
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      const detail = e instanceof ApiRequestError ? e.detail : null;
+      setErr(detail ? `code: ${detail.code || "unknown"}\nmessage: ${detail.message || (e instanceof Error ? e.message : String(e))}` : e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -2846,6 +2890,18 @@ function LLMConfigTab() {
           value={maxTokens}
           onChange={(e) => setMaxTokens(e.target.value)}
           placeholder="8000"
+        />
+      </label>
+      <label className="menu-field">
+        <span>Timeout Seconds</span>
+        <input
+          className="menu-input"
+          type="number"
+          min={10}
+          max={900}
+          value={timeoutSeconds}
+          onChange={(e) => setTimeoutSeconds(e.target.value)}
+          placeholder="180"
         />
       </label>
       <label className="menu-field">
@@ -4246,6 +4302,7 @@ function ApiSettingsModal({
     model: string;
     has_api_key: boolean;
     max_tokens?: number;
+    timeout_seconds?: number;
     advanced_model?: string;
     advanced_base_url?: string;
     has_advanced_api_key?: boolean;
@@ -4260,6 +4317,7 @@ function ApiSettingsModal({
   const [advancedApiKey, setAdvancedApiKey] = React.useState("");
   const [apiKey, setApiKey] = React.useState("");
   const [maxTokens, setMaxTokens] = React.useState(String(initial?.max_tokens || 8000));
+  const [timeoutSeconds, setTimeoutSeconds] = React.useState(String(initial?.timeout_seconds || 180));
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState("");
 
@@ -4267,21 +4325,29 @@ function ApiSettingsModal({
     setBusy(true);
     setErr("");
     try {
-      await api("/api/menu/llm", {
+      const response = await fetch("/api/menu/llm", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base_url: baseUrl.trim(),
           model: model.trim(),
           api_key: apiKey.trim(),
           max_tokens: parseInt(maxTokens) || 8000,
+          timeout_seconds: parseFloat(timeoutSeconds) || 180,
           advanced_model: advancedModel.trim(),
           advanced_base_url: advancedBaseUrl.trim(),
           advanced_api_key: advancedApiKey.trim(),
         }),
       });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({ detail: response.statusText }));
+        const detail = normalizeApiError(payload, response.statusText);
+        setErr(`code: ${detail.code || "unknown"}\nmessage: ${detail.message || response.statusText}`);
+        return;
+      }
       await onSaved();
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(`code: request_failed\nmessage: ${e?.message || String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -4316,6 +4382,10 @@ function ApiSettingsModal({
         <label>
           Max Tokens
           <input type="number" min={256} max={65536} value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} placeholder="8000" />
+        </label>
+        <label>
+          Timeout Seconds
+          <input type="number" min={10} max={900} value={timeoutSeconds} onChange={(e) => setTimeoutSeconds(e.target.value)} placeholder="180" />
         </label>
         <label>
           API Key

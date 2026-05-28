@@ -77,7 +77,6 @@ def choose_minister(session: GameSession) -> Optional[Character]:
                 c for c in characters.values()
                 if raw in c.name or raw in c.office or raw in c.office_type
                 or raw in c.faction or raw in c.aliases
-                or any(raw in skill for skill in c.personal_skills)
             ]
             if len(matches) == 1:
                 candidate = matches[0]
@@ -422,6 +421,7 @@ def run_cli(
     advanced_model: str = "",
     advanced_base_url: str = "",
     advanced_api_key: str = "",
+    timeout_seconds: float = 180.0,
 ) -> None:
     """CLI 主循环：建 GameSession，逐回合 play_turn。"""
     from ming_sim.llm_config import load_llm_config
@@ -437,6 +437,7 @@ def run_cli(
             advanced_model=advanced_model,
             advanced_base_url=advanced_base_url,
             advanced_api_key=advanced_api_key,
+            timeout_seconds=timeout_seconds,
         )
         import os
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)

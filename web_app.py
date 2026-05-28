@@ -69,6 +69,77 @@ def _user_path(user_id: int, *parts: str) -> str:
     return str(target)
 
 
+def _delete_sqlite_db_files_or_raise(db_path: str) -> None:
+    """删除 SQLite 主库及 WAL/SHM；失败时阻断重开，避免误读旧档。"""
+    for suffix in ("", "-wal", "-shm"):
+        target = db_path + suffix
+        if not os.path.exists(target):
+            continue
+        if not os.path.isfile(target):
+            raise HTTPException(
+                status_code=500,
+                detail=f"重开失败：无法清理主库文件 {target}，它不是普通文件。请检查该路径后再重试。",
+            )
+        try:
+            os.remove(target)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"重开失败：权限不足，无法删除主库文件 {target}。"
+                    "请关闭占用该文件的程序，或用管理员权限运行游戏后重试。"
+                ),
+            ) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"重开失败：无法删除主库文件 {target}。系统返回：{exc}。"
+                    "请确认没有其他游戏进程占用该文件；若是权限问题，请用管理员权限运行游戏后重试。"
+                ),
+            ) from exc
+
+
+def _verify_llm_configs_or_raise(config: LLMConfig) -> None:
+    """校验主模型；若配置了 advanced_model，也用其实际 base/key 单独校验。"""
+    try:
+        verify_llm_available(config)
+    except LLMUnavailable as e:
+        raise HTTPException(status_code=400, detail=_llm_error_detail(e, "主模型连通性检查失败：")) from None
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=_llm_error_detail(e, "主模型连通性检查失败：")) from None
+
+    advanced_model = (config.advanced_model or "").strip()
+    if not advanced_model:
+        return
+    advanced_config = LLMConfig(
+        api_key=(config.advanced_api_key or "").strip() or config.api_key,
+        base_url=(config.advanced_base_url or "").strip() or config.base_url,
+        model=advanced_model,
+        max_tokens=config.max_tokens,
+        timeout_seconds=config.timeout_seconds,
+        advanced_model=config.advanced_model,
+        advanced_base_url=config.advanced_base_url,
+        advanced_api_key=config.advanced_api_key,
+    )
+    try:
+        verify_llm_available(advanced_config)
+    except LLMUnavailable as e:
+        raise HTTPException(status_code=400, detail=_llm_error_detail(e, "高级模型连通性检查失败：")) from None
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=_llm_error_detail(e, "高级模型连通性检查失败：")) from None
+
+
+def _llm_error_detail(exc: Exception, prefix: str = "") -> Dict[str, Any]:
+    message = f"{prefix}{exc.message if hasattr(exc, 'message') else str(exc)}"
+    return {
+        "code": getattr(exc, "code", "llm_error"),
+        "message": message,
+        "provider_message": getattr(exc, "provider_message", str(exc)),
+        "status_code": getattr(exc, "status_code", None),
+    }
+
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -105,13 +176,7 @@ class WebGame:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self.db_path = db_path
         if fresh:
-            for suffix in ("", "-wal", "-shm"):
-                target = db_path + suffix
-                if os.path.isfile(target):
-                    try:
-                        os.remove(target)
-                    except OSError:
-                        pass
+            _delete_sqlite_db_files_or_raise(db_path)
         self.session = GameSession(db_path, llm_config)
         self.session.begin_turn()
         # 召对记录持久化在 chat_messages 表，启动时恢复进内存缓存。
@@ -133,10 +198,11 @@ class WebGame:
 
     def list_saves(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        campaign_id = (self.db.kv_get("campaign_id") or "").strip()
         for fname in sorted(os.listdir(self.saves_dir())):
             if not fname.endswith(".db"):
                 continue
-            if fname.startswith(AUTO_SAVE_PREFIX):
+            if not _save_visible_for_campaign(fname, campaign_id):
                 continue
             full = os.path.join(self.saves_dir(), fname)
             try:
@@ -177,13 +243,7 @@ class WebGame:
             self.session.close()
         except Exception:
             pass
-        for suffix in ("", "-wal", "-shm"):
-            target = self.db_path + suffix
-            if os.path.isfile(target):
-                try:
-                    os.remove(target)
-                except OSError:
-                    pass
+        _delete_sqlite_db_files_or_raise(self.db_path)
         self._rebuild_session(self.session.llm_config)
 
     def load_save(self, name: str) -> None:
@@ -228,6 +288,7 @@ class WebGame:
         model: str,
         api_key: str,
         max_tokens: int = 0,
+        timeout_seconds: float = 0,
         advanced_model: Optional[str] = None,
         advanced_base_url: Optional[str] = None,
         advanced_api_key: Optional[str] = None,
@@ -236,6 +297,7 @@ class WebGame:
         new_model = model.strip() or self.session.llm_config.model
         new_key = api_key.strip() or self.session.llm_config.api_key
         new_max = max_tokens if max_tokens > 0 else self.session.llm_config.max_tokens
+        new_timeout = timeout_seconds if timeout_seconds > 0 else self.session.llm_config.timeout_seconds
         # advanced_* = None 表示不动；传空串表示显式清空。
         if advanced_model is None:
             new_advanced = self.session.llm_config.advanced_model
@@ -255,11 +317,12 @@ class WebGame:
             base_url=base,
             model=new_model,
             max_tokens=new_max,
+            timeout_seconds=new_timeout,
             advanced_model=new_advanced,
             advanced_base_url=new_adv_base,
             advanced_api_key=new_adv_key,
         )
-        verify_llm_available(new_config)
+        _verify_llm_configs_or_raise(new_config)
         auth_store.save_llm_config(
             self.user_id,
             get_secret_store(),
@@ -267,6 +330,7 @@ class WebGame:
             model=new_config.model,
             api_key=new_config.api_key,
             max_tokens=new_config.max_tokens,
+            timeout_seconds=new_config.timeout_seconds,
             advanced_model=new_config.advanced_model,
             advanced_base_url=new_config.advanced_base_url,
             advanced_api_key=new_config.advanced_api_key if advanced_api_key is not None else None,
@@ -790,7 +854,10 @@ class WebGame:
             )
             yield {"type": "done", "payload": payload}
         except Exception as error:
-            yield {"type": "error", "message": str(error)}
+            if isinstance(error, LLMUnavailable):
+                yield {"type": "error", "detail": _llm_error_detail(error)}
+            else:
+                yield {"type": "error", "message": str(error)}
 
     def suggestions_for(self, character: Character) -> List[Dict[str, str]]:
         suggestions = [
@@ -921,16 +988,41 @@ async def csrf_middleware(request: Request, call_next):
             _request_user.reset(user_token)
 
 
+def _save_visible_for_campaign(fname: str, campaign_id: str) -> bool:
+    if not fname.startswith(AUTO_SAVE_PREFIX):
+        return True
+    campaign_id = (campaign_id or "").strip()
+    return bool(campaign_id and fname.startswith(f"{AUTO_SAVE_PREFIX}{campaign_id}_"))
+
+
+def _main_db_campaign_id(user_id: int) -> str:
+    db_path = _user_path(user_id, "ming_sim.db")
+    if not os.path.isfile(db_path):
+        return ""
+    try:
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(db_path)
+        try:
+            row = conn.execute("SELECT value FROM kv_store WHERE key='campaign_id'").fetchone()
+            return str(row[0]).strip() if row and row[0] else ""
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+
+
 def _scan_saves(user_id: int) -> List[Dict[str, Any]]:
     """扫存档目录，独立于 WebGame 实例（菜单页无 game 也要能列）。"""
     saves_dir = os.path.dirname(_user_path(user_id, "saves", "_keep"))
     out: List[Dict[str, Any]] = []
     if not os.path.isdir(saves_dir):
         return out
+    campaign_id = _main_db_campaign_id(user_id)
     for fname in sorted(os.listdir(saves_dir)):
         if not fname.endswith(".db"):
             continue
-        if fname.startswith(AUTO_SAVE_PREFIX):
+        if not _save_visible_for_campaign(fname, campaign_id):
             continue
         full = os.path.join(saves_dir, fname)
         try:
@@ -991,6 +1083,7 @@ def _migrate_runtime_llm_to_user(user_id: int, store: SecretStore) -> bool:
         model=runtime.get("model") or DEFAULT_MODEL,
         api_key=runtime.get("api_key") or "",
         max_tokens=int(runtime.get("max_tokens") or DEFAULT_MAX_TOKENS),
+        timeout_seconds=float(runtime.get("timeout_seconds") or 180),
         advanced_model=runtime.get("advanced_model") or "",
         advanced_base_url=runtime.get("advanced_base_url") or "",
         advanced_api_key=runtime.get("advanced_api_key") or "",
@@ -1000,6 +1093,7 @@ def _migrate_runtime_llm_to_user(user_id: int, store: SecretStore) -> bool:
         runtime.get("model") or DEFAULT_MODEL,
         "",
         int(runtime.get("max_tokens") or DEFAULT_MAX_TOKENS),
+        float(runtime.get("timeout_seconds") or 180),
         runtime.get("advanced_model") or "",
         runtime.get("advanced_base_url") or "",
         "",
@@ -1112,6 +1206,7 @@ async def api_menu_status(user: AuthUser = Depends(require_user)) -> Dict[str, A
             "model": llm.get("model") or DEFAULT_MODEL,
             "has_api_key": has_api_key,
             "max_tokens": int(llm.get("max_tokens") or DEFAULT_MAX_TOKENS),
+            "timeout_seconds": float(llm.get("timeout_seconds") or 180),
             "advanced_model": llm.get("advanced_model") or "",
             "advanced_base_url": llm.get("advanced_base_url") or "",
             "has_advanced_api_key": bool(llm.get("has_advanced_api_key")),
@@ -1131,8 +1226,10 @@ async def api_menu_new_game(user: AuthUser = Depends(require_user)) -> Dict[str,
     try:
         game = WebGame(user, auth_store.build_llm_config(user.id, get_secret_store()), fresh=True)
         games_by_user_id[user.id] = game
-    except (LLMUnavailable, SecretStoreError) as exc:
-        raise HTTPException(status_code=412, detail=str(exc))
+    except SecretStoreError as exc:
+        raise HTTPException(status_code=412, detail=str(exc)) from None
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=412, detail=_llm_error_detail(exc)) from None
     return {"state": game.state_payload()}
 
 
@@ -1150,8 +1247,10 @@ async def api_menu_continue(user: AuthUser = Depends(require_user)) -> Dict[str,
     try:
         game = WebGame(user, auth_store.build_llm_config(user.id, get_secret_store()), fresh=False)
         games_by_user_id[user.id] = game
-    except (LLMUnavailable, SecretStoreError) as exc:
-        raise HTTPException(status_code=412, detail=str(exc))
+    except SecretStoreError as exc:
+        raise HTTPException(status_code=412, detail=str(exc)) from None
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=412, detail=_llm_error_detail(exc)) from None
     return {"state": game.state_payload()}
 
 
@@ -1166,8 +1265,10 @@ async def api_menu_load_save(name: str, user: AuthUser = Depends(require_user)) 
             pass
     try:
         game = WebGame(user, auth_store.build_llm_config(user.id, get_secret_store()), fresh=False)  # 先有 session 才能 load_save
-    except (LLMUnavailable, SecretStoreError) as exc:
-        raise HTTPException(status_code=412, detail=str(exc))
+    except SecretStoreError as exc:
+        raise HTTPException(status_code=412, detail=str(exc)) from None
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=412, detail=_llm_error_detail(exc)) from None
     game.load_save(name)
     games_by_user_id[user.id] = game
     return {"state": game.state_payload()}
@@ -1217,6 +1318,7 @@ class LlmSetupRequest(BaseModel):
     model: str
     api_key: str
     max_tokens: int = 8000
+    timeout_seconds: float = 180
     advanced_model: str = ""
     advanced_base_url: str = ""
     advanced_api_key: str = ""
@@ -1224,7 +1326,7 @@ class LlmSetupRequest(BaseModel):
 
 @app.post("/api/menu/llm")
 async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(require_user)) -> Dict[str, Any]:
-    """菜单页保存当前用户的 LLM 配置：加密落盘，不建 session（轻校验：非空即可）。"""
+    """菜单页保存当前用户的 LLM 配置：先校验，再加密落盘。"""
     base_url = (request.base_url or "").strip()
     model = (request.model or "").strip()
     api_key = (request.api_key or "").strip()
@@ -1233,6 +1335,7 @@ async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(r
     advanced_base_url = normalize_openai_base_url(adv_base_in) if adv_base_in else ""
     advanced_api_key = (request.advanced_api_key or "").strip()
     max_tokens = request.max_tokens if request.max_tokens > 0 else 8000
+    timeout_seconds = request.timeout_seconds if request.timeout_seconds > 0 else 180
     if not (base_url and model):
         raise HTTPException(status_code=400, detail="base_url / model 不能为空。")
     existing = auth_store.get_llm_config(user.id)
@@ -1241,14 +1344,38 @@ async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(r
     api_key_to_save: Optional[str] = api_key if api_key else None
     # advanced_api_key 留空：复用已存的（避免覆盖成空）。
     adv_key_to_save: Optional[str] = advanced_api_key if advanced_api_key else None
+    normalized_base_url = normalize_openai_base_url(base_url)
+    try:
+        store = get_secret_store()
+        current_cfg = auth_store.build_llm_config(user.id, store) if existing.get("has_api_key") else None
+        config = LLMConfig(
+            api_key=api_key or (current_cfg.api_key if current_cfg else ""),
+            base_url=normalized_base_url,
+            model=model,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+            advanced_model=advanced_model,
+            advanced_base_url=advanced_base_url,
+            advanced_api_key=advanced_api_key or (current_cfg.advanced_api_key if current_cfg else ""),
+        )
+        _verify_llm_configs_or_raise(config)
+    except HTTPException:
+        raise
+    except SecretStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=400, detail=_llm_error_detail(exc)) from None
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail={"code": "llm_validation_failed", "message": str(exc)}) from None
     try:
         auth_store.save_llm_config(
             user.id,
-            get_secret_store(),
-            base_url=base_url,
+            store,
+            base_url=normalized_base_url,
             model=model,
             api_key=api_key_to_save,
             max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
             advanced_model=advanced_model,
             advanced_base_url=advanced_base_url,
             advanced_api_key=adv_key_to_save,
@@ -1266,10 +1393,11 @@ async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(r
     return {
         "ok": True,
         "llm": {
-            "base_url": normalize_openai_base_url(base_url),
+            "base_url": normalized_base_url,
             "model": model,
             "has_api_key": True,
             "max_tokens": max_tokens,
+            "timeout_seconds": timeout_seconds,
             "advanced_model": advanced_model,
             "advanced_base_url": advanced_base_url,
             "has_advanced_api_key": bool(saved_llm.get("has_advanced_api_key")),
@@ -1437,7 +1565,7 @@ async def api_chat_stream(minister_name: str, request: ChatRequest) -> Streaming
             elif item_type == "done":
                 yield sse_event("done", item.get("payload", {}))
             elif item_type == "error":
-                yield sse_event("error", {"message": item.get("message", "流式回复失败。")})
+                yield sse_event("error", item.get("detail") or {"message": item.get("message", "流式回复失败。")})
             await asyncio.sleep(0)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -1541,7 +1669,7 @@ async def api_issue_decree_stream() -> StreamingResponse:
         except ValueError as e:
             ev_queue.put(("__error__", str(e)))
         except Exception as e:  # noqa: BLE001
-            ev_queue.put(("__error__", str(e)))
+            ev_queue.put(("__error__", _llm_error_detail(e) if isinstance(e, LLMUnavailable) else str(e)))
 
     async def generate() -> AsyncIterator[str]:
         thread = threading.Thread(target=worker, daemon=True)
@@ -1553,7 +1681,7 @@ async def api_issue_decree_stream() -> StreamingResponse:
                 yield sse_event("done", data)
                 break
             if kind == "__error__":
-                yield sse_event("error", {"message": data})
+                yield sse_event("error", data if isinstance(data, dict) else {"message": data})
                 break
             # stage / thinking / text
             yield sse_event(kind, {"content": data})
@@ -1570,6 +1698,7 @@ class LLMConfigRequest(BaseModel):
     model: str = ""
     api_key: str = ""
     max_tokens: int = 0
+    timeout_seconds: float = 0
     # None=不动，""=显式清空，其他=覆写。pydantic v1 默认 None 走不进来；用 sentinel "__keep__"
     advanced_model: str = "__keep__"
     advanced_base_url: str = "__keep__"
@@ -1590,18 +1719,21 @@ async def api_consort_candidates() -> Dict[str, Any]:
 @app.post("/api/consorts/{name}/select")
 async def api_select_consort(name: str) -> Dict[str, Any]:
     """皇帝选中某秀女，转 active 并赋予初始位份。"""
-    consort = get_game().content.characters.get(name)
+    game = get_game()
+    consort = game.content.characters.get(name)
     if consort is None or consort.office_type != "后宫":
         raise HTTPException(status_code=404, detail=f"未找到候选秀女：{name}")
     if consort.status != "candidate":
         raise HTTPException(status_code=409, detail=f"{name} 当前状态为 {consort.status}，不可再选。")
-    # 转 active
+    game.db.set_character_office(name, "嫔", "后宫", source="皇帝选妃")
+    game.db.set_character_status(game.state, name, "active", "皇帝选中入宫")
+    consort.office = "嫔"
+    consort.office_type = "后宫"
     consort.status = "active"
-    consort.office = "嫔"  # 初始位份：嫔
     # 同步进 registry（新增 agent）
-    get_game().session.registry.register(consort)
-    get_game().chat_history.setdefault(name, [])
-    return {"selected": get_game().public_character(consort)}
+    game.session.registry.register(consort)
+    game.chat_history.setdefault(name, [])
+    return {"selected": game.public_character(consort)}
 
 
 @app.get("/api/saves")
@@ -1644,6 +1776,7 @@ async def api_get_llm_config() -> Dict[str, Any]:
         "base_url": cfg.base_url,
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
+        "timeout_seconds": cfg.timeout_seconds,
         "advanced_model": cfg.advanced_model,
         "advanced_base_url": cfg.advanced_base_url,
         "has_advanced_api_key": bool(cfg.advanced_api_key),
@@ -1653,6 +1786,7 @@ async def api_get_llm_config() -> Dict[str, Any]:
             "model": saved.get("model", ""),
             "has_api_key": bool(saved.get("has_api_key")),
             "max_tokens": int(saved.get("max_tokens") or 8000),
+            "timeout_seconds": float(saved.get("timeout_seconds") or 180),
             "advanced_model": saved.get("advanced_model", ""),
             "advanced_base_url": saved.get("advanced_base_url", ""),
             "has_advanced_api_key": bool(saved.get("has_advanced_api_key")),
@@ -1671,18 +1805,20 @@ async def api_set_llm_config(request: LLMConfigRequest) -> Dict[str, Any]:
             request.model,
             request.api_key,
             request.max_tokens,
+            request.timeout_seconds,
             advanced_model=advanced,
             advanced_base_url=adv_base,
             advanced_api_key=adv_key,
         )
     except LLMUnavailable as e:
-        raise HTTPException(status_code=400, detail=str(e)) from None
+        raise HTTPException(status_code=400, detail=_llm_error_detail(e)) from None
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=str(e)) from None
+        raise HTTPException(status_code=400, detail=_llm_error_detail(e)) from None
     return {
         "base_url": cfg.base_url,
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
+        "timeout_seconds": cfg.timeout_seconds,
         "advanced_model": cfg.advanced_model,
         "advanced_base_url": cfg.advanced_base_url,
         "has_advanced_api_key": bool(cfg.advanced_api_key),
