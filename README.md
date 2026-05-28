@@ -57,7 +57,7 @@ MING_SIM_SETUP_TOKEN=首次创建管理员时输入的一次性口令
 可用下面的命令生成主密钥：
 
 ```bash
-python3 -c "from ming_sim.secret_store import generate_master_key; print(generate_master_key())"
+python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode('ascii'))"
 ```
 
 启动网页游戏：
