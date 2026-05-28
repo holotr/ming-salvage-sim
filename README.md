@@ -126,6 +126,8 @@ docker compose -f docker-compose.example.yml pull
 docker compose -f docker-compose.example.yml up -d
 ```
 
+如果旧镜像日志里出现 `sqlite3.OperationalError: unable to open database file`，通常是挂载的 `/app/data` 权限不对。拉取新镜像并重建容器即可；新镜像启动时会先修复数据目录所有权，再降权运行 Web 服务。若使用宿主机 bind mount，请确认该目录允许容器写入。
+
 也可以本地构建：
 
 ```bash
