@@ -89,6 +89,7 @@ def _significant_change(change: Dict[str, object]) -> bool:
     if isinstance(delta, int) and abs(delta) >= 8:
         return True
     field = str(change.get("field") or "")
+    # arrears 单位=累计欠饷万两；任何 delta（哪怕 ±1 万两）都视为人物关键记忆事件
     if field in {"arrears", "unrest", "military_pressure", "stance", "last_action", "status"}:
         return True
     return delta is None and field in {"natural_disaster", "human_disaster", "status", "last_action"}
@@ -285,6 +286,9 @@ def _write_llm_memories(db: GameDB, state: GameState, data: Dict[str, object]) -
             continue
         tlog(f"[memory/write] id={memory_id} subject={item['subject_id']} event={item['event_type']} "
              f"title={item['title']!r} importance={item['importance']} source={item['source_kind']}:{item['source_id']}")
+        tlog(f"[MEM-IO/memory/write/BODY] id={memory_id} "
+             f"cause={item['cause']!r} process={item['process']!r} outcome={item['outcome']!r} "
+             f"sentiment={item['sentiment']} tags={item['tags']} expires_turn={item['expires_turn']}")
         for src in item["sources"]:  # type: ignore[index]
             if not isinstance(src, dict):
                 continue
@@ -322,7 +326,10 @@ def extract_event_memories_with_agent(
         "extractor_output": extractor_output,
         "instruction": "提取渐进式事件记忆摘要卡和来源摘录。",
     }
-    raw = run_agent_text(agent, json.dumps(payload, ensure_ascii=False, sort_keys=False), tag="memory-extractor")
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
+    tlog(f"[MEM-IO/memory-extractor/INPUT] ({len(payload_json)}字):\n{payload_json}")
+    raw = run_agent_text(agent, payload_json, tag="memory-extractor")
+    tlog(f"[MEM-IO/memory-extractor/OUTPUT] ({len(raw)}字):\n{raw}")
     data = parse_agent_json(raw, "记忆抽取")
     return _write_llm_memories(db, state, data)
 
@@ -344,8 +351,10 @@ def extract_chat_memories_for_minister(
         "chat_history": chat_history,
         "instruction": "提取本次召对的结构化记忆卡，只写有实质内容的承诺/建议/情报，闲聊跳过。",
     }
-    raw = run_agent_text(agent, json.dumps(payload, ensure_ascii=False, sort_keys=False), tag="chat-memory")
-    tlog(f"[chat-memory] raw_output({len(raw)}字): {raw[:300]}")
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
+    tlog(f"[MEM-IO/chat-memory/INPUT] minister={minister_name} ({len(payload_json)}字):\n{payload_json}")
+    raw = run_agent_text(agent, payload_json, tag="chat-memory")
+    tlog(f"[MEM-IO/chat-memory/OUTPUT] minister={minister_name} ({len(raw)}字):\n{raw}")
     data = parse_agent_json(raw, "对话记忆抽取")
     mem_list = data.get("memories") or []
     tlog(f"[chat-memory] parsed memories={len(mem_list)}: "
