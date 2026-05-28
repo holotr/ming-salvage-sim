@@ -1,0 +1,17 @@
+services:
+  ming-salvage-sim:
+    image: ghcr.io/holotr/ming-salvage-sim:latest
+    container_name: ming-salvage-sim
+    restart: unless-stopped
+    ports:
+      - "${MING_SIM_PORT:-8010}:8010"
+    environment:
+      MING_SIM_SECRET_KEY: "${MING_SIM_SECRET_KEY:?set MING_SIM_SECRET_KEY}"
+      MING_SIM_SETUP_TOKEN: "${MING_SIM_SETUP_TOKEN:?set MING_SIM_SETUP_TOKEN}"
+      MING_SIM_AUTH_DB: "/app/data/app_auth.db"
+      MING_SIM_SESSION_DAYS: "${MING_SIM_SESSION_DAYS:-7}"
+    volumes:
+      - ming-salvage-data:/app/data
+
+volumes:
+  ming-salvage-data:

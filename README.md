@@ -105,6 +105,27 @@ docker run -d \
 
 `MING_SIM_SECRET_KEY` 必须长期固定并备份；它丢失后，数据库里的用户 API Key 将无法解密。公网部署建议放在 HTTPS 反代后面。
 
+Docker Compose 示例见 `docker-compose.example.yml`。先在同目录准备 `.env`，至少填写：
+
+```bash
+MING_SIM_SECRET_KEY=换成固定的32字节base64主密钥
+MING_SIM_SETUP_TOKEN=换成首次创建管理员的一次性口令
+MING_SIM_PORT=8010
+```
+
+然后启动：
+
+```bash
+docker compose -f docker-compose.example.yml up -d
+```
+
+默认使用命名卷 `ming-salvage-data` 持久化 `/app/data`。升级镜像时：
+
+```bash
+docker compose -f docker-compose.example.yml pull
+docker compose -f docker-compose.example.yml up -d
+```
+
 也可以本地构建：
 
 ```bash
