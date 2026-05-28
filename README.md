@@ -47,12 +47,17 @@ cd ..
 cp .env.example .env
 ```
 
-编辑 `.env`，至少填入：
+网页端现在带登录与用户级 API Key 加密存储。编辑 `.env`，至少填入：
 
 ```bash
-OPENAI_API_KEY=your_api_key_here
-OPENAI_BASE_URL=https://api.deepseek.com
-OPENAI_MODEL=deepseek-v4-flash
+MING_SIM_SECRET_KEY=生成一个32字节base64主密钥
+MING_SIM_SETUP_TOKEN=首次创建管理员时输入的一次性口令
+```
+
+可用下面的命令生成主密钥：
+
+```bash
+python3 -c "from ming_sim.secret_store import generate_master_key; print(generate_master_key())"
 ```
 
 启动网页游戏：
@@ -66,6 +71,8 @@ python3 -m uvicorn web_app:app --host 127.0.0.1 --port 8010
 
 打开 <http://127.0.0.1:8010>。
 
+第一次打开会要求创建管理员账号。创建后进入菜单，在「设置 API」里填写 DeepSeek/OpenAI 兼容接口；API Key 会加密保存到 `data/app_auth.db`，不会回传到前端。若旧版 `data/runtime_llm.json` 里已有明文 Key，首次创建管理员时会迁入该管理员账号并清除旧文件里的明文。
+
 也可以跑纯文本版本：
 
 ```bash
@@ -74,6 +81,8 @@ source .env
 set +a
 python3 main.py
 ```
+
+纯文本 CLI 仍沿用 `.env` 里的 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`。
 
 ## 怎么玩
 
@@ -156,10 +165,14 @@ python3 main.py
 
 | 变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `OPENAI_API_KEY` | 是 | 无 | API Key |
-| `OPENAI_BASE_URL` | 否 | `https://api.openai.com/v1` | API 地址，推荐 `https://api.deepseek.com` |
-| `OPENAI_MODEL` | 否 | `gpt-4o-mini` | 模型名，推荐 `deepseek-v4-flash` |
-| `MING_SIM_DB` | 否 | `data/ming_sim.db` | 存档数据库路径 |
+| `MING_SIM_SECRET_KEY` | Web 必填 | 无 | 32 字节 base64/hex 主密钥，用于加密每个用户的 API Key |
+| `MING_SIM_SETUP_TOKEN` | 首次 Web 初始化必填 | 无 | 首个管理员创建口令 |
+| `MING_SIM_AUTH_DB` | 否 | `data/app_auth.db` | Web 用户、session、加密 API 配置库路径 |
+| `MING_SIM_SESSION_DAYS` | 否 | `7` | 登录 Session 有效天数 |
+| `OPENAI_API_KEY` | CLI 必填 | 无 | 纯文本 CLI API Key；Web 端登录后由每个用户自行填写 |
+| `OPENAI_BASE_URL` | CLI 可选 | `https://api.openai.com/v1` | CLI API 地址，推荐 `https://api.deepseek.com` |
+| `OPENAI_MODEL` | CLI 可选 | `gpt-4o-mini` | CLI 模型名，推荐 `deepseek-v4-flash` |
+| `MING_SIM_DB` | CLI 可选 | `data/ming_sim.db` | CLI 存档数据库路径；Web 端改用 `data/users/{user_id}/ming_sim.db` |
 | `MING_SIM_SEED` | 否 | `7` | 随机种子 |
 | `MING_SIM_START_YM` | 否 | 空 | 新存档起始年月，如 `1629.04` |
 | `CLI_API_KEY` | 否 | 回退 `OPENAI_API_KEY` | CLI 单独 API Key |
