@@ -4471,26 +4471,26 @@ function AdminUsersModal({ onClose }: { onClose: () => void }) {
 
   return (
     <div className="menu-modal-bg" onClick={onClose}>
-      <div className="menu-modal" onClick={(e) => e.stopPropagation()}>
+      <div className="menu-modal admin-users-modal" onClick={(e) => e.stopPropagation()}>
         <h2>用户管理</h2>
         {err && <div className="menu-error">{err}</div>}
-        <div className="menu-row">
-          <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="用户名" />
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="初始密码" />
-          <select value={role} onChange={(e) => setRole(e.target.value as "user" | "admin")}>
+        <div className="admin-user-create">
+          <input className="menu-input" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="用户名" />
+          <input className="menu-input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="初始密码" />
+          <select className="menu-input" value={role} onChange={(e) => setRole(e.target.value as "user" | "admin")}>
             <option value="user">用户</option>
             <option value="admin">管理员</option>
           </select>
-          <button className="primary" disabled={busy || username.length < 3 || password.length < 8} onClick={createUser}>创建</button>
+          <button className="menu-btn primary" disabled={busy || username.length < 3 || password.length < 8} onClick={createUser}>创建</button>
         </div>
-        <ul className="menu-save-list">
+        <ul className="admin-user-list">
           {users.map((u) => (
             <li key={u.id}>
               <div>
-                <span className="save-name">{u.username} · {u.role}</span>
-                <span className="save-meta">{u.status === "active" ? "启用" : "禁用"} · 上次登录 {u.last_login_at ? new Date(u.last_login_at * 1000).toLocaleString("zh-CN") : "从未"}</span>
+                <span className="admin-user-name">{u.username} · {u.role}</span>
+                <span className="admin-user-meta">{u.status === "active" ? "启用" : "禁用"} · 上次登录 {u.last_login_at ? new Date(u.last_login_at * 1000).toLocaleString("zh-CN") : "从未"}</span>
               </div>
-              <div className="saves-actions">
+              <div className="admin-user-actions">
                 {u.status === "active" ? (
                   <button className="menu-btn danger" disabled={busy} onClick={() => setStatus(u.id, "disabled")}>禁用</button>
                 ) : (
