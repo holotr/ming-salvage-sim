@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ming_sim.assets import format_money, format_money_delta
 from ming_sim.constants import (
@@ -91,6 +91,9 @@ class GameDB:
         # 复用同一 GameDB 连接。游戏单写者、无并发写，跨线程安全。
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # 遗产修正符缓存：legacy_modifiers 在落账热路径被频繁调用，缓存聚合结果，
+        # 仅在 active 遗产集变化（insert_legacy / expire_legacies）时失效。
+        self._legacy_mod_cache: Optional[Dict[str, object]] = None
         self.init_schema()
 
     def init_schema(self) -> None:
@@ -417,6 +420,40 @@ class GameDB:
             CREATE INDEX IF NOT EXISTS idx_chat_messages_turn
                 ON chat_messages(turn);
 
+            CREATE TABLE IF NOT EXISTS chat_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                minister_name TEXT NOT NULL,
+                turn INTEGER NOT NULL,
+                year INTEGER NOT NULL,
+                period INTEGER NOT NULL,
+                user_message_id INTEGER,
+                minister_message_id INTEGER,
+                agno_session_id TEXT NOT NULL DEFAULT '',
+                agno_runs_before INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                undone_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_turns_minister_turn
+                ON chat_turns(minister_name, turn, status, id);
+            CREATE INDEX IF NOT EXISTS idx_chat_turns_status_id
+                ON chat_turns(status, id);
+
+            CREATE TABLE IF NOT EXISTS chat_turn_rollback_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_turn_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                target_table TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                before_json TEXT NOT NULL DEFAULT '',
+                after_json TEXT NOT NULL DEFAULT '',
+                rollback_strategy TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(chat_turn_id) REFERENCES chat_turns(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_turn_rollback_items_turn
+                ON chat_turn_rollback_items(chat_turn_id, id);
+
             CREATE TABLE IF NOT EXISTS secret_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 turn_issued INTEGER NOT NULL,
@@ -545,6 +582,23 @@ class GameDB:
                 FOREIGN KEY(issue_id) REFERENCES issues(id)
             );
 
+            CREATE TABLE IF NOT EXISTS legacies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                source_issue_id INTEGER,                    -- 产生它的 issue（可空）
+                modifiers TEXT NOT NULL DEFAULT '{}',  -- 各维度带符号百分比修正符 {"国库":10,"regions":{...},"armies":{...}}
+                narrative_hint TEXT NOT NULL DEFAULT '',    -- 一句话说明（仅展示用，不喂 simulator）
+                start_month INTEGER NOT NULL,               -- 绝对月 = year*12+period
+                duration_months INTEGER NOT NULL DEFAULT 24,-- 时长；-1=永久
+                status TEXT NOT NULL DEFAULT 'active',      -- active / expired / cleared
+                clear_gate TEXT NOT NULL DEFAULT '{}',      -- 机器消除条件（同 _gate_passed 语法）；非空=靠程序判定消除而非时长
+                legacy_key TEXT NOT NULL DEFAULT '',        -- 开局负面修正对应 opening_legacies.key，去重用
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_legacies_active
+            ON legacies(status);
+
             CREATE INDEX IF NOT EXISTS idx_issues_active
             ON issues(kind, status, severity DESC);
 
@@ -650,15 +704,31 @@ class GameDB:
         self.ensure_column("characters", "aliases", "TEXT NOT NULL DEFAULT '[]'")
         # 步骤7：回合阶段（旧库迁移，schema 升级非 fallback）
         self.ensure_column("game_state", "turn_phase", "TEXT NOT NULL DEFAULT 'summoning'")
+        # 结局：ended=1 时游戏终结；ending_status 为 context.ENDING_* 类型。
+        self.ensure_column("game_state", "ended", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("game_state", "ending_status", "TEXT NOT NULL DEFAULT ''")
         # 密令推演副作用列（result 留给承办人进展，sim_note 给推演写泄漏/反弹，互不覆盖）
         self.ensure_column("secret_orders", "sim_note", "TEXT NOT NULL DEFAULT ''")
         # 密令期限：0=无硬期限；到 due_turn 时自动转入待核议，由推演当月判 done/failed。
         self.ensure_column("secret_orders", "due_turn", "INTEGER NOT NULL DEFAULT 0")
+        # fiscal_config 科目元数据列（数据驱动预算目录）：budget_role=fixed 的 base 项靠
+        # account/direction/display 由 flows.compute_budget_lines 动态生成预算行；
+        # dynamic 项（田赋/辽饷/盐税/商税/皇庄）走省级公式/皇庄专路，这三列留空。
+        self.ensure_column("fiscal_config", "budget_role", "TEXT NOT NULL DEFAULT 'fixed'")
+        self.ensure_column("fiscal_config", "account", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("fiscal_config", "direction", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("fiscal_config", "display", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("fiscal_config", "sort_order", "INTEGER NOT NULL DEFAULT 9999")
         # economy_ledger 支出结构化标签：仅 extractor 抽出的 economy_moves 填这三列；
         # flows 月固定支出与所有收入留 NULL。purpose 受控枚举见 constants.ECONOMY_PURPOSES。
         self.ensure_column("economy_ledger", "purpose", "TEXT")
         self.ensure_column("economy_ledger", "target_kind", "TEXT")
         self.ensure_column("economy_ledger", "target_id", "TEXT")
+        # 开局负面帝国修正：clear_gate(机器消除条件)、legacy_key(对应 opening_legacies.key，开局修正去重用)
+        self.ensure_column("legacies", "clear_gate", "TEXT NOT NULL DEFAULT '{}'")
+        self.ensure_column("legacies", "legacy_key", "TEXT NOT NULL DEFAULT ''")
+        # 章节记忆正文：event_type='chapter_summary' 用，存整段叙事章节（不受 outcome 80 字限）。
+        self.ensure_column("event_memories", "body", "TEXT NOT NULL DEFAULT ''")
         # 后宫调教记录
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS consort_traits (
@@ -669,68 +739,94 @@ class GameDB:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # 结局总结：每局结局触发时落一条（单 campaign 一库，turn 为主键，对齐 turn_reports）。
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS ending_summary (
+                turn INTEGER PRIMARY KEY,
+                year INTEGER NOT NULL,
+                period INTEGER NOT NULL,
+                ending_status TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                timeline TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         self.conn.commit()
         self.init_fiscal_config()
 
     def init_fiscal_config(self) -> None:
-        # base/rate 单位为季度万两/%。flows.py 用 monthly_amount(x)=round(x/3) 换月度。
-        # 开局目标：国库月净 ~-13 万、内库月净 ~+18 万；玩家主要破局点：
-        # 查隐田(田赋_rate↑)、加商税/钞关(商税_base↑)、查盐课(盐税_base↑)、减宗室(宗室禄米_rate↓)。
-        rows = [
-            ("田赋_rate",    68,  "rate", "各省田赋实收率%，账面845×此率/100。可升至 85（查隐田+清丈）"),
-            ("辽饷_base",   130,  "base", "辽东加派季额，万两"),
-            ("辽饷_rate",   100,  "rate", "辽饷实收率%"),
-            ("盐税_base",    70,  "base", "两淮两浙盐引季度定额，万两。查私盐可拉到 120"),
-            ("盐税_rate",   100,  "rate", "盐税实收率%"),
-            ("商税_base",    22,  "base", "各地关卡店税季额，万两。加钞关/抽分可拉到 60"),
-            ("商税_rate",   100,  "rate", "商税实收率%"),
-            ("宗室禄米_base",360,  "base", "诸藩宗室禄米季度账面额，万两。史实万历末已达千万/年；削藩可降到180"),
-            ("宗室禄米_rate", 55,  "rate", "宗室禄米实发率%。史实崇祯初实发不足6成；削藩可降到30~40"),
-            ("官俸_base",    75,  "base", "在京百官俸禄季额，万两（含地方折色）"),
-            ("官俸_rate",   100,  "rate", "官俸发放率%"),
-            ("工程_base",    15,  "base", "工部季度维护支出，万两"),
-            ("工程_rate",   100,  "rate", "工程维护率%"),
-            ("赈灾_base",    15,  "base", "制度性赈灾备用，万两"),
-            ("赈灾_rate",   100,  "rate", "赈灾拨付率%"),
-            ("皇庄_base",    60,  "base", "皇庄地租季度上缴内库，万两"),
-            ("皇庄_rate",   100,  "rate", "皇庄收益率%"),
-            ("织造_base",    35,  "base", "苏杭织造局季度上缴内库，万两"),
-            ("织造_rate",   100,  "rate", "织造收益率%"),
-            ("矿税_base",    10,  "base", "矿税残余季额，万两"),
-            ("矿税_rate",   100,  "rate", "矿税实收率%"),
-            ("宫廷_base",    22,  "base", "皇室日常用度季额，万两"),
-            ("宫廷_rate",   100,  "rate", "宫廷开支率%"),
-            ("内廷俸_base",  15,  "base", "太监宫女俸禄季额，万两"),
-            ("内廷俸_rate", 100,  "rate", "内廷俸禄率%"),
-            ("妃嫔_base",    10,  "base", "后宫妃嫔季度供奉，万两"),
-            ("妃嫔_rate",   100,  "rate", "妃嫔供奉率%"),
-        ]
-        # schema 版本：旧 DB 用 INSERT OR IGNORE 保留玩家中途的 set_fiscal_config 改动；
-        # 默认值整体重平衡时升 SCHEMA_VERSION，旧库走 UPDATE 路径全量覆盖。
-        SCHEMA_VERSION = 5
+        """从 content/fiscal_config.json（self.content.fiscal_items）seed 财政科目目录。
+
+        base/rate 单位为【月度】万两/%。科目目录与元数据全走 JSON 设定（铁律：设定走 JSON）；
+        加新税源只改 JSON 加两行（base+rate）并升 schema_version，零 Python。
+
+        schema 版本来自 JSON 的 schema_version。旧 DB 用 INSERT OR IGNORE 保留玩家中途的
+        set_fiscal_config 改动；JSON 升 schema_version 即整体重置玩家未改动的默认值（走
+        ON CONFLICT UPDATE 全量覆盖 value/元数据列）。
+        """
+        items = list(self.content.fiscal_items)
+        if not items or "__schema_version" not in items[0]:
+            raise SystemExit("init_fiscal_config: fiscal_items 缺 __schema_version 头，中止。")
+        schema_version = int(items[0]["__schema_version"])
+        rows = items[1:]
+
+        def _meta(rec: Dict[str, object]) -> tuple:
+            return (
+                str(rec["key"]), int(rec["value"]), str(rec["kind"]), str(rec["note"]),
+                str(rec.get("budget_role", "fixed")),
+                str(rec.get("account", "")), str(rec.get("direction", "")),
+                str(rec.get("display", "")), int(rec.get("order", 9999)),
+            )
+
+        cols = "(key, value, kind, note, budget_role, account, direction, display, sort_order)"
         cur_ver_row = self.conn.execute(
             "SELECT value FROM fiscal_config WHERE key = '__schema_version'"
         ).fetchone()
         cur_ver = int(cur_ver_row["value"]) if cur_ver_row else 0
-        if cur_ver < SCHEMA_VERSION:
-            for key, value, kind, note in rows:
+        if cur_ver < schema_version:
+            for rec in rows:
                 self.conn.execute(
-                    "INSERT INTO fiscal_config (key, value, kind, note) VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, note=excluded.note",
-                    (key, value, kind, note),
+                    f"INSERT INTO fiscal_config {cols} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, kind=excluded.kind, "
+                    "note=excluded.note, budget_role=excluded.budget_role, account=excluded.account, "
+                    "direction=excluded.direction, display=excluded.display, sort_order=excluded.sort_order",
+                    _meta(rec),
                 )
             self.conn.execute(
                 "INSERT INTO fiscal_config (key, value, kind, note) VALUES "
                 "('__schema_version', ?, 'meta', '财政默认值大版本号，升即重置玩家未改动的默认值') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (SCHEMA_VERSION,),
+                (schema_version,),
             )
         else:
             self.conn.executemany(
-                "INSERT OR IGNORE INTO fiscal_config (key, value, kind, note) VALUES (?, ?, ?, ?)",
-                rows,
+                f"INSERT OR IGNORE INTO fiscal_config {cols} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [_meta(rec) for rec in rows],
             )
         self.conn.commit()
+
+    def iter_budget_items(self) -> "List[Dict[str, object]]":
+        """返回 budget_role=fixed 的 base 科目（含 account/direction/display/sort_order）。
+
+        flows.compute_budget_lines 据此动态生成固定收支预算行——加新税源不必改代码。
+        每项配套的 *_rate 由调用方按 stem 自取（rate 项 budget_role 同 fixed 但 kind=rate，
+        不在本列表里）。dynamic 项（田赋/辽饷/盐税/商税/皇庄）走省级公式，这里不返回。
+        """
+        rows = self.conn.execute(
+            "SELECT key, account, direction, display, note, sort_order FROM fiscal_config "
+            "WHERE budget_role = 'fixed' AND kind = 'base' AND key LIKE '%\\_base' ESCAPE '\\' "
+            "ORDER BY sort_order, key"
+        ).fetchall()
+        return [
+            {
+                "key": str(r["key"]),
+                "account": str(r["account"]),
+                "direction": str(r["direction"]),
+                "display": str(r["display"]),
+                "note": str(r["note"] or ""),
+            }
+            for r in rows
+        ]
 
     def get_fiscal_config(self) -> Dict[str, int]:
         rows = self.conn.execute(
@@ -743,6 +839,150 @@ class GameDB:
             "UPDATE fiscal_config SET value = ? WHERE key = ?", (value, key)
         )
         self.conn.commit()
+
+    def create_fiscal_item(
+        self,
+        key: str,
+        account: str,
+        direction: str,
+        display: str,
+        init_value: int,
+        note: str = "",
+    ) -> Optional[str]:
+        """LLM 推演中凭空新立一个月固定收支项（budget_role=fixed）。
+
+        落 base+rate 两行：`<stem>_base`=init_value、`<stem>_rate`=100。
+        既存 base key 直接返回 None（不覆盖，由 fiscal_changes 调增量）。
+        返回新建的 base key；冲突或非法返回 None。元数据走 fixed 预算目录，
+        flows.iter_budget_items 下{月}起自动遍历落账——零代码加新税种／新月俸。
+        """
+        stem = key[:-5] if key.endswith("_base") else key
+        if not stem:
+            return None
+        base_key = f"{stem}_base"
+        rate_key = f"{stem}_rate"
+        exists = self.conn.execute(
+            "SELECT 1 FROM fiscal_config WHERE key = ?", (base_key,)
+        ).fetchone()
+        if exists is not None:
+            return None
+        sort_order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM fiscal_config"
+        ).fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO fiscal_config "
+            "(key, value, kind, budget_role, account, direction, display, sort_order, note) "
+            "VALUES (?, ?, 'base', 'fixed', ?, ?, ?, ?, ?)",
+            (base_key, max(0, init_value), account, direction, display, sort_order, note),
+        )
+        self.conn.execute(
+            "INSERT INTO fiscal_config "
+            "(key, value, kind, budget_role, account, direction, display, sort_order, note) "
+            "VALUES (?, 100, 'rate', 'fixed', ?, ?, ?, ?, ?)",
+            (rate_key, account, direction, display, sort_order, f"{display}实收率%"),
+        )
+        self.conn.commit()
+        return base_key
+
+    # dynamic 税科目 → regions.fiscal 子字段映射。dynamic 税实收走 calc_province_fiscal
+    # 读 region.fiscal（不读 fiscal_config 的 base），故对这些 key 做裁撤/调额必须同步改
+    # 各省 fiscal 字段才真生效——否则只动目录不动钱（账目与叙事脱节）。
+    #   田赋无独立字段（=tax_per_turn 减其余三税的残差），裁撤走 tax_per_turn 压低；
+    #   皇庄收入真读 fiscal_config.皇庄_base，裁撤/调额改 config 即生效，不在本表。
+    _DYNAMIC_REGION_FIELD = {
+        "辽饷": "liao_xiang", "盐税": "salt_tax", "商税": "commerce_tax",
+    }
+
+    def _stem_of(self, key: str) -> str:
+        if key.endswith("_base") or key.endswith("_rate"):
+            return key[:-5]
+        return key
+
+    def apply_dynamic_fiscal_scale(self, stem: str, ratio: float) -> int:
+        """按 ratio 缩放所有省 regions.fiscal 中该 dynamic 税字段（辽饷/盐税/商税）。
+
+        ratio=0 即彻底罢废（字段归零）；0<ratio<1 即按比例削减。田赋走 _scale_tian_fu。
+        返回被改动的省数。皇庄不在此（走 fiscal_config）。命中映射外的 stem 返回 0。
+        """
+        field = self._DYNAMIC_REGION_FIELD.get(stem)
+        if field is None:
+            return 0
+        touched = 0
+        for row in self.conn.execute("SELECT id, fiscal FROM regions").fetchall():
+            fiscal: dict = json.loads(str(row["fiscal"] or "{}"))
+            old = int(fiscal.get(field, 0) or 0)
+            if old <= 0:
+                continue
+            new = max(0, round(old * ratio))
+            if new == old:
+                continue
+            fiscal[field] = new
+            self.conn.execute(
+                "UPDATE regions SET fiscal = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(fiscal, ensure_ascii=False), str(row["id"])),
+            )
+            touched += 1
+        if touched:
+            self.conn.commit()
+        return touched
+
+    def scale_tian_fu(self, ratio: float) -> int:
+        """田赋无独立字段（=tax_per_turn 减辽饷/盐税/商税的残差）。按 ratio 缩放田赋部分：
+        新 tax_per_turn = 三税之和 + 田赋残差×ratio。ratio=0 即罢田赋（仅留三税基）。
+        返回被改动的省数。"""
+        touched = 0
+        for row in self.conn.execute(
+            "SELECT id, tax_per_turn, fiscal FROM regions"
+        ).fetchall():
+            fiscal: dict = json.loads(str(row["fiscal"] or "{}"))
+            others = (int(fiscal.get("liao_xiang", 0) or 0)
+                      + int(fiscal.get("salt_tax", 0) or 0)
+                      + int(fiscal.get("commerce_tax", 0) or 0))
+            tax = int(row["tax_per_turn"])
+            tian_fu = max(0, tax - others)
+            new_tax = others + max(0, round(tian_fu * ratio))
+            if new_tax == tax:
+                continue
+            self.conn.execute(
+                "UPDATE regions SET tax_per_turn = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_tax, str(row["id"])),
+            )
+            touched += 1
+        if touched:
+            self.conn.commit()
+        return touched
+
+    def remove_fiscal_item(self, key: str) -> Optional[str]:
+        """彻底裁撤一个月固定收支项（罢税/裁俸）：删 base+rate 两行。
+
+        完全放开——含 dynamic（田赋/辽饷/盐税/商税/皇庄），后果玩家自负。
+        - fixed 项：删目录条目即停止逐月落账。
+        - dynamic 税（辽饷/盐税/商税）：实收走 region.fiscal，故同步把各省该字段归零；
+          田赋走 tax_per_turn 压到仅留三税基；皇庄收入读 fiscal_config，删 config 即停。
+          这样「永久罢辽饷」当真停收，不再只动目录不动钱。
+        删不存在的项返回 None。返回被删的 base key（按 stem 归一）。
+        """
+        stem = self._stem_of(key)
+        if not stem:
+            return None
+        base_key = f"{stem}_base"
+        rate_key = f"{stem}_rate"
+        # 存在性查 base 或 rate 任一——田赋只有 田赋_rate（无 base），但仍是可裁撤的 dynamic 项。
+        exists = self.conn.execute(
+            "SELECT 1 FROM fiscal_config WHERE key IN (?, ?)", (base_key, rate_key)
+        ).fetchone()
+        if exists is None:
+            return None
+        self.conn.execute(
+            "DELETE FROM fiscal_config WHERE key IN (?, ?)", (base_key, rate_key)
+        )
+        # dynamic 税：同步罢废各省实收字段（皇庄走 config 不在此）。
+        if stem in self._DYNAMIC_REGION_FIELD:
+            self.apply_dynamic_fiscal_scale(stem, 0.0)
+        elif stem == "田赋":
+            self.scale_tian_fu(0.0)
+        self.conn.commit()
+        return base_key
 
     def ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -839,62 +1079,60 @@ class GameDB:
                     """,
                     (cls.name, cls.region_id, cls.population, cls.satisfaction, cls.leverage, cls.agenda),
                 )
-        if not self.table_has_rows("powers"):
-            for power in self.content.powers.values():
-                self.conn.execute(
-                    """
-                    INSERT INTO powers
-                    (id, name, kind, leader, stance, leverage, satisfaction, military_strength,
-                     cohesion, supply, agenda, status, last_action, aliases)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        power.id,
-                        power.name,
-                        power.kind,
-                        power.leader,
-                        power.stance,
-                        power.leverage,
-                        power.satisfaction,
-                        power.military_strength,
-                        power.cohesion,
-                        power.supply,
-                        power.agenda,
-                        power.status,
-                        power.last_action,
-                        power.aliases,
-                    ),
-                )
-        if not self.table_has_rows("regions"):
-            for region in self.content.regions.values():
-                self.conn.execute(
-                    """
-                    INSERT INTO regions
-                    (id, name, kind, population, public_support, unrest, natural_disaster, human_disaster,
-                     registered_land, hidden_land, tax_per_turn, grain_security, gentry_resistance,
-                     military_pressure, status, controlled_by, fiscal)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        region.id,
-                        region.name,
-                        region.kind,
-                        region.population,
-                        region.public_support,
-                        region.unrest,
-                        region.natural_disaster,
-                        region.human_disaster,
-                        region.registered_land,
-                        region.hidden_land,
-                        region.tax_per_turn,
-                        region.grain_security,
-                        region.gentry_resistance,
-                        region.military_pressure,
-                        region.status,
-                        region.controlled_by,
-                        json.dumps(region.fiscal, ensure_ascii=False),
-                    ),
-                )
+        for power in self.content.powers.values():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO powers
+                (id, name, kind, leader, stance, leverage, satisfaction, military_strength,
+                 cohesion, supply, agenda, status, last_action, aliases)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    power.id,
+                    power.name,
+                    power.kind,
+                    power.leader,
+                    power.stance,
+                    power.leverage,
+                    power.satisfaction,
+                    power.military_strength,
+                    power.cohesion,
+                    power.supply,
+                    power.agenda,
+                    power.status,
+                    power.last_action,
+                    power.aliases,
+                ),
+            )
+        for region in self.content.regions.values():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO regions
+                (id, name, kind, population, public_support, unrest, natural_disaster, human_disaster,
+                 registered_land, hidden_land, tax_per_turn, grain_security, gentry_resistance,
+                 military_pressure, status, controlled_by, fiscal)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    region.id,
+                    region.name,
+                    region.kind,
+                    region.population,
+                    region.public_support,
+                    region.unrest,
+                    region.natural_disaster,
+                    region.human_disaster,
+                    region.registered_land,
+                    region.hidden_land,
+                    region.tax_per_turn,
+                    region.grain_security,
+                    region.gentry_resistance,
+                    region.military_pressure,
+                    region.status,
+                    region.controlled_by,
+                    json.dumps(region.fiscal, ensure_ascii=False),
+                ),
+            )
         is_fresh_armies_seed = not self.table_has_rows("armies")
         if is_fresh_armies_seed:
             for army in self.content.armies.values():
@@ -1011,12 +1249,16 @@ class GameDB:
     def save_state(self, state: GameState) -> None:
         self.conn.execute(
             """
-            INSERT INTO game_state (id, year, period, turn, turn_phase)
-            VALUES (1, ?, ?, ?, ?)
+            INSERT INTO game_state (id, year, period, turn, turn_phase, ended, ending_status)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET year = excluded.year, period = excluded.period,
-                turn = excluded.turn, turn_phase = excluded.turn_phase
+                turn = excluded.turn, turn_phase = excluded.turn_phase,
+                ended = excluded.ended, ending_status = excluded.ending_status
             """,
-            (state.year, state.period, state.turn, state.turn_phase),
+            (
+                state.year, state.period, state.turn, state.turn_phase,
+                1 if state.ended else 0, state.ending_status,
+            ),
         )
         for key, value in state.metrics.items():
             self.conn.execute(
@@ -1031,7 +1273,9 @@ class GameDB:
         self.conn.commit()
 
     def load_state(self, start_ym: str = "") -> GameState:
-        row = self.conn.execute("SELECT year, period, turn, turn_phase FROM game_state WHERE id = 1").fetchone()
+        row = self.conn.execute(
+            "SELECT year, period, turn, turn_phase, ended, ending_status FROM game_state WHERE id = 1"
+        ).fetchone()
         if row is None:
             state = GameState()
             if start_ym:
@@ -1057,6 +1301,8 @@ class GameDB:
         state = GameState(
             year=int(row["year"]), period=int(row["period"]), turn=int(row["turn"]),
             turn_phase=str(row["turn_phase"] or "summoning"),
+            ended=bool(row["ended"]) if "ended" in row.keys() else False,
+            ending_status=str(row["ending_status"] or "") if "ending_status" in row.keys() else "",
         )
         if metrics:
             # 只接当前 GameState 默认 dict 里有的 key，避免旧 DB 残留废弃 metric 灌入。
@@ -1138,42 +1384,47 @@ class GameDB:
         self.conn.commit()
 
     def seed_opening_crises(self, state: GameState) -> None:
-        """新档首次进入时塞 1627 即位三大危机为 active situation issue。"""
-        from ming_sim.assets import load_json_asset
-        raw = load_json_asset("opening_crises.json")
-        if not isinstance(raw, list):
+        """新档首次进入时塞 1627 即位即面对的危机为 active situation issue。
+        数据源已并入 seed_events.json：取标了 auto_trigger 且 trigger_gate 为空（开局盘面无条件
+        即达标）的 situation 事件，开局直接立项，使玩家召见前就看到三大危机。
+        其余带 gate 的 seed 事件靠 auto_trigger_seed_issues 在 gate 达标的回合再硬立。"""
+        if not getattr(self, "content", None):
             return
-        for item in raw:
-            if not isinstance(item, dict):
+        for ev in self.content.seed_events:
+            if not ev.auto_trigger or ev.trigger_gate:
                 continue
-            origin_ref = str(item.get("id") or "")
-            if origin_ref and self.find_any_issue_by_origin("opening", origin_ref) is not None:
+            if ev.event_type != "situation":
                 continue
+            if self.find_any_issue_by_origin("event_pool", ev.id) is not None:
+                continue
+            # 推导默认 bar / inertia / ongoing / effect，与 event_to_issue 同口径；精调字段优先
+            bar = ev.bar_value or max(20, min(60, 50 - int(ev.severity / 5)))
+            inertia = ev.issue_inertia  # 默认 0=不漂；要月漂在 seed 里显式填
             try:
                 self.insert_issue(
                     state,
-                    kind=str(item.get("kind") or "situation"),
-                    title=str(item.get("title") or ""),
-                    origin_kind="opening",
-                    origin_ref=origin_ref,
-                    bar_value=int(item.get("bar_value", 25)),
-                    bar_good_meaning=str(item.get("bar_good_meaning") or "已平"),
-                    bar_bad_meaning=str(item.get("bar_bad_meaning") or "失控"),
-                    inertia=int(item.get("inertia") or 0),
-                    stage_text=str(item.get("stage_text") or ""),
-                    severity=int(item.get("severity") or 60),
-                    region_hint=str(item.get("region_hint") or ""),
-                    faction_hint=str(item.get("faction_hint") or ""),
-                    tags=list(item.get("tags") or []),
-                    ongoing_effects=dict(item.get("ongoing_effects") or {}),
+                    kind="situation",
+                    title=ev.title,
+                    origin_kind="event_pool",
+                    origin_ref=ev.id,
+                    bar_value=bar,
+                    bar_good_meaning=ev.bar_good_meaning or "已平",
+                    bar_bad_meaning=ev.bar_bad_meaning or "失控",
+                    inertia=inertia,
+                    stage_text=ev.stage_text or ev.summary[:80],
+                    severity=int(ev.severity),
+                    region_hint=ev.region_hint,
+                    faction_hint=",".join(ev.interests[:2]),
+                    tags=ev.issue_tags or [ev.kind],
+                    ongoing_effects=ev.ongoing_effects,
                     cancellable="never",
-                    effect_on_resolve=dict(item.get("effect_on_resolve") or {}),
-                    effect_on_fail=dict(item.get("effect_on_fail") or {}),
-                    resolve_condition=str(item.get("resolve_condition") or ""),
-                    fail_condition=str(item.get("fail_condition") or ""),
+                    effect_on_resolve=ev.effect_on_resolve,
+                    effect_on_fail=ev.effect_on_fail,
+                    resolve_condition=ev.resolve_condition,
+                    fail_condition=ev.fail_condition,
                 )
             except Exception as exc:
-                print(f"[WARN] opening crisis 落库失败：{exc}；跳过 {item.get('title')}")
+                print(f"[WARN] 开局危机落库失败：{exc}；跳过 {ev.title}")
 
     def set_character_status(
         self,
@@ -1546,66 +1797,31 @@ class GameDB:
         self.sync_economy_accounts(state)
         self.conn.commit()
 
-    def treasury_budget_summary(self) -> str:
-        cfg = self.get_fiscal_config()
-        land_base = self.conn.execute("SELECT SUM(tax_per_turn) FROM regions").fetchone()[0] or 0
-        army_total = self.conn.execute("SELECT SUM(maintenance_per_turn) FROM armies").fetchone()[0] or 0
-        gk_in = (
-            round(land_base * cfg.get("田赋_rate", 68) / 100)
-            + round(cfg.get("辽饷_base", 130) * cfg.get("辽饷_rate", 100) / 100)
-            + round(cfg.get("盐税_base", 70) * cfg.get("盐税_rate", 100) / 100)
-            + round(cfg.get("商税_base", 22) * cfg.get("商税_rate", 100) / 100)
-        )
-        gk_out = (
-            int(army_total)
-            + round(cfg.get("宗室禄米_base", 100) * cfg.get("宗室禄米_rate", 70) / 100)
-            + round(cfg.get("官俸_base", 35) * cfg.get("官俸_rate", 100) / 100)
-            + round(cfg.get("工程_base", 15) * cfg.get("工程_rate", 100) / 100)
-            + round(cfg.get("赈灾_base", 15) * cfg.get("赈灾_rate", 100) / 100)
-        )
-        nk_in = (
-            round(cfg.get("皇庄_base", 60) * cfg.get("皇庄_rate", 100) / 100)
-            + round(cfg.get("织造_base", 35) * cfg.get("织造_rate", 100) / 100)
-            + round(cfg.get("矿税_base", 10) * cfg.get("矿税_rate", 100) / 100)
-        )
-        nk_out = (
-            round(cfg.get("宫廷_base", 22) * cfg.get("宫廷_rate", 100) / 100)
-            + round(cfg.get("内廷俸_base", 15) * cfg.get("内廷俸_rate", 100) / 100)
-            + round(cfg.get("妃嫔_base", 10) * cfg.get("妃嫔_rate", 100) / 100)
-        )
-        # 建筑：maintenance/output_amount 已是月值，不过 monthly_amount。
-        # 维护按 category 分账：内廷扣内库，其它扣国库。产出按 output_metric 走。
-        build_rows = self.conn.execute(
-            "SELECT category, condition, maintenance, output_metric, output_amount FROM buildings"
-        ).fetchall()
-        b_gk_out = b_nk_out = b_gk_in = b_nk_in = 0
-        for r in build_rows:
-            maint = max(0, int(r["maintenance"]))
-            if str(r["category"]) == "内廷":
-                b_nk_out += maint
-            else:
-                b_gk_out += maint
-            metric = str(r["output_metric"])
-            cond = max(0, min(100, int(r["condition"])))
-            out = max(0, int(r["output_amount"]))
-            produced = round(out * cond / 100) if metric and out else 0
-            if metric == "国库":
-                b_gk_in += produced
-            elif metric == "内库":
-                b_nk_in += produced
+    def treasury_budget_summary(self, state: "GameState | None" = None) -> str:
+        # 三套口径统一：直接调 flows.compute_budget_lines（唯一定额源），此处只负责拼文本。
+        from ming_sim.flows import compute_budget_lines  # 局部 import 避免与 flows 顶层循环依赖
+        st = state if state is not None else self.load_state("")
+        budget = compute_budget_lines(self, st)
 
-        gk_net = monthly_amount(gk_in) + b_gk_in - monthly_amount(gk_out) - b_gk_out
-        nk_net = monthly_amount(nk_in) + b_nk_in - monthly_amount(nk_out) - b_nk_out
+        def _sum(acc: str, direction: str) -> int:
+            return sum(int(it["amount"]) for it in budget[acc][direction])
+
+        def _amt(acc: str, direction: str, name: str) -> int:
+            return sum(int(it["amount"]) for it in budget[acc][direction] if it["name"] == name)
+
+        gk_in, gk_out = _sum("国库", "income"), _sum("国库", "expense")
+        nk_in, nk_out = _sum("内库", "income"), _sum("内库", "expense")
         return (
-            f"{TURN_UNIT}度预算基准：国库入{format_money(monthly_amount(gk_in) + b_gk_in)}"
-            f"（田赋+辽饷+盐税+商税+建筑产出{format_money(b_gk_in)}）"
-            f"出{format_money(monthly_amount(gk_out) + b_gk_out)}"
-            f"（军饷{format_money(monthly_amount(int(army_total)))}+宗室+官俸+补给+建筑维护{format_money(b_gk_out)}）"
-            f"净{format_money_delta(gk_net)}；"
-            f"内库入{format_money(monthly_amount(nk_in) + b_nk_in)}"
-            f"出{format_money(monthly_amount(nk_out) + b_nk_out)}"
-            f"（内廷维护{format_money(b_nk_out)}）"
-            f"净{format_money_delta(nk_net)}。"
+            f"{TURN_UNIT}度预算基准：国库入{format_money(gk_in)}"
+            f"（田赋+辽饷+盐税+商税+建筑产出{format_money(_amt('国库', 'income', '建筑产出'))}）"
+            f"出{format_money(gk_out)}"
+            f"（军饷{format_money(_amt('国库', 'expense', '各军军饷'))}+宗室+官俸+补给+"
+            f"建筑维护{format_money(_amt('国库', 'expense', '建筑维护'))}）"
+            f"净{format_money_delta(gk_in - gk_out)}；"
+            f"内库入{format_money(nk_in)}"
+            f"出{format_money(nk_out)}"
+            f"（内廷维护{format_money(_amt('内库', 'expense', '建筑维护'))}）"
+            f"净{format_money_delta(nk_in - nk_out)}。"
         )
 
     def treasury_report(self, state: GameState, limit: int = 6) -> str:
@@ -1653,7 +1869,7 @@ class GameDB:
                 f"{period_label(int(row['year']), int(row['period']))} {row['account']}{sign}{format_money(delta)} {row['category']}：{row['reason']}"
             )
         recent_text = "；".join(recent) if recent else "未见流水"
-        budget = self.treasury_budget_summary()
+        budget = self.treasury_budget_summary(state)
         return f"{budget}账面：{account_text}。本{TURN_UNIT}收支：{period_text}。近账：{recent_text}。"
 
     def faction_satisfaction(self, faction: str) -> int:
@@ -2074,6 +2290,11 @@ class GameDB:
                     fiscal: dict = json.loads(str(row["fiscal"] or "{}"))
                     old_value = fiscal.get(field, 50)
                     delta = int(value)
+                    # 帝国修正：该地区该字段若有 active 修正符，先放大/缩小 delta
+                    net_pct = int(((self.legacy_modifiers(state).get("regions") or {})
+                                   .get(region_id) or {}).get(field, 0) or 0)
+                    if net_pct:
+                        delta = self.apply_legacy_pct(delta, net_pct)
                     new_value = max(0, min(100, int(old_value) + delta))
                     actual_delta = new_value - int(old_value)
                     if actual_delta == 0:
@@ -2105,6 +2326,11 @@ class GameDB:
                 old_value = row[field]
                 if field in REGION_SCORE_FIELDS:
                     delta = int(value)
+                    # 遗产百分比修正：该地区该字段若有 active 遗产修正符，先放大/缩小 delta
+                    net_pct = int(((self.legacy_modifiers(state).get("regions") or {})
+                                   .get(region_id) or {}).get(field, 0) or 0)
+                    if net_pct:
+                        delta = self.apply_legacy_pct(delta, net_pct)
                     new_value = max(0, min(100, int(old_value) + delta))
                     actual_delta = new_value - int(old_value)
                     if actual_delta == 0:
@@ -2343,6 +2569,50 @@ class GameDB:
             f"状态：{row['status']}"
         )
 
+    def army_roster(self) -> str:
+        """全军名册——表格（| 分隔）压 token。大明各军给全字段，敌对/外藩军只给可见情报。
+        固定喂进大臣 system；去掉 list_armies/inspect_army 后大臣据此作答。
+        欠饷万两=精确累计欠饷（整数无上限，非 0-100 抽象分）；欠饷月数=欠饷/月饷，便于直接奏对。"""
+        rows = self.conn.execute(
+            "SELECT * FROM armies ORDER BY owner_power='ming' DESC, theater, name"
+        ).fetchall()
+        if not rows:
+            return ""
+        own: List[str] = []
+        other: List[str] = []
+        for row in rows:
+            maint = int(row["maintenance_per_turn"]) or 0
+            arr = int(row["arrears"]) or 0
+            # 全按月度：maintenance_per_turn 就是月饷，不除 3（别被 monthly_amount 命名误导）。
+            monthly_pay = maint
+            months = f"{arr / monthly_pay:.1f}" if monthly_pay > 0 and arr > 0 else "0"
+            if str(row["owner_power"]) == "ming":
+                # 列序见表头。兵力/月饷/欠饷单位万两；补给…忠诚为 0-100。
+                own.append(
+                    "|".join(str(x) for x in (
+                        row["name"], row["station"], row["commander"], row["troop_type"],
+                        row["manpower"], monthly_pay, row["supply"], row["morale"],
+                        row["training"], row["equipment"], row["mobility"], row["loyalty"],
+                        arr, months, row["status"],
+                    ))
+                )
+            else:
+                other.append(
+                    "|".join(str(x) for x in (
+                        row["name"], row["owner_power"], row["station"],
+                        row["commander"], row["troop_type"], row["manpower"], row["status"],
+                    ))
+                )
+        out = [
+            "【全军名册（现状以此为准，谈某军欠饷/补给/士气直接据此；欠饷万两为精确累计值，非抽象分）】",
+            "大明各军（| 分隔，列序＝军名|驻地|统帅|兵种|兵力|月饷万两|补给|士气|训练|装备|机动|忠诚|欠饷万两|欠饷月数|状态；补给…忠诚为0-100）：",
+            *own,
+        ]
+        if other:
+            out.append("敌对/外藩军（可见情报，列序＝军名|势力|驻地|统帅|兵种|兵力|状态）：")
+            out.extend(other)
+        return "\n".join(out)
+
     def turn_army_summary(self, turn: int, limit: int = 10) -> str:
         rows = self.conn.execute(
             """
@@ -2410,6 +2680,11 @@ class GameDB:
                     log_delta: int | None = actual_delta
                 elif field in ARMY_SCORE_FIELDS:
                     delta = int(value)
+                    # 遗产百分比修正：该军该字段若有 active 遗产修正符，先放大/缩小 delta
+                    net_pct = int(((self.legacy_modifiers(state).get("armies") or {})
+                                   .get(army_id) or {}).get(field, 0) or 0)
+                    if net_pct:
+                        delta = self.apply_legacy_pct(delta, net_pct)
                     new_value = max(0, min(100, int(old_value) + delta))
                     actual_delta = new_value - int(old_value)
                     if actual_delta == 0:
@@ -2964,13 +3239,14 @@ class GameDB:
         )
         self.conn.commit()
 
-    def append_chat_message(self, minister_name: str, turn: int, role: str, content: str) -> None:
+    def append_chat_message(self, minister_name: str, turn: int, role: str, content: str) -> int:
         """召对聊天单条消息落库（chat_messages）。"""
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO chat_messages (minister_name, turn, role, content) VALUES (?, ?, ?, ?)",
             (minister_name, turn, role, content),
         )
         self.conn.commit()
+        return int(cur.lastrowid)
 
     def load_all_chat_history(self) -> Dict[str, List[Dict[str, str]]]:
         """读出全部召对记录，按大臣分组，供进程启动时恢复内存缓存。"""
@@ -2983,6 +3259,292 @@ class GameDB:
                 {"role": row["role"], "content": row["content"]}
             )
         return history
+
+    # ----- chat_turns（本回合召对撤回）-----
+
+    _ROLLBACK_TABLE_PK = {
+        "turn_directives": "id",
+        "secret_orders": "id",
+        "characters": "name",
+        "character_offices": "character_name",
+        "consort_traits": "name",
+    }
+
+    def _row_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {key: row[key] for key in row.keys()}
+
+    def _json_dump_row(self, row: Dict[str, Any]) -> str:
+        return json.dumps(row, ensure_ascii=False, sort_keys=True)
+
+    def _json_load_row(self, raw: str) -> Dict[str, Any]:
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+
+    def _table_exists(self, table: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    def _snapshot_table(self, table: str, pk: str) -> Dict[str, Dict[str, Any]]:
+        rows = self.conn.execute(f"SELECT * FROM {table}").fetchall()
+        return {str(row[pk]): self._row_dict(row) for row in rows}
+
+    def capture_chat_rollback_snapshot(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """截取召对前后的可回滚业务表状态，用于撤回时做差异还原。"""
+        return {
+            table: self._snapshot_table(table, pk)
+            for table, pk in self._ROLLBACK_TABLE_PK.items()
+        }
+
+    def create_chat_turn(
+        self,
+        state: GameState,
+        minister_name: str,
+        agno_session_id: str,
+        agno_runs_before: int,
+    ) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO chat_turns
+                (minister_name, turn, year, period, agno_session_id, agno_runs_before)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                minister_name,
+                int(state.turn),
+                int(state.year),
+                int(state.period),
+                agno_session_id,
+                max(0, int(agno_runs_before)),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_chat_turn_messages(
+        self,
+        chat_turn_id: int,
+        user_message_id: Optional[int] = None,
+        minister_message_id: Optional[int] = None,
+    ) -> None:
+        assignments: List[str] = []
+        params: List[Any] = []
+        if user_message_id is not None:
+            assignments.append("user_message_id = ?")
+            params.append(int(user_message_id))
+        if minister_message_id is not None:
+            assignments.append("minister_message_id = ?")
+            params.append(int(minister_message_id))
+        if not assignments:
+            return
+        params.append(int(chat_turn_id))
+        self.conn.execute(
+            f"UPDATE chat_turns SET {', '.join(assignments)} WHERE id = ?",
+            params,
+        )
+        self.conn.commit()
+
+    def mark_chat_turn_failed(self, chat_turn_id: int) -> None:
+        self.conn.execute(
+            "UPDATE chat_turns SET status = 'failed' WHERE id = ? AND status = 'active'",
+            (int(chat_turn_id),),
+        )
+        self.conn.commit()
+
+    def record_chat_turn_rollback_diffs(
+        self,
+        chat_turn_id: int,
+        before: Dict[str, Dict[str, Dict[str, Any]]],
+        after: Dict[str, Dict[str, Dict[str, Any]]],
+    ) -> None:
+        rows: List[Tuple[int, str, str, str, str, str, str]] = []
+        for table, before_rows in before.items():
+            after_rows = after.get(table, {})
+            all_ids = set(before_rows) | set(after_rows)
+            for target_id in sorted(all_ids):
+                before_row = before_rows.get(target_id)
+                after_row = after_rows.get(target_id)
+                if before_row == after_row:
+                    continue
+                if before_row is None and after_row is not None:
+                    strategy = "delete_inserted_row"
+                elif before_row is not None and after_row is None:
+                    strategy = "restore_deleted_row"
+                else:
+                    strategy = "restore_row"
+                rows.append(
+                    (
+                        int(chat_turn_id),
+                        table,
+                        table,
+                        str(target_id),
+                        self._json_dump_row(before_row or {}),
+                        self._json_dump_row(after_row or {}),
+                        strategy,
+                    )
+                )
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO chat_turn_rollback_items
+                (chat_turn_id, kind, target_table, target_id, before_json, after_json, rollback_strategy)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def agno_runs_length(self, session_id: str) -> int:
+        if not session_id or not self._table_exists("agno_sessions"):
+            return 0
+        row = self.conn.execute(
+            "SELECT runs FROM agno_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return 0
+        runs, _encoded_as_string = self._decode_agno_runs(row["runs"])
+        return len(runs)
+
+    def _decode_agno_runs(self, raw: Any) -> Tuple[List[Any], bool]:
+        if raw in (None, ""):
+            return [], False
+        try:
+            decoded = json.loads(raw)
+            encoded_as_string = isinstance(decoded, str)
+            if encoded_as_string:
+                decoded = json.loads(decoded or "[]")
+            return (decoded if isinstance(decoded, list) else []), encoded_as_string
+        except (TypeError, ValueError):
+            return [], False
+
+    def _encode_agno_runs(self, runs: List[Any], encoded_as_string: bool) -> str:
+        if encoded_as_string:
+            return json.dumps(json.dumps(runs, ensure_ascii=False), ensure_ascii=False)
+        return json.dumps(runs, ensure_ascii=False)
+
+    def _truncate_agno_runs_in_tx(self, session_id: str, keep_count: int) -> None:
+        if not session_id or not self._table_exists("agno_sessions"):
+            return
+        row = self.conn.execute(
+            "SELECT runs FROM agno_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        runs, encoded_as_string = self._decode_agno_runs(row["runs"])
+        kept = runs[: max(0, int(keep_count))]
+        self.conn.execute(
+            "UPDATE agno_sessions SET runs = ?, updated_at = strftime('%s','now') WHERE session_id = ?",
+            (self._encode_agno_runs(kept, encoded_as_string), session_id),
+        )
+
+    def get_last_active_chat_turn(self, minister_name: str, turn: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT * FROM chat_turns
+            WHERE minister_name = ? AND turn = ? AND status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (minister_name, int(turn)),
+        ).fetchone()
+        return self._row_dict(row) if row is not None else None
+
+    def is_global_last_active_chat_turn(self, chat_turn_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT id FROM chat_turns WHERE status = 'active' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return bool(row and int(row["id"]) == int(chat_turn_id))
+
+    def can_undo_last_chat_turn(self, minister_name: str, turn: int) -> bool:
+        row = self.get_last_active_chat_turn(minister_name, turn)
+        if row is None:
+            return False
+        if not row.get("user_message_id") or not row.get("minister_message_id"):
+            return False
+        return self.is_global_last_active_chat_turn(int(row["id"]))
+
+    def _restore_row_in_tx(self, table: str, row: Dict[str, Any]) -> None:
+        if not row:
+            return
+        if table not in self._ROLLBACK_TABLE_PK:
+            raise ValueError(f"不支持回滚表：{table}")
+        columns = list(row.keys())
+        placeholders = ",".join("?" for _ in columns)
+        column_sql = ",".join(columns)
+        self.conn.execute(
+            f"INSERT OR REPLACE INTO {table} ({column_sql}) VALUES ({placeholders})",
+            [row[column] for column in columns],
+        )
+
+    def _delete_row_in_tx(self, table: str, target_id: str) -> None:
+        pk = self._ROLLBACK_TABLE_PK.get(table)
+        if not pk:
+            raise ValueError(f"不支持回滚表：{table}")
+        self.conn.execute(f"DELETE FROM {table} WHERE {pk} = ?", (target_id,))
+
+    def undo_chat_turn(self, chat_turn_id: int) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM chat_turns WHERE id = ?",
+            (int(chat_turn_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("召对轮次不存在。")
+        turn_row = self._row_dict(row)
+        if turn_row["status"] != "active":
+            raise ValueError("该召对已经撤回或不可撤回。")
+        if not self.is_global_last_active_chat_turn(int(chat_turn_id)):
+            raise ValueError("只能撤回全局最后一轮召对。")
+        items = self.conn.execute(
+            """
+            SELECT * FROM chat_turn_rollback_items
+            WHERE chat_turn_id = ?
+            ORDER BY id DESC
+            """,
+            (int(chat_turn_id),),
+        ).fetchall()
+        message_ids = [
+            int(mid)
+            for mid in (turn_row.get("user_message_id"), turn_row.get("minister_message_id"))
+            if mid
+        ]
+        with self.conn:
+            for item in items:
+                table = str(item["target_table"])
+                strategy = str(item["rollback_strategy"])
+                target_id = str(item["target_id"])
+                if strategy == "delete_inserted_row":
+                    self._delete_row_in_tx(table, target_id)
+                elif strategy in {"restore_row", "restore_deleted_row"}:
+                    before_row = self._json_load_row(item["before_json"])
+                    self._restore_row_in_tx(table, before_row)
+                else:
+                    raise ValueError(f"不支持的回滚策略：{strategy}")
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                self.conn.execute(
+                    f"DELETE FROM chat_messages WHERE id IN ({placeholders})",
+                    message_ids,
+                )
+            self.conn.execute(
+                """
+                UPDATE chat_turns
+                SET status = 'undone', undone_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(chat_turn_id),),
+            )
+            self._truncate_agno_runs_in_tx(
+                str(turn_row.get("agno_session_id") or ""),
+                int(turn_row.get("agno_runs_before") or 0),
+            )
+        return turn_row
 
     # ----- event memories（渐进式记忆：摘要卡 + 来源摘录） -----
 
@@ -3405,6 +3967,104 @@ class GameDB:
             (turn,),
         ).fetchone()
         return (row["report"] if row else "") or ""
+
+    # ── 章节记忆（event_memories 的 chapter_summary 类，每回合一条，importance=5 永久）──
+
+    def save_chapter_memory(self, state: GameState, title: str, body: str) -> int:
+        """落本回合章节记忆。subject 固定 court/chapter，event_type=chapter_summary，
+        source_id=turn 保证每回合唯一。body 存整段叙事章节（不受 outcome 80 字限）。"""
+        memory_id = self.upsert_event_memory(
+            state,
+            subject_type="court",
+            subject_id="chapter",
+            event_type="chapter_summary",
+            title=str(title or f"崇祯{state.year}年{state.period}月")[:40],
+            outcome=str(title or "")[:80],
+            sentiment="neutral",
+            importance=5,
+            tags=["章节", f"turn{state.turn}"],
+            source_kind="turn_report",
+            source_id=str(state.turn),
+            expires_turn=None,
+        )
+        if memory_id:
+            self.conn.execute(
+                "UPDATE event_memories SET body = ? WHERE id = ?",
+                (str(body or ""), memory_id),
+            )
+            self.conn.commit()
+        return memory_id
+
+    def list_chapter_memories(
+        self, upto_turn: Optional[int] = None, recent: Optional[int] = None
+    ) -> List[Dict[str, object]]:
+        """取章节记忆，按 turn 升序。upto_turn 限上界；recent 只取最近 N 回合（喂大臣/推演用）。"""
+        clauses = ["event_type = 'chapter_summary'"]
+        params: list = []
+        if upto_turn is not None:
+            clauses.append("turn <= ?")
+            params.append(int(upto_turn))
+        if recent is not None and upto_turn is not None:
+            clauses.append("turn >= ?")
+            params.append(max(1, int(upto_turn) - int(recent) + 1))
+        where = " AND ".join(clauses)
+        rows = self.conn.execute(
+            f"SELECT turn, year, period, title, body FROM event_memories "
+            f"WHERE {where} ORDER BY turn ASC",
+            params,
+        ).fetchall()
+        return [
+            {
+                "turn": int(r["turn"]),
+                "year": int(r["year"]),
+                "period": int(r["period"]),
+                "title": r["title"] or "",
+                "body": r["body"] or "",
+            }
+            for r in rows
+        ]
+
+    # ── 结局总结 ──
+
+    def save_ending_summary(
+        self, state: GameState, ending_status: str, summary: str, timeline: List[Dict[str, object]]
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO ending_summary (turn, year, period, ending_status, summary, timeline)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(turn) DO UPDATE SET
+                year = excluded.year, period = excluded.period,
+                ending_status = excluded.ending_status,
+                summary = excluded.summary, timeline = excluded.timeline
+            """,
+            (
+                state.turn, state.year, state.period, str(ending_status or ""),
+                str(summary or ""), json.dumps(timeline or [], ensure_ascii=False),
+            ),
+        )
+        self.conn.commit()
+
+    def get_ending_summary(self) -> Optional[Dict[str, object]]:
+        """取最近一条结局总结（单库一局，按 turn 取最大）。无则 None。"""
+        row = self.conn.execute(
+            "SELECT turn, year, period, ending_status, summary, timeline "
+            "FROM ending_summary ORDER BY turn DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            timeline = json.loads(row["timeline"] or "[]")
+        except Exception:
+            timeline = []
+        return {
+            "turn": int(row["turn"]),
+            "year": int(row["year"]),
+            "period": int(row["period"]),
+            "ending_status": row["ending_status"],
+            "summary": row["summary"] or "",
+            "timeline": timeline,
+        }
 
     def list_archived_turns(self) -> List[Dict[str, object]]:
         """所有已存档回合（turn_reports/turn_extractions/turn_directives 任一有数据）。
@@ -3963,6 +4623,126 @@ class GameDB:
         self.conn.commit()
         return self.conn.execute("SELECT * FROM issues WHERE id=?", (issue_id,)).fetchone()
 
+    # ── 帝国修正（legacies 表）：结案留下的长期百分比修正符，落账层放大/缩小增量 ────
+    def insert_legacy(
+        self,
+        state: GameState,
+        *,
+        name: str,
+        modifiers: Dict[str, object],
+        narrative_hint: str = "",
+        duration_months: int = 24,
+        source_issue_id: int | None = None,
+        clear_gate: Dict[str, str] | None = None,
+        legacy_key: str = "",
+    ) -> int:
+        """结案产生持续修正符。start_month=当前绝对月，duration_months=-1 为永久。
+        clear_gate 非空时：靠程序按 _gate_passed 判定消除（见 issues.clear_gated_legacies），与时长无关。"""
+        start_month = int(state.year) * 12 + int(state.period)
+        cur = self.conn.execute(
+            """INSERT INTO legacies
+               (name, source_issue_id, modifiers, narrative_hint,
+                start_month, duration_months, status, clear_gate, legacy_key)
+               VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (
+                str(name)[:60], source_issue_id,
+                json.dumps(modifiers, ensure_ascii=False),
+                str(narrative_hint)[:200],
+                start_month, int(duration_months),
+                json.dumps(clear_gate or {}, ensure_ascii=False),
+                str(legacy_key)[:60],
+            ),
+        )
+        self.conn.commit()
+        self._legacy_mod_cache = None  # active 集变了，修正符缓存失效
+        return int(cur.lastrowid)
+
+    def list_active_legacies(self, state: GameState) -> List[sqlite3.Row]:
+        """当前仍生效的帝国修正，顺手把已到期的失活。"""
+        self.expire_legacies(state)
+        return self.conn.execute(
+            "SELECT * FROM legacies WHERE status='active' ORDER BY id"
+        ).fetchall()
+
+    def expire_legacies(self, state: GameState) -> List[int]:
+        """到期失活：当前月 >= start_month + duration_months（永久 -1 永不到期）。"""
+        now = int(state.year) * 12 + int(state.period)
+        rows = self.conn.execute(
+            "SELECT id, start_month, duration_months FROM legacies WHERE status='active'"
+        ).fetchall()
+        expired: List[int] = []
+        for r in rows:
+            dur = int(r["duration_months"])
+            if dur < 0:
+                continue
+            if now >= int(r["start_month"]) + dur:
+                expired.append(int(r["id"]))
+        if expired:
+            self.conn.executemany(
+                "UPDATE legacies SET status='expired' WHERE id=?",
+                [(i,) for i in expired],
+            )
+            self.conn.commit()
+            self._legacy_mod_cache = None  # active 集变了，修正符缓存失效
+        return expired
+
+    def legacy_remaining_months(self, row: sqlite3.Row, state: GameState) -> int:
+        """剩余月数；-1=永久。"""
+        dur = int(row["duration_months"])
+        if dur < 0:
+            return -1
+        now = int(state.year) * 12 + int(state.period)
+        return max(0, int(row["start_month"]) + dur - now)
+
+    def legacy_modifiers(self, state: GameState) -> Dict[str, object]:
+        """聚合所有 active 遗产的百分比修正符，同维度累加（A 方案）。返回：
+        {
+          "国库": net_pct, "内库": net_pct, "民心": net_pct, "皇威": net_pct,
+          "regions": {region_id: {field: net_pct, ...}, ...},
+          "armies":  {army_id:  {field: net_pct, ...}, ...},
+        }
+        net_pct 为带符号整数百分比；落账时 base>=0 用 ×(1+net/100)，base<0 用 ×(1-net/100)。
+        结果缓存，active 遗产集变化时由 insert_legacy/expire_legacies 清空。
+        """
+        # expire 可能改变 active 集 → 先跑（其内部会在有变动时清缓存）
+        self.expire_legacies(state)
+        if self._legacy_mod_cache is not None:
+            return self._legacy_mod_cache
+        agg: Dict[str, object] = {"国库": 0, "内库": 0, "民心": 0, "皇威": 0, "regions": {}, "armies": {}}
+        for lg in self.conn.execute(
+            "SELECT modifiers FROM legacies WHERE status='active' ORDER BY id"
+        ).fetchall():
+            try:
+                eff = json.loads(str(lg["modifiers"] or "{}"))
+            except Exception:
+                continue
+            for acc in ("国库", "内库", "民心", "皇威"):
+                v = eff.get(acc)
+                if isinstance(v, (int, float)):
+                    agg[acc] = int(agg[acc]) + int(v)
+            for scope in ("regions", "armies"):
+                block = eff.get(scope)
+                if not isinstance(block, dict):
+                    continue
+                dst = agg[scope]  # type: ignore[assignment]
+                for entity_id, fields in block.items():
+                    if not isinstance(fields, dict):
+                        continue
+                    bucket = dst.setdefault(str(entity_id), {})  # type: ignore[union-attr]
+                    for field, pct in fields.items():
+                        if isinstance(pct, (int, float)):
+                            bucket[str(field)] = int(bucket.get(str(field), 0)) + int(pct)
+        self._legacy_mod_cache = agg
+        return agg
+
+    @staticmethod
+    def apply_legacy_pct(base: int, net_pct: int) -> int:
+        """遗产百分比修正：base>=0 → base×(1+net/100)；base<0 → base×(1-net/100)。net=0 原样。"""
+        if net_pct == 0 or base == 0:
+            return int(base)
+        factor = (1 + net_pct / 100.0) if base >= 0 else (1 - net_pct / 100.0)
+        return int(round(base * factor))
+
     def cancel_issue(
         self,
         state: GameState,
@@ -4016,7 +4796,15 @@ class GameDB:
 
         purpose/target_kind/target_id 仅对 extractor 抽出的 economy_moves（自由拨款）填，
         flows 月固定支出与所有收入一律 None。受控枚举见 constants.ECONOMY_PURPOSES。
+
+        遗产修正：account 上若有 active 遗产百分比修正符，先按 apply_legacy_pct 放大/缩小 delta
+        再落账（base>=0 ×(1+net/100)，base<0 ×(1-net/100)）。修正折进本笔流水，不另立账行。
+        category=='局势遗产' 时不再二次修正（避免自乘，且当前已无该类调用）。
         """
+        if category != "局势遗产":
+            net_pct = int(self.legacy_modifiers(state).get(account, 0) or 0)  # type: ignore[arg-type]
+            if net_pct:
+                delta = self.apply_legacy_pct(int(delta), net_pct)
         before = int(state.metrics[account])
         after = max(0, before + int(delta))
         actual = after - before
@@ -4380,6 +5168,78 @@ class GameDB:
                 {"role": row["role"], "content": row["content"]}
             )
         return result
+
+    # ── 调试用通用 CRUD（仅限白名单核心表）──────────────────────
+    # 表名 → 主键列。只暴露核心几张，防误删元数据/日志表。
+    ADMIN_TABLES: Dict[str, str] = {
+        "game_state": "id",        # 局势
+        "metrics": "key",          # 国家修正（国库/内库/民心/皇威）
+        "regions": "id",           # 地区
+        "armies": "id",            # 军队
+        "characters": "name",      # 人物
+        "buildings": "id",         # 建筑
+    }
+
+    def admin_check_table(self, table: str) -> str:
+        pk = self.ADMIN_TABLES.get(table)
+        if pk is None:
+            raise ValueError(f"表 {table!r} 不在调试白名单")
+        return pk
+
+    def admin_columns(self, table: str) -> List[Dict[str, object]]:
+        """PRAGMA 取列定义：name/type/notnull/pk/default。"""
+        self.admin_check_table(table)
+        cur = self.conn.execute(f"PRAGMA table_info({table})")
+        return [
+            {
+                "name": r["name"],
+                "type": r["type"],
+                "notnull": bool(r["notnull"]),
+                "pk": bool(r["pk"]),
+                "default": r["dflt_value"],
+            }
+            for r in cur.fetchall()
+        ]
+
+    def admin_rows(self, table: str) -> List[Dict[str, object]]:
+        pk = self.admin_check_table(table)
+        cur = self.conn.execute(f"SELECT * FROM {table} ORDER BY {pk}")
+        return [dict(r) for r in cur.fetchall()]
+
+    def _admin_valid_cols(self, table: str) -> set:
+        return {c["name"] for c in self.admin_columns(table)}
+
+    def admin_upsert(self, table: str, values: Dict[str, object]) -> Dict[str, object]:
+        """按主键 INSERT OR REPLACE，返回落库后的行。只接受表内有的列。"""
+        pk = self.admin_check_table(table)
+        valid = self._admin_valid_cols(table)
+        data = {k: v for k, v in values.items() if k in valid}
+        if pk not in data or data[pk] in (None, ""):
+            raise ValueError(f"缺主键 {pk}")
+        cols = list(data.keys())
+        placeholders = ",".join("?" for _ in cols)
+        collist = ",".join(cols)
+        self.conn.execute(
+            f"INSERT OR REPLACE INTO {table} ({collist}) VALUES ({placeholders})",
+            [data[c] for c in cols],
+        )
+        # 国库/内库同时落在 economy_accounts.balance，load_state 会用后者盖回 metrics。
+        # 只改 metrics 表会在下回合被覆盖，故此处同步 economy_accounts。
+        if table == "metrics" and data.get("key") in ("国库", "内库") and "value" in data:
+            self.conn.execute(
+                "UPDATE economy_accounts SET balance = ? WHERE account = ?",
+                (int(data["value"]), data["key"]),
+            )
+        self.conn.commit()
+        row = self.conn.execute(f"SELECT * FROM {table} WHERE {pk}=?", (data[pk],)).fetchone()
+        return dict(row) if row else {}
+
+    def admin_delete(self, table: str, pk_value: object) -> int:
+        """按主键删行，返回受影响行数。"""
+        pk = self.admin_check_table(table)
+        cur = self.conn.execute(f"DELETE FROM {table} WHERE {pk}=?", (pk_value,))
+        self.conn.commit()
+        return cur.rowcount
 
     def close(self) -> None:
         self.conn.close()

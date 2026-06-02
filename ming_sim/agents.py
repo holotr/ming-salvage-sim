@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -37,12 +38,54 @@ def _ctx() -> GameContent:
     return _content
 
 
+# 调试开关：MING_SIM_DUMP_LLM=1 时把每次 agno 调用真实送进 LLM 的 system/user/assistant
+# 全文落盘到 scripts/runs/llm_dump_<pid>.log。从 RunOutput.messages 取（=实际 payload，非重建）。
+_DUMP_LLM = os.environ.get("MING_SIM_DUMP_LLM", "").strip() in ("1", "true", "yes")
+_DUMP_PATH = f"scripts/runs/llm_dump_{os.getpid()}.log"
+
+
+def _dump_llm_messages(output: Any, tag: str, agent: Optional[Agent] = None) -> None:
+    """把这次 run 的完整 messages（含 system prompt）追加写盘。仅 _DUMP_LLM 开时生效。
+
+    非流式：output 即 RunOutput，带 .messages。
+    流式：终结事件 RunCompletedEvent 无 .messages，改从 agent.get_last_run_output() 取。"""
+    if not _DUMP_LLM:
+        return
+    msgs = getattr(output, "messages", None)
+    if not msgs and agent is not None:
+        try:
+            last = agent.get_last_run_output()
+            msgs = getattr(last, "messages", None)
+        except Exception:  # noqa: BLE001 — dump 是调试旁路，任何异常都不该断结算
+            msgs = None
+    if not msgs:
+        return
+    lines = [f"\n{'='*80}\n[DUMP] tag={tag}  共 {len(msgs)} 条 message\n{'='*80}"]
+    for i, m in enumerate(msgs):
+        role = getattr(m, "role", "?")
+        content = getattr(m, "content", "")
+        if content is None:
+            content = ""
+        lines.append(f"\n----- #{i} role={role} ({len(str(content))} 字) -----\n{content}")
+        # 工具调用也带上
+        tcalls = getattr(m, "tool_calls", None)
+        if tcalls:
+            lines.append(f"\n  [tool_calls] {tcalls}")
+    try:
+        with open(_DUMP_PATH, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        tlog(f"[{tag}] LLM messages 已 dump → {_DUMP_PATH}")
+    except OSError as e:
+        tlog(f"[{tag}] dump 写盘失败：{e}")
+
+
 def run_agent_text(agent: Agent, prompt: str, tag: str) -> str:
     """非流式跑 agent，返回最终完整文本。
     extractor/sanitizer 这类要严格 JSON 的场合用——避免流式 buffer 把 LLM 偶发重发段累加成畸形。"""
     tlog(f"[{tag}] 开始非流式推演（等待完整响应）")
     t0 = time.monotonic()
     output = agent.run(prompt)
+    _dump_llm_messages(output, tag)
     text = extract_agent_text(output)
     tlog(f"[{tag}] 完成，{len(text)} 字，用时 {time.monotonic() - t0:.1f}s")
     return text
@@ -157,6 +200,7 @@ def run_agent_stream_text(
         abort_llm_contract(tag, "流式无内容且无终结事件", "")
     tlog(f"[{tag}] 完成，{len(text)} 字，工具调用 {tool_calls} 次")
     # 流式 openai response 无 .usage，monkeypatch 抓不到；从终结事件 metrics 补记 token。
+    _dump_llm_messages(final_output, tag, agent=agent)
     if final_output is not None:
         metrics = getattr(final_output, "metrics", None)
         model_id = getattr(getattr(agent, "model", None), "id", None) or "stream"
@@ -245,43 +289,70 @@ def create_decree_writer_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agen
     )
 
 
-_MEMORY_RETRIEVAL_PROMPT = (
-    "你是记忆检索助手。从给定文本（诏书、对话、奏报均可）中提取关键实体、操作词与时间信息，用于检索历史记忆。\n"
-    "输出严格 JSON，不加任何解释：\n"
-    "{\n"
-    '  "characters": ["人名", ...],\n'
-    '  "regions": ["地名/省份", ...],\n'
-    '  "armies": ["军队名", ...],\n'
-    '  "powers": ["势力名", ...],\n'
-    '  "keywords": ["核心动词或操作名词或钱粮科目", ...],\n'
-    '  "year": 1628,\n'
-    '  "period": 3\n'
-    "}\n"
-    "规则：只提取文本中实际出现的词；keywords 限 5 个以内最核心的；所有列表可为空数组。\n"
-    "year/period：仅当文本明确提及具体年份或月份时填写（如「崇祯元年三月」→ year=1628, period=3）；"
-    "无明确时间则两字段均不输出或填 null。"
-)
+def _is_cols_rows_table(v: object) -> bool:
+    """判断某字段是否 {cols,rows} 二维表（可转 TSV）。"""
+    return isinstance(v, dict) and set(v.keys()) == {"cols", "rows"}
 
 
-def create_memory_retrieval_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agent:
-    """从诏书提取实体词用于记忆检索；低温、无 tool、输出纯 JSON。"""
-    return Agent(
-        name="记忆检索员",
-        id="memory-retrieval",
-        session_id="memory-retrieval",
-        db=agno_db,
-        model=create_chat_model(
-            llm_config,
-            temperature=0.0,
-            top_p=0.7,
-            max_tokens=max(400, llm_config.max_tokens),
-            enable_thinking=False,
-            force_json_output=True,
-        ),
-        instructions=[_MEMORY_RETRIEVAL_PROMPT],
-        add_history_to_context=False,
-        markdown=False,
-    )
+def _table_to_tsv(name: str, table: Dict[str, object]) -> str:
+    """{cols,rows} → 真 TSV 文本块（tab 分隔、换行分行）。
+
+    放在 json.dumps 之外，避免 \\t/\\n 被 JSON 转义吃掉压缩收益（实测比 dict-of-rows -25%、
+    比转义后塞进 JSON 再 -10%）。空表只吐表头行（空）。None → 空串。
+    """
+    cols = [str(c) for c in (table.get("cols") or [])]
+    rows = table.get("rows") or []
+    lines = ["\t".join(cols)]
+    for r in rows:  # type: ignore[assignment]
+        lines.append("\t".join("" if v is None else str(v) for v in r))
+    return f"## {name}（TSV，首行列名，tab 分隔）\n" + "\n".join(lines)
+
+
+def build_simulator_context(simulator_payload: Optional[Dict[str, object]]) -> str:
+    """拼 simulator/extractor 共用的盘面前缀段（turn_header + 盘面 TSV 块 + 其余 JSON）。
+
+    缓存关键：simulator 与 extractor 的 system instructions 前缀都是
+    `[game_world, simulator_context, ...]`。本函数对二者吐出**字节级一致**的 simulator_context，
+    simulator 先跑就把 `game_world + simulator_context` 写进 DeepSeek 前缀缓存，extractor
+    再命中。turn_header 文案、取值路径(统一从 payload['turn'])、序列化参数三者两边同源。
+
+    BUG 修复：历史上 simulator 用 state 路径+文案「邸报抬头与正文涉及年月」，extractor 用
+    payload['turn']+文案「抽取涉及年月」→ 第一个字节就分叉 → extractor 整段 payload 全 miss。
+    实测统一后结算 token -14.7%。
+
+    TSV 优化：`{cols,rows}` 二维表（regions/armies/buildings/court_roster/powers_brief）转**真
+    TSV 文本块**（json.dumps 之外，免转义），按「变化最小→最易变」排序——建筑/人物在前，军队/
+    地区其次，诏书/记忆/issue 等高频变化字段连同非表字段走尾部 JSON。其余字段（含 factions_brief/
+    classes_brief 叙述串、issues/memories 等）维持 JSON。实测表类 -25% token。
+    """
+    payload = simulator_payload or {}
+    turn_header = ""
+    if isinstance(payload.get("turn"), dict):
+        t = payload["turn"]
+        turn_header = (
+            f"【本回合年月】{t.get('year')} 年 {t.get('period')} 月（第 {t.get('turn')} 回合）。"
+            f"涉及年月时以此为准。\n"
+        )
+
+    # 盘面表（{cols,rows}）转 TSV，按「稳→变」排序置前；缺失/非表的跳过。
+    table_order = ("buildings", "court_roster", "armies", "regions")
+    tsv_blocks: List[str] = []
+    consumed: set[str] = set()
+    for name in table_order:
+        v = payload.get(name)
+        if _is_cols_rows_table(v):
+            tsv_blocks.append(_table_to_tsv(name, v))  # type: ignore[arg-type]
+            consumed.add(name)
+    # table_order 未列到、但仍是 {cols,rows} 的表也转 TSV（防新增表字段漏压缩），稳定排序。
+    for name in sorted(k for k in payload if k not in consumed and _is_cols_rows_table(payload.get(k))):
+        tsv_blocks.append(_table_to_tsv(name, payload[name]))  # type: ignore[arg-type]
+        consumed.add(name)
+
+    rest = {k: v for k, v in payload.items() if k not in consumed}
+    parts = [turn_header + "【本回合推演输入 simulator_payload】"]
+    parts.extend(tsv_blocks)
+    parts.append("## 其余字段（JSON）\n" + json.dumps(rest, ensure_ascii=False, sort_keys=False))
+    return "\n".join(parts)
 
 
 def create_season_simulator_agent(
@@ -293,28 +364,11 @@ def create_season_simulator_agent(
 ) -> Agent:
     """月末推演日讲官。全量盘面走 user payload，无 tool。
     走 advanced 角色派生：若 advanced_model 已配，用更强模型；否则 fallback 主 model。"""
-    del db
+    del db, state
     cfg = _llm_for_role(llm_config, "simulator")
     tlog(f"[simulator] 使用模型 {cfg.model}")
-    # 显式年月单挑出来——别让 LLM 在大 JSON payload 里翻 turn 子节，邸报抬头才不会写错。
-    turn_header = ""
-    if state is not None:
-        turn_header = (
-            f"【本回合年月】{state.year} 年 {state.period} 月（第 {state.turn} 回合）。"
-            f"邸报抬头与正文涉及年月时以此为准。\n"
-        )
-    elif simulator_payload and isinstance(simulator_payload.get("turn"), dict):
-        t = simulator_payload["turn"]
-        turn_header = (
-            f"【本回合年月】{t.get('year')} 年 {t.get('period')} 月（第 {t.get('turn')} 回合）。"
-            f"邸报抬头与正文涉及年月时以此为准。\n"
-        )
-    simulator_context = (
-        turn_header
-        + "【本回合推演输入 simulator_payload】\n"
-        + json.dumps(simulator_payload or {}, ensure_ascii=False, sort_keys=False)
-    )
-    del state
+    # simulator_context 与 extractor 共用 build_simulator_context → 字节一致 → 暖好 extractor 前缀缓存。
+    simulator_context = build_simulator_context(simulator_payload)
 
     return Agent(
         name="月末推演日讲官",
@@ -323,29 +377,6 @@ def create_season_simulator_agent(
         db=agno_db,
         model=create_chat_model(cfg, temperature=0.9, top_p=0.95, max_tokens=cfg.max_tokens, enable_thinking=True),
         instructions=[_ctx().game_world_prompt, simulator_context, _ctx().season_simulator_prompt],
-        add_history_to_context=False,
-        markdown=False,
-    )
-
-
-def create_score_extractor_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agent:
-    """打分提取员。走 advanced 角色派生：若 advanced_model 已配，用更强模型。"""
-    cfg = _llm_for_role(llm_config, "extractor")
-    tlog(f"[extractor] 使用模型 {cfg.model}")
-    return Agent(
-        name="档房书办",
-        id="score-extractor",
-        session_id="score-extractor",
-        db=agno_db,
-        model=create_chat_model(
-            cfg,
-            temperature=0.1,
-            top_p=0.7,
-            max_tokens=cfg.max_tokens,
-            enable_thinking=False,
-            force_json_output=True,
-        ),
-        instructions=[_ctx().game_world_prompt, _ctx().score_extractor_prompt],
         add_history_to_context=False,
         markdown=False,
     )
@@ -365,18 +396,8 @@ def create_score_extractor_module_agent(
         raise RuntimeError(f"未知结算提取模块：{module}")
     cfg = _llm_for_role(llm_config, "extractor")
     tlog(f"[extractor/{module}] 使用模型 {cfg.model}")
-    turn_header = ""
-    if simulator_payload and isinstance(simulator_payload.get("turn"), dict):
-        t = simulator_payload["turn"]
-        turn_header = (
-            f"【本回合年月】{t.get('year')} 年 {t.get('period')} 月（第 {t.get('turn')} 回合）。"
-            f"抽取涉及年月时以此为准。\n"
-        )
-    simulator_context = (
-        turn_header
-        + "【本回合推演输入 simulator_payload】\n"
-        + json.dumps(simulator_payload or {}, ensure_ascii=False, sort_keys=False)
-    )
+    # 与 simulator 共用同一函数 → simulator_context 字节级一致 → 命中 simulator 暖好的前缀缓存。
+    simulator_context = build_simulator_context(simulator_payload)
     supplemental = (
         "【结算补充上下文 extractor_context】\n"
         + json.dumps(supplemental_context or {}, ensure_ascii=False, sort_keys=False)
@@ -429,45 +450,43 @@ def create_json_sanitizer_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Age
     )
 
 
-def create_chat_memory_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agent:
-    """从当月召对聊天提取承诺/建议/情报摘要，写入 event_memory（source_kind=chat_message）。"""
+def create_chapter_memory_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agent:
+    """章节记忆：把本回合诏书+邸报+落库效果浓缩成一段叙事章节（纯文本，非 JSON）。"""
     ctx = _ctx()
     return Agent(
-        name="对话记忆档房",
-        id="chat-memory-extractor",
-        session_id="chat-memory-extractor",
+        name="起居注史官",
+        id="chapter-memory",
+        session_id="chapter-memory",
         db=agno_db,
         model=create_chat_model(
             llm_config,
-            temperature=0.1,
-            top_p=0.7,
-            max_tokens=max(1500, llm_config.max_tokens),
+            temperature=0.5,
+            top_p=0.85,
+            max_tokens=max(1200, llm_config.max_tokens),
             enable_thinking=False,
-            force_json_output=True,
         ),
-        instructions=[ctx.game_world_prompt, ctx.chat_memory_extractor_prompt],
+        instructions=[ctx.game_world_prompt, ctx.chapter_memory_prompt],
         add_history_to_context=False,
         markdown=False,
     )
 
 
-def create_memory_extractor_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agent:
-    """从本月诏书+邸报+落库结果提取人物/势力/地区/军队事件记忆。"""
+def create_ending_summary_agent(llm_config: LLMConfig, agno_db: SqliteDb) -> Agent:
+    """国史编纂官：读全程章节记忆 + 结局类型，生成史评式结局总结（纯文本流式）。"""
     ctx = _ctx()
     return Agent(
-        name="事件记忆档房",
-        id="memory-extractor",
-        session_id="memory-extractor",
+        name="国史编纂官",
+        id="ending-summary",
+        session_id="ending-summary",
         db=agno_db,
         model=create_chat_model(
             llm_config,
-            temperature=0.1,
-            top_p=0.7,
-            max_tokens=max(2000, llm_config.max_tokens),
-            enable_thinking=False,
-            force_json_output=True,
+            temperature=0.6,
+            top_p=0.9,
+            max_tokens=max(2400, llm_config.max_tokens),
+            enable_thinking=True,
         ),
-        instructions=[ctx.game_world_prompt, ctx.memory_extractor_prompt],
+        instructions=[ctx.game_world_prompt, ctx.ending_summary_prompt],
         add_history_to_context=False,
         markdown=False,
     )

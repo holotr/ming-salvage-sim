@@ -8,6 +8,8 @@ import {
   Loader2,
   Lock,
   LogOut,
+  ChevronLeft,
+  ChevronRight,
   MapPinned,
   Menu,
   MessageSquare,
@@ -19,11 +21,18 @@ import {
   ScrollText,
   Shield,
   Star,
+  Target,
   Trash2,
   Swords,
   Upload,
   X,
+  Pencil,
+  Eraser,
+  Move,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
+import { EXTERNAL_PATH_GROUPS, MAP_VIEW_BOX, REGION_PATH_GROUPS } from "./mapPaths";
 import "./styles.css";
 import "./mobile.css";
 
@@ -109,6 +118,32 @@ type MapNode = {
   region?: Region;
   armies: Army[];
   buildings?: Building[];
+  power?: Power;
+};
+
+type RegionPathRenderItem = {
+  id: string;
+  name: string;
+  controlledBy: string;
+  unrest: number;
+  risk: number;
+  labelX: number;
+  labelY: number;
+  paths: Array<{ id: string; d: string }>;
+};
+
+type ExternalPathRenderItem = {
+  id: string;
+  name: string;
+  powerId: string;
+  labelX: number;
+  labelY: number;
+  paths: Array<{ id: string; d: string }>;
+};
+
+type SvgLabelPosition = {
+  svgX: number;
+  svgY: number;
 };
 
 type Minister = {
@@ -173,6 +208,25 @@ type Issue = {
   effect_on_fail: Record<string, number>;
 };
 
+type LegacyEffect = {
+  国库?: number;
+  内库?: number;
+  民心?: number;
+  皇威?: number;
+  regions?: Record<string, Record<string, number>>;
+  armies?: Record<string, Record<string, number>>;
+};
+
+type Legacy = {
+  id: number;
+  name: string;
+  narrative_hint: string;
+  modifiers: LegacyEffect;
+  effect_text: string;
+  remaining_months: number;  // -1 = 永久
+  clear_condition: string;
+};
+
 type ClosedIssue = {
   id: number;
   kind: "situation" | "initiative";
@@ -218,6 +272,7 @@ type GameState = {
   previous_summary: string;
   treasury: string;
   issues: Issue[];
+  legacies: Legacy[];
   closed_this_turn: ClosedIssue[];
   budget: Budget;
   region_warning: string;
@@ -225,6 +280,7 @@ type GameState = {
   power_warning: string;
   powers: Power[];
   victory_status: { status: string; summary: string };
+  ending: EndingPayload | null;
   events: EventItem[];
   regions: Region[];
   armies: Army[];
@@ -237,19 +293,28 @@ type GameState = {
   last_report: string;
 };
 
+type EndingTimelineItem = {
+  turn: number; year: number; period: number;
+  decree_brief: string; effect_brief: string; chapter: string;
+};
+type EndingPayload = {
+  status: string; label: string; summary: string; timeline: EndingTimelineItem[];
+};
 type ChatMessage = { role: "user" | "minister"; content: string };
 type ChatDisplayMessage = ChatMessage & { pending?: boolean };
 type Suggestion = { label: string; text: string; prefix?: boolean };
-type ModalName = "none" | "state" | "chat" | "edict" | "report" | "extraction" | "history" | "menu" | "secret_orders";
+type ModalName = "none" | "state" | "chat" | "edict" | "report" | "extraction" | "history" | "menu" | "secret_orders" | "ending" | "long_goals";
 type SaveEntry = { name: string; size: number; mtime: number };
 type LLMConfigInfo = {
   base_url: string;
   model: string;
   max_tokens: number;
   timeout_seconds: number;
+  thinking_level: string;
   advanced_model: string;
   advanced_base_url: string;
   has_advanced_api_key: boolean;
+  advanced_thinking_level: string;
   has_api_key: boolean;
   persisted: {
     base_url: string;
@@ -257,9 +322,11 @@ type LLMConfigInfo = {
     has_api_key: boolean;
     max_tokens: number;
     timeout_seconds: number;
+    thinking_level: string;
     advanced_model: string;
     advanced_base_url: string;
     has_advanced_api_key: boolean;
+    advanced_thinking_level: string;
   };
 };
 type SecretOrder = {
@@ -285,6 +352,8 @@ type ChatResponse = {
   history: ChatMessage[];
   suggestions: Suggestion[];
   directives: Directive[];
+  pending_count?: number;
+  can_undo_last_chat?: boolean;
   court_action?: string;
   next_minister?: string;
   registered_minister?: string;
@@ -300,6 +369,15 @@ const cookieValue = (name: string) => {
 const csrfHeaders = (): Record<string, string> => {
   const token = cookieValue("csrf_token");
   return token ? { "X-CSRF-Token": token } : {};
+};
+
+type ChatUndoResponse = {
+  history: ChatMessage[];
+  suggestions: Suggestion[];
+  directives: Directive[];
+  pending_count: number;
+  secret_orders: SecretOrder[];
+  can_undo_last_chat: boolean;
 };
 
 type ApiErrorDetail = {
@@ -446,28 +524,48 @@ const issueTone = (value: number) => {
   return "good";
 };
 
-const formatIssueEffect = (effect: Record<string, number>) => {
-  const parts = Object.entries(effect || {})
-    .filter(([, value]) => typeof value === "number" && value !== 0)
-    .map(([key, value]) => `${key} ${value > 0 ? "+" : ""}${value}`);
-  return parts.length ? parts.join("、") : "无直接数值影响";
+const signedNumber = (value: number) => `${value > 0 ? "+" : ""}${value}`;
+
+const numericEffectValue = (value: any): number | null => {
+  if (typeof value === "number") return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) return Number(value);
+  return null;
 };
 
-const formatClosedEffect = (effect: any) => {
+const appendScopedEffect = (
+  parts: string[],
+  block: any,
+  labelEntity: (id: any) => string,
+) => {
+  if (!block || typeof block !== "object" || Array.isArray(block)) return;
+  for (const [entity, fields] of Object.entries(block)) {
+    if (!fields || typeof fields !== "object" || Array.isArray(fields)) continue;
+    for (const [field, raw] of Object.entries(fields)) {
+      const n = numericEffectValue(raw);
+      if (!n) continue;
+      parts.push(`${labelEntity(entity)}·${cnField(field)}${signedNumber(n)}`);
+    }
+  }
+};
+
+const formatEffectSummary = (effect: any) => {
   if (!effect || typeof effect !== "object") return "无直接数值影响";
   const parts: string[] = [];
+
   const metrics = effect.metrics || {};
   for (const [k, v] of Object.entries(metrics)) {
     const n = Number(v);
     if (!n) continue;
-    parts.push(`${k}${n > 0 ? "+" : ""}${n}`);
+    parts.push(`${k}${signedNumber(n)}`);
   }
+
   const econ = Array.isArray(effect.economy) ? effect.economy : [];
   for (const e of econ) {
     const n = Number(e?.delta);
     if (!n) continue;
-    parts.push(`${e.account || "钱粮"}${n > 0 ? "+" : ""}${n}万`);
+    parts.push(`${e.account || "钱粮"}${signedNumber(n)}万`);
   }
+
   const factions = effect.factions || {};
   for (const [k, v] of Object.entries(factions)) {
     if (v && typeof v === "object") {
@@ -475,16 +573,38 @@ const formatClosedEffect = (effect: any) => {
       for (const [kk, vv] of Object.entries(v as any)) {
         const n = Number(vv);
         if (!n) continue;
-        sub.push(`${kk}${n > 0 ? "+" : ""}${n}`);
+        sub.push(`${SAT_LEV_CN[kk] || cnField(kk)}${signedNumber(n)}`);
       }
       if (sub.length) parts.push(`${k}（${sub.join("、")}）`);
     } else {
       const n = Number(v);
-      if (n) parts.push(`${k}${n > 0 ? "+" : ""}${n}`);
+      if (n) parts.push(`${k}${signedNumber(n)}`);
     }
   }
+
+  appendScopedEffect(parts, effect.classes, labelClass);
+  appendScopedEffect(parts, effect.regions, labelRegion);
+  appendScopedEffect(parts, effect.armies, labelArmy);
+  appendScopedEffect(parts, effect.powers, labelPower);
+
+  if (effect.legacy && typeof effect.legacy === "object") {
+    const legacyName = String(effect.legacy.name || "帝国修正");
+    const duration = effect.legacy.duration ? `，${effect.legacy.duration}` : "";
+    const modifiers = formatLegacyEffect(effect.legacy.modifiers || {});
+    parts.push(`帝国修正：${legacyName}${duration}${modifiers ? `（${modifiers}）` : ""}`);
+  }
+
+  for (const [key, value] of Object.entries(effect)) {
+    if (["metrics", "economy", "factions", "classes", "regions", "armies", "powers", "legacy", "buildings"].includes(key)) continue;
+    const n = numericEffectValue(value);
+    if (n) parts.push(`${cnField(key)}${signedNumber(n)}`);
+  }
+
   return parts.length ? parts.join("、") : "无直接数值影响";
 };
+
+const formatIssueEffect = formatEffectSummary;
+const formatClosedEffect = formatEffectSummary;
 
 const splitReportItems = (text: string, prefix: string) => {
   const cleaned = text.replace(prefix, "").trim();
@@ -494,6 +614,86 @@ const splitReportItems = (text: string, prefix: string) => {
     items: itemsPart.split("；").map((item) => item.replace(/^。+|。+$/g, "").trim()).filter(Boolean),
     tail: totalMatch?.[1] || "",
   };
+};
+
+// 邸报详明里 extractor 常输出英文 id（region_id/army_id/power_id）或编号。
+// 这里建一份 id→中文名 的全局映射，每次拉 state 时刷新，供 ExtractionView 各 block 翻译。
+const labelMaps = {
+  region: new Map<string, string>(),
+  army: new Map<string, string>(),
+  power: new Map<string, string>(),
+  issue: new Map<number, string>(),
+};
+
+const POWER_ID_CN: Record<string, string> = {
+  ming: "大明",
+  houjin: "后金",
+  mongol: "蒙古",
+  korea: "朝鲜",
+  bandits: "流寇",
+  dutch: "荷兰东印度公司",
+  japan: "日本",
+};
+
+function refreshLabelMaps(state: GameState) {
+  labelMaps.region.clear();
+  labelMaps.army.clear();
+  labelMaps.power.clear();
+  labelMaps.issue.clear();
+  for (const r of state.regions || []) labelMaps.region.set(r.id, r.name);
+  for (const a of state.armies || []) labelMaps.army.set(a.id, a.name);
+  for (const p of state.powers || []) labelMaps.power.set(p.id, p.name);
+  for (const it of state.issues || []) labelMaps.issue.set(it.id, it.title);
+  for (const it of state.closed_this_turn || []) labelMaps.issue.set(it.id, it.title);
+}
+
+// 把 id 翻成中文名；查不到（如本月新增/已离场）就回退原值，至少不空。
+const labelRegion = (id: any) => labelMaps.region.get(String(id)) || String(id ?? "");
+const labelArmy = (id: any) => labelMaps.army.get(String(id)) || String(id ?? "");
+const labelPower = (id: any) => labelMaps.power.get(String(id)) || POWER_ID_CN[String(id)] || String(id ?? "");
+const labelIssue = (id: any) => {
+  const t = labelMaps.issue.get(Number(id));
+  return t ? `#${id} ${t}` : `#${id}`;
+};
+
+// extractor 偶尔吐出的英文枚举值，统一翻中文。
+const EN_VALUE_CN: Record<string, string> = {
+  ...POWER_ID_CN,
+  appoint: "新进朝堂", promote: "升迁", transfer: "调任", demote: "贬", reinstate: "起复",
+  resolved: "已了", failed: "崩坏", dropped: "撤销",
+  situation: "时局", initiative: "举措", crisis: "危机", reform: "改革", decree: "诏令",
+  done: "办结", pending: "在办", pending_review: "待核议", active: "进行中",
+  draft: "草案", rejected: "已驳回", cancelled: "已取消",
+};
+const cnValue = (v: any) => (v == null ? "" : (EN_VALUE_CN[String(v)] || String(v)));
+
+// extractor 吐的是英文字段名（region/army/class/power 的列名），这里统一翻中文。
+// 查不到的回退原值，至少不空。
+const EN_FIELD_CN: Record<string, string> = {
+  // 地区
+  public_support: "民心", unrest: "动乱", grain_security: "粮食安全",
+  gentry_resistance: "士绅阻力", military_pressure: "边防压力", corruption: "腐败度",
+  population: "人口", registered_land: "在册田亩", hidden_land: "隐田",
+  tax_per_turn: "月税", natural_disaster: "天灾", human_disaster: "人祸",
+  status: "状态", controlled_by: "控制者", 控制: "控制者", kind: "类型",
+  // 军队
+  supply: "补给", morale: "士气", training: "操练", equipment: "军械",
+  arrears: "欠饷", mobility: "机动", loyalty: "忠诚", manpower: "兵力",
+  maintenance_quarter: "月饷", maintenance_per_turn: "月饷",
+  station: "驻地", commander: "统帅", controller: "主管", troop_type: "兵种", owner_power: "归属",
+  // 势力
+  cohesion: "凝聚", 威望: "威望", leverage: "威望", 实力: "实力",
+  military_strength: "实力", 经济: "经济",
+  // 阶级
+  satisfaction: "满意度",
+};
+const cnField = (k: string) => EN_FIELD_CN[k] || k;
+
+const fiscalKeyLabel = (key: any): string => {
+  const raw = String(key ?? "");
+  const match = raw.match(/^(.+)_(base|rate)$/);
+  if (!match) return cnField(raw);
+  return `${match[1]}${match[2] === "base" ? "基数" : "系数"}`;
 };
 
 const briefTreasury = (state: GameState) => [
@@ -551,20 +751,45 @@ type AdminUser = AuthUser & {
   last_login_at: number;
 };
 
+type MenuSave = {
+  name: string;
+  size: number;
+  mtime: number;
+  campaign_id?: string;
+  kind?: "auto" | "manual";
+  label?: string;
+  year?: number;
+  period?: number;
+  turn?: number;
+  tag?: string;
+};
+
+type MenuCampaign = {
+  campaign_id: string;
+  kind: "auto" | "manual";
+  current: boolean;
+  saves: MenuSave[];
+  latest_mtime: number;
+};
+
 type MenuStatus = {
   has_api_key: boolean;
   has_running_game: boolean;
   has_main_db: boolean;
-  saves: Array<{ name: string; size: number; mtime: number }>;
+  saves: MenuSave[];
+  campaigns?: MenuCampaign[];
+  current_campaign?: string;
   llm: {
     base_url: string;
     model: string;
     has_api_key: boolean;
     max_tokens: number;
     timeout_seconds: number;
+    thinking_level: string;
     advanced_model: string;
     advanced_base_url: string;
     has_advanced_api_key: boolean;
+    advanced_thinking_level: string;
   };
 };
 
@@ -587,6 +812,7 @@ function App() {
   const [pendingUserMessage, setPendingUserMessage] = React.useState("");
   const [streamingMinisterMessage, setStreamingMinisterMessage] = React.useState("");
   const [chatNotice, setChatNotice] = React.useState("");
+  const [canUndoLastChat, setCanUndoLastChat] = React.useState(false);
   const [composerHint, setComposerHint] = React.useState("");
   const [input, setInput] = React.useState("");
   const [directiveText, setDirectiveText] = React.useState("");
@@ -608,9 +834,13 @@ function App() {
   const [gazetteShown, setGazetteShown] = React.useState<number>(-1);
   const [secretOrders, setSecretOrders] = React.useState<SecretOrder[]>([]);
   const [secretOrderShown, setSecretOrderShown] = React.useState<number>(-1);
+  // 作弊控制台（Ctrl+~）：cheatDirective 暂存强制结算项，下次颁诏随结算一次性穿入。
+  const [cheatOpen, setCheatOpen] = React.useState(false);
+  const [cheatDirective, setCheatDirective] = React.useState("");
 
   const loadState = React.useCallback(async () => {
     const data = await api<GameState>("/api/game/state");
+    refreshLabelMaps(data);
     setState(data);
     setSelectedNodeId((current) => current || data.map_nodes[0]?.id || "");
     setDecree(data.last_decree || "");
@@ -618,7 +848,7 @@ function App() {
   }, [selectedMinister]);
 
   const loadMinisterChat = React.useCallback(async (ministerName: string) => {
-    const data = await api<{ minister: Minister; history: ChatMessage[]; suggestions: Suggestion[] }>(`/api/ministers/${encodeURIComponent(ministerName)}/chat`);
+    const data = await api<{ minister: Minister; history: ChatMessage[]; suggestions: Suggestion[]; can_undo_last_chat: boolean }>(`/api/ministers/${encodeURIComponent(ministerName)}/chat`);
     const allKnown = [
       ...(state?.ministers || []),
       ...(state?.consorts || []),
@@ -626,6 +856,7 @@ function App() {
     setTemporaryActiveMinister(allKnown.some((m) => m.name === data.minister.name) ? null : data.minister);
     setChat(data.history);
     setSuggestions(data.suggestions);
+    setCanUndoLastChat(!!data.can_undo_last_chat);
   }, [state]);
 
   const uploadPortrait = React.useCallback(async (ministerName: string, file: File) => {
@@ -738,10 +969,22 @@ function App() {
       .catch(() => {/* 失败静默 */});
   }, [state?.turn.turn]);
 
+  // 结局已触发：自动弹结局结算页一次（按 sessionStorage 去重，关掉后同会话不再自动弹，
+  // 以便玩家关页继续游玩；重开浏览器会再弹一次）。
+  React.useEffect(() => {
+    if (!state || !state.ending) return;
+    const key = `endingShown_${state.ending.status}`;
+    if (sessionStorage.getItem(key)) return;
+    sessionStorage.setItem(key, "1");
+    setActiveModal("ending");
+  }, [state]);
+
   // 每次进入页面/换回合都弹上回合邸报。不持久化记录——刷新即重新弹。
   // 同一加载周期内同一回合不重复弹（gazetteShown 用 React state，刷新后回到 -1）。
   React.useEffect(() => {
     if (!state) return;
+    // 结局页本会话还没弹过时让位给它；已弹过（玩家关掉继续玩）则邸报照常。
+    if (state.ending && !sessionStorage.getItem(`endingShown_${state.ending.status}`)) return;
     const currentTurn = state.turn.turn;
     const summary = (state.previous_summary || "").trim();
     if (!summary) return;
@@ -759,6 +1002,7 @@ function App() {
       setPendingUserMessage("");
       setStreamingMinisterMessage("");
       setChatNotice("");
+      setCanUndoLastChat(false);
       setComposerHint("");
       return;
     }
@@ -766,6 +1010,7 @@ function App() {
     setSuggestions([]);
     setPendingUserMessage("");
     setStreamingMinisterMessage("");
+    setCanUndoLastChat(false);
     setComposerHint("");
     loadMinisterChat(selectedMinister).catch((err) => setError(err.message));
   }, [selectedMinister, loadMinisterChat]);
@@ -774,7 +1019,7 @@ function App() {
   React.useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (activeModal === "chat" || activeModal === "edict" || activeModal === "state" || activeModal === "history" || activeModal === "report" || activeModal === "secret_orders") {
+      if (activeModal === "chat" || activeModal === "edict" || activeModal === "state" || activeModal === "history" || activeModal === "report" || activeModal === "secret_orders" || activeModal === "long_goals") {
         // 召对/诏书等全屏弹窗最优先
         setActiveModal("none");
       } else if (drawerOpen) {
@@ -788,6 +1033,18 @@ function App() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [activeModal, drawerOpen, haremDrawerOpen, mapIntelOpen]);
+
+  // 作弊控制台：Ctrl+~（或 Ctrl+`）切换显隐。强制结算唯一入口。
+  React.useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.ctrlKey && (event.key === "~" || event.key === "`")) {
+        event.preventDefault();
+        setCheatOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   if (appView === "loading") {
     return (
@@ -833,7 +1090,12 @@ function App() {
     );
   }
 
-  const selectedNode = state.map_nodes.find((node) => node.id === selectedNodeId) || state.map_nodes[0];
+  const powerById = new Map((state.powers || []).map((power) => [power.id, power]));
+  const mapNodes = state.map_nodes.map((node) => {
+    const powerId = node.region?.controlled_by;
+    return powerId ? { ...node, power: powerById.get(powerId) } : node;
+  });
+  const selectedNode = mapNodes.find((node) => node.id === selectedNodeId) || mapNodes[0];
   const ministers = filterMinisters(state.ministers, ministerGroup);
   const consorts = filterConsorts(state.consorts || [], haremGroup);
   const allCharacters = [...state.ministers, ...(state.consorts || [])];
@@ -852,12 +1114,14 @@ function App() {
       setChat([]);
       setSuggestions([]);
       setTemporaryActiveMinister(null);
+      setCanUndoLastChat(false);
     }
     setSelectedMinister(minister.name);
     setActiveModal("chat");
     setError("");
     setComposerHint("");
     setChatNotice("");
+    setCanUndoLastChat(false);
     setPendingUserMessage("");
     setStreamingMinisterMessage("");
     loadMinisterChat(minister.name).catch((err) => setError(err.message));
@@ -895,7 +1159,8 @@ function App() {
       setStreamingMinisterMessage("");
       setChat(data.history);
       setSuggestions(data.suggestions);
-      setState((current) => (current ? { ...current, directives: data.directives } : current));
+      setCanUndoLastChat(!!data.can_undo_last_chat);
+      setState((current) => (current ? { ...current, directives: data.directives, pending_count: data.pending_count ?? current.pending_count } : current));
       await loadState();
       // 刷新密令列表（含历史，大臣可能调了 issue_secret_order tool）
       api<{ orders: SecretOrder[] }>("/api/secret_orders")
@@ -911,6 +1176,7 @@ function App() {
         setChat([]);
         setSuggestions([]);
         setStreamingMinisterMessage("");
+        setCanUndoLastChat(false);
         setSelectedMinister(data.next_minister);
         setActiveModal("chat");
         setChatNotice(`已传${data.next_minister}入殿。`);
@@ -926,6 +1192,34 @@ function App() {
       }
       setPendingUserMessage("");
       setStreamingMinisterMessage("");
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const undoLastChat = async () => {
+    if (busy || !activeMinister || !canUndoLastChat) return;
+    const ok = window.confirm("将撤回最近一轮召对及其政务影响，是否继续？");
+    if (!ok) return;
+    setBusy("撤回召对");
+    setError("");
+    setChatNotice("");
+    setComposerHint("");
+    setPendingUserMessage("");
+    setStreamingMinisterMessage("");
+    try {
+      const data = await api<ChatUndoResponse>(`/api/ministers/${encodeURIComponent(activeMinister.name)}/chat/undo`, {
+        method: "POST",
+      });
+      setChat(data.history);
+      setSuggestions(data.suggestions);
+      setCanUndoLastChat(!!data.can_undo_last_chat);
+      setSecretOrders(data.secret_orders || []);
+      setState((current) => (current ? { ...current, directives: data.directives, pending_count: data.pending_count } : current));
+      await loadState();
+      setChatNotice("已撤回最近一轮召对。");
+    } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy("");
@@ -1057,11 +1351,17 @@ function App() {
     setSettleNarrative("");
     setError("");
     try {
+      // 作弊强制结算项随颁诏一次性穿入；发出即清空，绝不跨回合。
+      const cheatPayload = cheatDirective.trim();
       const response = await fetch("/api/decree/issue/stream", {
         method: "POST",
         credentials: "include",
-        headers: csrfHeaders(),
+        headers: { "Content-Type": "application/json", ...csrfHeaders() },
+        body: JSON.stringify({ cheat: cheatPayload }),
       });
+      if (cheatPayload) {
+        setCheatDirective("");
+      }
       if (!response.ok || !response.body) {
         throw new Error(`颁诏失败：HTTP ${response.status}`);
       }
@@ -1123,11 +1423,12 @@ function App() {
 
   return (
     <main className="game-shell">
-      <GrandMap nodes={state.map_nodes} selectedId={mapIntelOpen ? selectedNode?.id || "" : ""} onSelect={selectMapNode} />
+      <GrandMap nodes={mapNodes} selectedId={mapIntelOpen ? selectedNode?.id || "" : ""} onSelect={selectMapNode} />
       <TopStatusBar
         state={state}
         onOpenState={() => setActiveModal("state")}
         onOpenMenu={() => setActiveModal("menu")}
+        onOpenLongGoals={() => setActiveModal("long_goals")}
         onToggleCourt={() => { setDrawerOpen((current) => !current); }}
         onToggleHarem={() => { setHaremDrawerOpen((current) => !current); }}
       />
@@ -1151,6 +1452,7 @@ function App() {
         onGroupChange={setMinisterGroup}
         onClose={guardClose(() => setDrawerOpen(false))}
         onOpenChat={openChat}
+        onUploadPortrait={uploadPortrait}
       />
 
       <HaremDrawer
@@ -1164,7 +1466,11 @@ function App() {
         onUploadPortrait={uploadPortrait}
       />
 
-      <SituationPanel issues={state.issues} closedIssues={state.closed_this_turn || []} />
+      <SituationPanel
+        issues={state.issues}
+        closedIssues={state.closed_this_turn || []}
+        hasLegacies={(state.legacies || []).length > 0}
+      />
 
       {mapIntelOpen && selectedNode ? (
         <section className="map-intel-panel overlay-panel" style={mapIntelStyle}>
@@ -1181,6 +1487,10 @@ function App() {
         </FullscreenModal>
       ) : null}
 
+      {activeModal === "long_goals" ? (
+        <LongGoalsModal onClose={guardClose(() => setActiveModal("none"))} />
+      ) : null}
+
       {activeModal === "chat" && activeMinister ? (
         <FullscreenModal title={`召对：${activeMinister.name}`} subtitle={activeMinister.office} bgClass="modal-bg-chat" onClose={guardClose(() => setActiveModal("none"))}>
           <ChatModal
@@ -1191,6 +1501,7 @@ function App() {
             pendingUserMessage={pendingUserMessage}
             streamingMinisterMessage={streamingMinisterMessage}
             chatNotice={chatNotice}
+            canUndoLastChat={canUndoLastChat}
             composerHint={composerHint}
             input={input}
             busy={busy}
@@ -1198,6 +1509,7 @@ function App() {
             secretOrders={secretOrders.filter((o) => o.minister_name === activeMinister.name && (o.status === "active" || o.status === "pending_review"))}
             onInput={setInput}
             onSend={sendChat}
+            onUndo={undoLastChat}
             onHint={setComposerHint}
             onFavorite={() => toggleFavorite(activeMinister)}
             onOpenEdict={() => setActiveModal("edict")}
@@ -1234,6 +1546,10 @@ function App() {
 
       {activeModal === "report" && (gazetteReport || report) ? (
         <ReportModal report={gazetteReport || report} onClose={guardClose(() => setActiveModal("none"))} />
+      ) : null}
+
+      {activeModal === "ending" && state.ending ? (
+        <EndingModal ending={state.ending} onClose={() => setActiveModal("none")} />
       ) : null}
 
       {activeModal === "extraction" ? (
@@ -1280,7 +1596,102 @@ function App() {
           narrative={settleNarrative}
         />
       ) : null}
+
+      {cheatOpen ? (
+        <CheatConsole
+          directive={cheatDirective}
+          onCommit={setCheatDirective}
+          onClose={() => setCheatOpen(false)}
+        />
+      ) : null}
     </main>
+  );
+}
+
+// 作弊控制台：terminal UI。强制结算唯一入口（Ctrl+~ 唤出）。输入的指令暂存于
+// cheatDirective，下次颁诏时随结算穿入 extractor 当既成事实落库。
+function CheatConsole({
+  directive,
+  onCommit,
+  onClose,
+}: {
+  directive: string;
+  onCommit: (text: string) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = React.useState("");
+  const [history, setHistory] = React.useState<string[]>([]);
+  const inputRef = React.useRef<HTMLTextAreaElement>(null);
+  const bodyRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+  React.useEffect(() => {
+    if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+  }, [history]);
+
+  const submit = () => {
+    const text = draft.trim();
+    if (!text) return;
+    onCommit(text);
+    setHistory((h) => [...h, `> ${text}`, "  已挂载强制结算项，下次颁诏随结算生效（一次性）。"]);
+    setDraft("");
+  };
+
+  const clearMounted = () => {
+    onCommit("");
+    setHistory((h) => [...h, "  已清空强制结算项。"]);
+  };
+
+  return (
+    <div className="cheat-console" role="dialog" aria-label="天命控制台" onClick={onClose}>
+      <div className="cheat-console-window" onClick={(e) => e.stopPropagation()}>
+        <div className="cheat-console-titlebar">
+          <span>tianming@ming-salvage:~$ 天命控制台</span>
+          <button className="cheat-console-x" onClick={onClose} aria-label="关闭">×</button>
+        </div>
+        <div className="cheat-console-body" ref={bodyRef}>
+          <div className="cheat-console-line cheat-console-dim">
+            强制结算控制台。输入的指令将在下次颁诏时作为「既成事实」穿入结算，无视合理性与史实。
+          </div>
+          <div className="cheat-console-line cheat-console-dim">
+            Enter 提交 · Shift+Enter 换行 · Ctrl+~ 关闭
+          </div>
+          {directive ? (
+            <div className="cheat-console-line cheat-console-armed">
+              ● 当前已挂载：{directive}
+            </div>
+          ) : (
+            <div className="cheat-console-line cheat-console-dim">○ 当前无挂载项</div>
+          )}
+          {history.map((line, i) => (
+            <div className="cheat-console-line" key={i}>{line}</div>
+          ))}
+        </div>
+        <div className="cheat-console-prompt">
+          <span className="cheat-console-caret">&gt;</span>
+          <textarea
+            ref={inputRef}
+            className="cheat-console-input"
+            value={draft}
+            rows={1}
+            placeholder="例：国库增至九千万两，后金军覆灭，皇太极暴毙"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                submit();
+              }
+            }}
+          />
+        </div>
+        <div className="cheat-console-actions">
+          <button className="cheat-console-btn" onClick={submit}>挂载</button>
+          <button className="cheat-console-btn cheat-console-btn-ghost" onClick={clearMounted}>清空挂载</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1755,6 +2166,7 @@ function CourtDrawer({
   onGroupChange,
   onClose,
   onOpenChat,
+  onUploadPortrait,
 }: {
   state: GameState;
   ministers: Minister[];
@@ -1764,6 +2176,7 @@ function CourtDrawer({
   onGroupChange: (group: string) => void;
   onClose: () => void;
   onOpenChat: (minister: Minister) => void;
+  onUploadPortrait: (ministerName: string, file: File) => Promise<void>;
 }) {
   return (
     <>
@@ -1794,6 +2207,7 @@ function CourtDrawer({
           emptyNote="此栏暂无可召见大臣。"
           onOpenChat={onOpenChat}
           courtMode={ministerGroup !== "全部"}
+          onUploadPortrait={onUploadPortrait}
         />
       </aside>
     </>
@@ -1858,17 +2272,20 @@ function TopStatusBar({
   state,
   onOpenState,
   onOpenMenu,
+  onOpenLongGoals,
   onToggleCourt,
   onToggleHarem,
 }: {
   state: GameState;
   onOpenState: () => void;
   onOpenMenu: () => void;
+  onOpenLongGoals: () => void;
   onToggleCourt: () => void;
   onToggleHarem: () => void;
 }) {
   const scoreKeys = ["民心", "皇威"];
   return (
+    <>
     <header className="status-bar" aria-label="国势状态栏">
       <button className="status-emblem" onClick={onOpenState}>
         <img src="/icon_ming_emblem.png" alt="大明" className="emblem-art" />
@@ -1890,12 +2307,146 @@ function TopStatusBar({
           <Crown size={16} />
           <span>后宫</span>
         </button>
+        <button className="status-menu long-goal-bar" onClick={onOpenLongGoals} aria-label="打开大明长期目标">
+          <Target size={16} />
+          <span>长期目标</span>
+        </button>
         <button className="status-menu" onClick={onOpenMenu} aria-label="游戏菜单">
           <Menu size={16} />
           <span>菜单</span>
         </button>
       </div>
     </header>
+    <LegacyBar legacies={state.legacies} />
+    </>
+  );
+}
+
+const LONG_GOAL_POSTERS = [
+  { src: "/long_goal_ming.jpg", alt: "长期目标：让大明再续二百年" },
+  { src: "/long_goal_tech.jpg", alt: "长期目标：科技树与文明延续" },
+  { src: "/long_goal_modernity.jpg", alt: "长期目标：从王朝危机到现代文明" },
+];
+
+function LongGoalsModal({ onClose }: { onClose: () => void }) {
+  const [index, setIndex] = React.useState(0);
+  const goPrev = React.useCallback(() => {
+    setIndex((current) => (current + LONG_GOAL_POSTERS.length - 1) % LONG_GOAL_POSTERS.length);
+  }, []);
+  const goNext = React.useCallback(() => {
+    setIndex((current) => (current + 1) % LONG_GOAL_POSTERS.length);
+  }, []);
+
+  React.useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") goPrev();
+      if (event.key === "ArrowRight") goNext();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [goPrev, goNext]);
+
+  const poster = LONG_GOAL_POSTERS[index];
+  return (
+    <section className="long-goal-layer" role="dialog" aria-modal="true" aria-label="大明长期目标">
+      <div className="long-goal-scrim" onClick={onClose} />
+      <button className="long-goal-close" aria-label="关闭弹窗" onClick={onClose}>
+        <X size={30} />
+      </button>
+      <button className="long-goal-nav long-goal-nav-prev" aria-label="上一张长期目标图" onClick={goPrev}>
+        <ChevronLeft size={34} />
+      </button>
+      <figure className="long-goal-poster">
+        <img src={poster.src} alt={poster.alt} />
+      </figure>
+      <button className="long-goal-nav long-goal-nav-next" aria-label="下一张长期目标图" onClick={goNext}>
+        <ChevronRight size={34} />
+      </button>
+      <div className="long-goal-dots" aria-label="长期目标图切换">
+        {LONG_GOAL_POSTERS.map((item, itemIndex) => (
+          <button
+            key={item.src}
+            className={itemIndex === index ? "active" : ""}
+            aria-label={`切换到第 ${itemIndex + 1} 张长期目标图`}
+            onClick={() => setIndex(itemIndex)}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+const LEGACY_FIELD_LABELS: Record<string, string> = {
+  public_support: "民心", unrest: "动乱", gentry_resistance: "士绅阻力", military_pressure: "边防压力",
+  tax_per_turn: "月税", grain_security: "粮食", corruption: "腐败度",
+  morale: "士气", training: "训练", loyalty: "忠诚", supply: "补给", equipment: "装备",
+  arrears: "欠饷", mobility: "机动",
+};
+
+function pctStr(v: number): string {
+  return `${v > 0 ? "+" : ""}${v}%`;
+}
+
+// modifiers = {国库?:pct, 内库?:pct, regions?:{rid:{field:pct}}, armies?:{aid:{field:pct}}}
+function formatLegacyEffect(eff: LegacyEffect): string {
+  const parts: string[] = [];
+  for (const acc of ["国库", "内库", "民心", "皇威"] as const) {
+    const v = eff[acc];
+    if (typeof v === "number") parts.push(`${acc}${pctStr(v)}`);
+  }
+  for (const scope of ["regions", "armies"] as const) {
+    const block = eff[scope];
+    if (!block || typeof block !== "object") continue;
+    for (const [entity, fields] of Object.entries(block)) {
+      for (const [field, pct] of Object.entries(fields)) {
+        const entityLabel = scope === "regions" ? labelRegion(entity) : labelArmy(entity);
+        const label = LEGACY_FIELD_LABELS[field] || cnField(field);
+        parts.push(`${entityLabel}·${label}${pctStr(pct as number)}`);
+      }
+    }
+  }
+  return parts.join("、");
+}
+
+function LegacyBar({ legacies }: { legacies: Legacy[] }) {
+  const [open, setOpen] = React.useState(false);
+  if (!legacies || legacies.length === 0) return null;
+  return (
+    <>
+      <button
+        className="legacy-bar"
+        aria-label="现行帝国修正"
+        onClick={() => setOpen(true)}
+      >
+        <span className="legacy-bar-label">帝国修正</span>
+        <span className="legacy-bar-count">{legacies.length}</span>
+      </button>
+      {open && (
+        <div className="legacy-modal-backdrop" onClick={() => setOpen(false)}>
+          <div className="legacy-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="legacy-modal-head">
+              <h3>现行帝国修正</h3>
+              <button className="legacy-modal-close" onClick={() => setOpen(false)} aria-label="关闭">×</button>
+            </div>
+            <ul className="legacy-list">
+              {legacies.map((lg) => (
+                <li key={lg.id} className="legacy-item">
+                  <div className="legacy-item-top">
+                    <b>{lg.name}</b>
+                    <span className="legacy-item-meta">
+                      <span className="legacy-item-dur">{lg.remaining_months < 0 ? "永久" : `余 ${lg.remaining_months} 月`}</span>
+                    </span>
+                  </div>
+                  <p className="legacy-item-eff">{lg.effect_text || formatLegacyEffect(lg.modifiers)}</p>
+                  {lg.clear_condition && <p className="legacy-item-clear">消除条件：{lg.clear_condition}</p>}
+                  {lg.narrative_hint && <p className="legacy-item-hint">{lg.narrative_hint}</p>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -2004,31 +2555,38 @@ function BottomCommandBar({
   onOpenSecretOrders: () => void;
 }) {
   return (
-    <nav className="bottom-command-bar" aria-label="朝政主操作">
-      <button className="command-icon" onClick={onOpenMemorials} aria-label={`奏疏 ${eventsCount} 件待览`}>
-        <img src="/icon_seal.png" alt="" className="command-art" />
-        {eventsCount ? <span className="command-badge">{eventsCount}</span> : null}
-        <span className="command-caption"><b>奏疏</b><small>{eventsCount} 件待览</small></span>
+    <>
+      <nav className="bottom-command-bar" aria-label="朝政辅助操作">
+        <button className="command-icon" onClick={onOpenMemorials} aria-label={`奏疏 ${eventsCount} 件待览`}>
+          <img src="/icon_seal.png" alt="" className="command-art" />
+          {eventsCount ? <span className="command-badge">{eventsCount}</span> : null}
+          <span className="command-caption"><b>奏疏</b><small>{eventsCount} 件待览</small></span>
+        </button>
+        <button className="command-icon" onClick={onOpenExtraction} aria-label="邸报详明">
+          <img src="/icon_scroll.png" alt="" className="command-art" />
+          <span className="command-caption"><b>邸报详明</b><small>数项加减/账目明细</small></span>
+        </button>
+        <button className="command-icon" onClick={onOpenSecretOrders} aria-label={`密令 ${secretOrdersCount} 条进行中`}>
+          <img src="/bg_edict.png" alt="" className="command-art command-art-secret" />
+          {secretOrdersCount ? <span className="command-badge command-badge-secret">{secretOrdersCount}</span> : null}
+          <span className="command-caption"><b>密令</b><small>{secretOrdersCount ? `${secretOrdersCount} 条进行中` : "暂无密令"}</small></span>
+        </button>
+        <button className="command-icon" onClick={onOpenHistory} aria-label="历代奏报">
+          <img src="/icon_scroll.png" alt="" className="command-art" />
+          <span className="command-caption"><b>史册</b><small>历代奏报/诏书</small></span>
+        </button>
+      </nav>
+      <button className="edict-turn-button" onClick={onOpenEdict} aria-label={`诏书草案 ${directivesCount} 道待发`}>
+        <span className="edict-turn-art">
+          <img src="/icon_edict_turn_cut.webp" alt="" />
+          {directivesCount ? <span className="command-badge edict-turn-badge">{directivesCount}</span> : null}
+          <span className="edict-turn-copy">
+            <b>拟诏</b>
+            <small>{directivesCount ? `${directivesCount} 道` : "本回合"}</small>
+          </span>
+        </span>
       </button>
-      <button className="command-icon" onClick={onOpenExtraction} aria-label="邸报详明">
-        <img src="/icon_scroll.png" alt="" className="command-art" />
-        <span className="command-caption"><b>邸报详明</b><small>数项加减/账目明细</small></span>
-      </button>
-      <button className="command-icon" onClick={onOpenEdict} aria-label={`诏书草案 ${directivesCount} 道待发`}>
-        <img src="/icon_scroll.png" alt="" className="command-art" />
-        {directivesCount ? <span className="command-badge">{directivesCount}</span> : null}
-        <span className="command-caption"><b>诏书草案</b><small>{directivesCount ? `${directivesCount} 道待发` : "本月未下旨"}</small></span>
-      </button>
-      <button className="command-icon" onClick={onOpenSecretOrders} aria-label={`密令 ${secretOrdersCount} 条进行中`}>
-        <img src="/bg_edict.png" alt="" className="command-art command-art-secret" />
-        {secretOrdersCount ? <span className="command-badge command-badge-secret">{secretOrdersCount}</span> : null}
-        <span className="command-caption"><b>密令</b><small>{secretOrdersCount ? `${secretOrdersCount} 条进行中` : "暂无密令"}</small></span>
-      </button>
-      <button className="command-icon" onClick={onOpenHistory} aria-label="历代奏报">
-        <img src="/icon_scroll.png" alt="" className="command-art" />
-        <span className="command-caption"><b>史册</b><small>历代奏报/诏书</small></span>
-      </button>
-    </nav>
+    </>
   );
 }
 
@@ -2086,6 +2644,47 @@ function ReportModal({ report, onClose }: { report: string; onClose: () => void 
         <div className="document-section">
           <pre className="memorial-text">{report}</pre>
         </div>
+      </article>
+    </FullscreenModal>
+  );
+}
+
+function EndingModal({ ending, onClose }: { ending: EndingPayload; onClose: () => void }) {
+  return (
+    <FullscreenModal
+      title={`结局 · ${ending.label}`}
+      subtitle="崇祯一朝，盖棺论定"
+      bgClass="modal-bg-state"
+      onClose={onClose}
+    >
+      <article className="state-document modal-scroll">
+        <div className="document-section">
+          <h2 className="ending-verdict-title">国史编纂官 · 结局总评</h2>
+          <pre className="memorial-text">{ending.summary || "（无总评）"}</pre>
+        </div>
+        {ending.timeline && ending.timeline.length > 0 && (
+          <div className="document-section">
+            <h2 className="ending-verdict-title">崇祯一朝 · 逐月历程</h2>
+            <ol className="ending-timeline">
+              {ending.timeline.map((it) => (
+                <li key={it.turn} className="ending-timeline-item">
+                  <div className="ending-timeline-date">{it.year}年{it.period}月</div>
+                  <div className="ending-timeline-body">
+                    {it.chapter ? (
+                      <p className="ending-timeline-chapter">{it.chapter}</p>
+                    ) : null}
+                    {it.decree_brief ? (
+                      <p className="ending-timeline-decree">诏：{it.decree_brief}</p>
+                    ) : null}
+                    {it.effect_brief ? (
+                      <p className="ending-timeline-effect">效：{it.effect_brief}</p>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
       </article>
     </FullscreenModal>
   );
@@ -2790,9 +3389,11 @@ function LLMConfigTab() {
   const [advancedModel, setAdvancedModel] = React.useState("");
   const [advancedBaseUrl, setAdvancedBaseUrl] = React.useState("");
   const [advancedApiKey, setAdvancedApiKey] = React.useState("");
+  const [advancedThinkingLevel, setAdvancedThinkingLevel] = React.useState("");
   const [apiKey, setApiKey] = React.useState("");
   const [maxTokens, setMaxTokens] = React.useState("8000");
   const [timeoutSeconds, setTimeoutSeconds] = React.useState("180");
+  const [thinkingLevel, setThinkingLevel] = React.useState("");
   const [show, setShow] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [msg, setMsg] = React.useState("");
@@ -2806,8 +3407,10 @@ function LLMConfigTab() {
         setModel(data.model);
         setAdvancedModel(data.advanced_model || "");
         setAdvancedBaseUrl(data.advanced_base_url || "");
+        setAdvancedThinkingLevel(data.advanced_thinking_level || "");
         setMaxTokens(String(data.max_tokens || 8000));
         setTimeoutSeconds(String(data.timeout_seconds || 180));
+        setThinkingLevel(data.thinking_level || "");
       })
       .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
   }, []);
@@ -2825,9 +3428,11 @@ function LLMConfigTab() {
           api_key: apiKey,
           max_tokens: parseInt(maxTokens) || 8000,
           timeout_seconds: parseFloat(timeoutSeconds) || 180,
+          thinking_level: thinkingLevel.trim(),
           advanced_model: advancedModel,
           advanced_base_url: advancedBaseUrl,
           advanced_api_key: advancedApiKey.trim() ? advancedApiKey : "__keep__",
+          advanced_thinking_level: advancedThinkingLevel.trim(),
         }),
       });
       setInfo((cur) => (cur ? { ...cur, ...data } : null));
@@ -2867,6 +3472,15 @@ function LLMConfigTab() {
         />
       </label>
       <label className="menu-field">
+        <span>Thinking Level <small className="menu-hint">（空=默认，请填写你的模型支持的值。）</small></span>
+        <input
+          className="menu-input"
+          value={thinkingLevel}
+          onChange={(e) => setThinkingLevel(e.target.value)}
+          placeholder="默认"
+        />
+      </label>
+      <label className="menu-field">
         <span>Advanced Model <small className="menu-hint">（推演 + 打分专用，空=与 Model 一致）</small></span>
         <input
           className="menu-input"
@@ -2899,6 +3513,15 @@ function LLMConfigTab() {
           value={advancedApiKey}
           onChange={(e) => setAdvancedApiKey(e.target.value)}
           placeholder="留空=复用主 API Key / 保留当前"
+        />
+      </label>
+      <label className="menu-field">
+        <span>Advanced Thinking Level <small className="menu-hint">（空=默认，请填写你的模型支持的值。）</small></span>
+        <input
+          className="menu-input"
+          value={advancedThinkingLevel}
+          onChange={(e) => setAdvancedThinkingLevel(e.target.value)}
+          placeholder="默认"
         />
       </label>
       <label className="menu-field">
@@ -3041,11 +3664,17 @@ function ExtractionView({ data, loading, error }: { data: ExtractionData | null;
       <ExtractionSection title="派系变化">
         <FactionBlock data={pickField(out, "派系变化", "faction_delta")} />
       </ExtractionSection>
+      <ExtractionSection title="阶级变化">
+        <ClassDeltaBlock data={pickField(out, "阶级变化", "class_delta")} />
+      </ExtractionSection>
       <ExtractionSection title="官职任免">
         <OfficeChangesBlock data={pickField(out, "人事变更", "office_changes")} />
       </ExtractionSection>
       <ExtractionSection title="去职变更">
         <StatusChangesBlock data={pickField(out, "人物状态变化", "character_status_changes")} />
+      </ExtractionSection>
+      <ExtractionSection title="人物易主">
+        <PowerChangesBlock data={pickField(out, "人物易主", "character_power_changes")} />
       </ExtractionSection>
       <ExtractionSection title="后宫纳妃">
         <AppointmentsBlock data={pickField(out, "后宫册封", "appointments")} />
@@ -3063,22 +3692,28 @@ function ExtractionView({ data, loading, error }: { data: ExtractionData | null;
         <CancelsBlock data={pickField(out, "撤销局势", "cancels")} />
       </ExtractionSection>
       <ExtractionSection title="地区变化">
-        <GenericKVBlock data={pickField(out, "地区变化", "region_delta")} />
+        <EntityDeltaBlock data={pickField(out, "地区变化", "region_delta")} labelFn={labelRegion} />
       </ExtractionSection>
       <ExtractionSection title="军队变化">
-        <GenericKVBlock data={pickField(out, "军队变化", "army_delta")} />
+        <EntityDeltaBlock data={pickField(out, "军队变化", "army_delta")} labelFn={labelArmy} />
       </ExtractionSection>
       <ExtractionSection title="新建军队">
         <NewArmiesBlock data={pickField(out, "新建军队", "new_armies")} />
       </ExtractionSection>
       <ExtractionSection title="势力变化">
-        <GenericKVBlock data={pickField(out, "势力变化", "power_updates")} />
+        <EntityDeltaBlock data={pickField(out, "势力变化", "power_updates")} labelFn={labelPower} />
       </ExtractionSection>
       <ExtractionSection title="财政系数">
         <FiscalBlock data={pickField(out, "财政制度变化", "fiscal_changes")} />
       </ExtractionSection>
       <ExtractionSection title="外交关系">
-        <GenericKVBlock data={pickField(out, "外交关系", "world_advance") ?? pickField(out, "外交", "world_advance") ?? pickField(out, "外交态度", "world_advance") ?? pickField(out, "四方动向", "world_advance")} />
+        <DiplomacyBlock data={pickField(out, "外交关系", "world_advance") ?? pickField(out, "外交", "world_advance") ?? pickField(out, "外交态度", "world_advance") ?? pickField(out, "四方动向", "world_advance")} />
+      </ExtractionSection>
+      <ExtractionSection title="密令副作用">
+        <SecretSideBlock data={pickField(out, "密令副作用", "secret_order_updates")} />
+      </ExtractionSection>
+      <ExtractionSection title="密令核议">
+        <SecretCloseBlock data={pickField(out, "密令结案", "secret_order_closes")} />
       </ExtractionSection>
     </div>
   );
@@ -3104,8 +3739,9 @@ function ExtractionSection({ title, children }: { title: string; children: React
 }
 
 function fmtDelta(n: any): string {
+  // 缺失/非数（extractor 偶尔不带 delta_bar）按 0 处理，避免渲染出字面 "undefined"
   const num = Number(n);
-  if (!Number.isFinite(num)) return String(n);
+  if (!Number.isFinite(num)) return "0";
   if (num > 0) return `+${num}`;
   return String(num);
 }
@@ -3153,7 +3789,7 @@ function FactionBlock({ data }: { data: any }) {
           return (
             <li key={k}>
               <span>{k}</span>
-              <b>{Object.entries(v).map(([kk, vv]) => `${kk}${fmtDelta(vv)}`).join("  ")}</b>
+              <b>{Object.entries(v).map(([kk, vv]) => `${SAT_LEV_CN[kk] || cnField(kk)}${fmtDelta(vv)}`).join("  ")}</b>
             </li>
           );
         }
@@ -3170,7 +3806,7 @@ function IssueAdvancesBlock({ data }: { data: any }) {
       {data.map((it: any, i: number) => (
         <li key={i}>
           <b className={Number(pickItem(it, "进度增量", "delta_bar")) >= 0 ? "good" : "bad"}>
-            #{pickItem(it, "局势编号", "issue_id")} 进度 {fmtDelta(pickItem(it, "进度增量", "delta_bar"))}
+            {labelIssue(pickItem(it, "局势编号", "issue_id"))} 进度 {fmtDelta(pickItem(it, "进度增量", "delta_bar"))}
             {pickItem(it, "惯性增量", "inertia_delta") ? `，惯性 ${fmtDelta(pickItem(it, "惯性增量", "inertia_delta"))}` : ""}
           </b>
           {pickItem(it, "阶段", "stage_text") ? <span>{pickItem(it, "阶段", "stage_text")}</span> : null}
@@ -3187,7 +3823,7 @@ function NewIssuesBlock({ data }: { data: any }) {
     <ul className="extraction-list">
       {data.map((it: any, i: number) => (
         <li key={i}>
-          <b>{pickItem(it, "标题", "title") || pickItem(it, "编号", "id") || "新事项"}（{pickItem(it, "类型", "kind") || pickItem(it, "来源类型", "origin_kind") || ""}）</b>
+          <b>{pickItem(it, "标题", "title") || pickItem(it, "编号", "id") || "新事项"}（{cnValue(pickItem(it, "类型", "kind") || pickItem(it, "来源类型", "origin_kind") || "")}）</b>
           {pickItem(it, "阶段", "stage_text") ? <span>{pickItem(it, "阶段", "stage_text")}</span> : null}
         </li>
       ))}
@@ -3202,7 +3838,7 @@ function CloseIssuesBlock({ data }: { data: any }) {
       {data.map((it: any, i: number) => (
         <li key={i}>
           <b className={pickItem(it, "原因", "reason") === "resolved" ? "good" : "bad"}>
-            #{pickItem(it, "局势编号", "issue_id")} {pickItem(it, "原因", "reason") === "resolved" ? "结案" : "失败"}
+            {labelIssue(pickItem(it, "局势编号", "issue_id"))} {pickItem(it, "原因", "reason") === "resolved" ? "结案" : "失败"}
           </b>
           {pickItem(it, "叙述", "narrative") ? <span>{pickItem(it, "叙述", "narrative")}</span> : null}
         </li>
@@ -3217,7 +3853,7 @@ function CancelsBlock({ data }: { data: any }) {
     <ul className="extraction-list">
       {data.map((it: any, i: number) => (
         <li key={i}>
-          <b>#{pickItem(it, "局势编号", "issue_id")} 撤旨</b>
+          <b>{labelIssue(pickItem(it, "局势编号", "issue_id"))} 撤旨</b>
           {pickItem(it, "叙述", "narrative") ? <span>{pickItem(it, "叙述", "narrative")}</span> : null}
         </li>
       ))}
@@ -3255,7 +3891,7 @@ function StatusChangesBlock({ data }: { data: any }) {
       {data.map((it: any, i: number) => (
         <li key={i}>
           <b className={pickItem(it, "rejected", "rejected") ? "bad" : ""}>
-            {pickItem(it, "姓名", "name")} {label[pickItem(it, "状态", "status")] || pickItem(it, "状态", "status")}
+            {pickItem(it, "姓名", "name")} {label[pickItem(it, "状态", "status")] || cnValue(pickItem(it, "状态", "status"))}
             {pickItem(it, "rejected", "rejected") ? "（未落地）" : ""}
           </b>
           {pickItem(it, "原因", "reason") ? <span>{pickItem(it, "原因", "reason")}</span> : null}
@@ -3289,7 +3925,7 @@ function FiscalBlock({ data }: { data: any }) {
       {data.map((it: any, i: number) => (
         <li key={i}>
           <b className={Number(pickItem(it, "增量", "delta")) >= 0 ? "good" : "bad"}>
-            {pickItem(it, "键", "key")} {fmtDelta(pickItem(it, "增量", "delta"))}
+            {fiscalKeyLabel(pickItem(it, "键", "key"))} {fmtDelta(pickItem(it, "增量", "delta"))}
           </b>
           {pickItem(it, "原因", "reason") ? <span>{pickItem(it, "原因", "reason")}</span> : null}
         </li>
@@ -3298,9 +3934,126 @@ function FiscalBlock({ data }: { data: any }) {
   );
 }
 
-function GenericKVBlock({ data }: { data: any }) {
-  if (isEmptyData(data)) return <p className="extraction-empty">无</p>;
-  return <pre className="extraction-json">{JSON.stringify(data, null, 2)}</pre>;
+// 一个字段值渲染成可读串：数字带正负号，文字直接显示（英文枚举翻中文）。
+function fmtFieldVal(v: any): { text: string; tone: string } {
+  if (typeof v === "number") return { text: fmtDelta(v), tone: v >= 0 ? "good" : "bad" };
+  const n = Number(v);
+  if (v !== "" && v != null && Number.isFinite(n) && String(v).trim() !== "" && !isNaN(n) && /^-?\d+$/.test(String(v).trim())) {
+    return { text: fmtDelta(n), tone: n >= 0 ? "good" : "bad" };
+  }
+  return { text: cnValue(v), tone: "" };
+}
+
+// 地区/军队/势力变化：外层 key=实体 id（翻中文名），内层=字段→增量/新值。
+function EntityDeltaBlock({ data, labelFn }: { data: any; labelFn: (id: any) => string }) {
+  if (isEmptyData(data) || typeof data !== "object" || Array.isArray(data)) return <p className="extraction-empty">无</p>;
+  return (
+    <ul className="extraction-list">
+      {Object.entries(data).map(([id, fields]: [string, any]) => (
+        <li key={id}>
+          <b>{labelFn(id)}</b>
+          {fields && typeof fields === "object" && !Array.isArray(fields) ? (
+            <span className="extraction-fieldline">
+              {Object.entries(fields).map(([fk, fv]) => {
+                const { text, tone } = fmtFieldVal(fv);
+                return <em key={fk} className={tone}>{cnField(fk)} {text}</em>;
+              })}
+            </span>
+          ) : (
+            <span>{cnValue(fields)}</span>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// 外交关系：key=势力 id（翻中文名），value=态度字符串。
+function DiplomacyBlock({ data }: { data: any }) {
+  if (isEmptyData(data) || typeof data !== "object" || Array.isArray(data)) return <p className="extraction-empty">无</p>;
+  return (
+    <ul className="extraction-kv">
+      {Object.entries(data).map(([id, stance]: [string, any]) => (
+        <li key={id}><span>{labelPower(id)}</span><b>{cnValue(stance)}</b></li>
+      ))}
+    </ul>
+  );
+}
+
+// 阶级变化：key=阶级名 或 阶级@region_id；region 后缀翻中文名。value={满意,影响力} 增量。
+const SAT_LEV_CN: Record<string, string> = { satisfaction: "满意", leverage: "影响力", 满意: "满意", 影响力: "影响力" };
+function labelClass(key: string): string {
+  const at = key.indexOf("@");
+  if (at < 0) return key;
+  return `${key.slice(0, at)}（${labelRegion(key.slice(at + 1))}）`;
+}
+function ClassDeltaBlock({ data }: { data: any }) {
+  if (isEmptyData(data) || typeof data !== "object" || Array.isArray(data)) return <p className="extraction-empty">无</p>;
+  return (
+    <ul className="extraction-kv">
+      {Object.entries(data).map(([k, v]: [string, any]) => {
+        if (v && typeof v === "object") {
+          return (
+            <li key={k}>
+              <span>{labelClass(k)}</span>
+              <b>{Object.entries(v).map(([kk, vv]) => `${SAT_LEV_CN[kk] || cnField(kk)}${fmtDelta(vv)}`).join("  ")}</b>
+            </li>
+          );
+        }
+        return <li key={k}><span>{labelClass(k)}</span><b className={Number(v) >= 0 ? "good" : "bad"}>{fmtDelta(v)}</b></li>;
+      })}
+    </ul>
+  );
+}
+
+// 人物易主：姓名 → 新势力（翻中文名）。
+function PowerChangesBlock({ data }: { data: any }) {
+  if (isEmptyData(data) || !Array.isArray(data)) return <p className="extraction-empty">无</p>;
+  return (
+    <ul className="extraction-list">
+      {data.map((it: any, i: number) => (
+        <li key={i}>
+          <b>{pickItem(it, "姓名", "name")} → {labelPower(pickItem(it, "new_power", "new_power"))}</b>
+          {pickItem(it, "reason", "reason") || pickItem(it, "原因", "reason") ? <span>{pickItem(it, "reason", "reason") || pickItem(it, "原因", "reason")}</span> : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// 密令副作用：active 密令的推演副作用。
+function SecretSideBlock({ data }: { data: any }) {
+  if (isEmptyData(data) || !Array.isArray(data)) return <p className="extraction-empty">无</p>;
+  return (
+    <ul className="extraction-list">
+      {data.map((it: any, i: number) => (
+        <li key={i}>
+          <b>密令 #{pickItem(it, "密令编号", "order_id")}</b>
+          <span>{pickItem(it, "推演备注", "sim_note") || ""}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// 密令核议：pending_review 密令结案判定。
+function SecretCloseBlock({ data }: { data: any }) {
+  if (isEmptyData(data) || !Array.isArray(data)) return <p className="extraction-empty">无</p>;
+  return (
+    <ul className="extraction-list">
+      {data.map((it: any, i: number) => {
+        const st = pickItem(it, "状态", "status");
+        return (
+          <li key={i}>
+            <b className={st === "done" ? "good" : "bad"}>
+              密令 #{pickItem(it, "密令编号", "order_id")} {st === "done" ? "办结" : "失败"}
+            </b>
+            <span>{pickItem(it, "结果", "result") || ""}</span>
+          </li>
+        );
+      })}
+    </ul>
+  );
 }
 
 function NewArmiesBlock({ data }: { data: any }) {
@@ -3309,7 +4062,7 @@ function NewArmiesBlock({ data }: { data: any }) {
     <ul className="extraction-list">
       {data.map((item: any, i: number) => {
         const name = pickItem(item, "名称", "name") || pickItem(item, "编号", "id") || "?";
-        const owner = pickItem(item, "归属", "owner_power") || "?";
+        const owner = labelPower(pickItem(item, "归属", "owner_power")) || "?";
         const manpower = pickItem(item, "人数", "manpower");
         const station = pickItem(item, "驻扎地", "station") || "";
         const commander = pickItem(item, "统将", "commander") || "";
@@ -3379,16 +4132,28 @@ function BriefReport({ title, items }: { title: string; items: string[] }) {
   );
 }
 
-function SituationPanel({ issues, closedIssues }: { issues: Issue[]; closedIssues: ClosedIssue[] }) {
+function SituationPanel({
+  issues,
+  closedIssues,
+  hasLegacies,
+}: {
+  issues: Issue[];
+  closedIssues: ClosedIssue[];
+  hasLegacies: boolean;
+}) {
   const active = issues.filter((issue) => issue.kind === "situation" || issue.kind === "initiative");
   const [collapsed, setCollapsed] = React.useState(() => typeof window !== "undefined" && window.innerWidth <= 600);
   if (!active.length && !closedIssues.length) return null;
-  active.sort((a, b) => {
+  const bySeq = (a: Issue, b: Issue) => {
     if (a.kind !== b.kind) return a.kind === "initiative" ? -1 : 1;
     return a.id - b.id;
-  });
+  };
+  // 长期局势＝贯穿一朝的大计（甲申国亡前不结案），靠 fail_condition 文案判定，纯前端分组。
+  const isLongTerm = (issue: Issue) => /甲申|贯穿一朝|倾国之大计/.test(issue.fail_condition || "");
+  const longTerm = active.filter(isLongTerm).sort(bySeq);
+  const nearTerm = active.filter((i) => !isLongTerm(i)).sort(bySeq);
   return (
-    <aside className={`situation-panel ${collapsed ? "collapsed" : ""}`} aria-label="局势进度">
+    <aside className={`situation-panel ${collapsed ? "collapsed" : ""} ${hasLegacies ? "with-legacies" : ""}`} aria-label="局势进度">
       <div className="situation-panel-title">
         <span>局势进度</span>
         <button
@@ -3411,49 +4176,66 @@ function SituationPanel({ issues, closedIssues }: { issues: Issue[]; closedIssue
           ))}
         </div>
       ) : null}
-      {!collapsed && <div className="situation-list">
-        {active.map((issue) => (
-          <div className={`situation-row ${issueTone(issue.bar_value)}`} key={issue.id} tabIndex={0}>
-            <div className="situation-row-head">
-              <span className="situation-name">{issue.title}</span>
-              <b>{issue.bar_value}</b>
-            </div>
-            <div className="situation-bar">
-              <i style={{ width: `${Math.max(0, Math.min(100, issue.bar_value))}%` }} />
-            </div>
-            <div className="situation-tip" role="tooltip">
-              <div className="situation-tip-head">#{issue.id} {issue.title}</div>
-              <div className="situation-tip-row"><span>阶段</span><b>{issue.phase}</b></div>
-              <div className="situation-tip-row"><span>进度</span><b>{issue.bar_value} / 100</b></div>
-              <div className="situation-tip-row">
-                <span>月度推进</span>
-                <b>{issue.inertia > 0 ? `+${issue.inertia}` : issue.inertia}/月</b>
-              </div>
-              <div className="situation-tip-row">
-                <span>当前影响</span>
-                <b>{issue.ongoing_text || "无"}</b>
-              </div>
-              <p className="situation-tip-stage">{issue.stage_text}</p>
-              <div className="situation-tip-outcome good">
-                <div className="situation-tip-outcome-head">达成（{issue.bar_good_meaning}）</div>
-                {issue.resolve_condition && <p>{issue.resolve_condition}</p>}
-                <div className="situation-tip-effect">{formatIssueEffect(issue.effect_on_resolve)}</div>
-              </div>
-              <div className="situation-tip-outcome bad">
-                <div className="situation-tip-outcome-head">失败（{issue.bar_bad_meaning}）</div>
-                {issue.fail_condition && <p>{issue.fail_condition}</p>}
-                <div className="situation-tip-effect">{formatIssueEffect(issue.effect_on_fail)}</div>
-              </div>
-              {issue.tags.length ? (
-                <div className="situation-tip-tags">
-                  {issue.tags.map((tag) => <small key={tag}>{tag}</small>)}
-                </div>
-              ) : null}
-            </div>
+      {!collapsed && (longTerm.length ? (
+        <div className="situation-group">
+          <div className="situation-group-title">长期局势</div>
+          <div className="situation-list">
+            {longTerm.map((issue) => <SituationRow key={issue.id} issue={issue} />)}
           </div>
-        ))}
-      </div>}
+        </div>
+      ) : null)}
+      {!collapsed && (nearTerm.length ? (
+        <div className="situation-group">
+          <div className="situation-group-title">近期局势</div>
+          <div className="situation-list">
+            {nearTerm.map((issue) => <SituationRow key={issue.id} issue={issue} />)}
+          </div>
+        </div>
+      ) : null)}
     </aside>
+  );
+}
+
+function SituationRow({ issue }: { issue: Issue }) {
+  return (
+    <div className={`situation-row ${issueTone(issue.bar_value)}`} tabIndex={0}>
+      <div className="situation-row-head">
+        <span className="situation-name">{issue.title}</span>
+        <b>{issue.bar_value}</b>
+      </div>
+      <div className="situation-bar">
+        <i style={{ width: `${Math.max(0, Math.min(100, issue.bar_value))}%` }} />
+      </div>
+      <div className="situation-tip" role="tooltip">
+        <div className="situation-tip-head">#{issue.id} {issue.title}</div>
+        <div className="situation-tip-row"><span>阶段</span><b>{issue.phase}</b></div>
+        <div className="situation-tip-row"><span>进度</span><b>{issue.bar_value} / 100</b></div>
+        <div className="situation-tip-row">
+          <span>月度推进</span>
+          <b>{issue.inertia > 0 ? `+${issue.inertia}` : issue.inertia}/月</b>
+        </div>
+        <div className="situation-tip-row">
+          <span>当前影响</span>
+          <b>{issue.ongoing_text || "无"}</b>
+        </div>
+        <p className="situation-tip-stage">{issue.stage_text}</p>
+        <div className="situation-tip-outcome good">
+          <div className="situation-tip-outcome-head">达成（{issue.bar_good_meaning}）</div>
+          {issue.resolve_condition && <p>{issue.resolve_condition}</p>}
+          <div className="situation-tip-effect">{formatIssueEffect(issue.effect_on_resolve)}</div>
+        </div>
+        <div className="situation-tip-outcome bad">
+          <div className="situation-tip-outcome-head">失败（{issue.bar_bad_meaning}）</div>
+          {issue.fail_condition && <p>{issue.fail_condition}</p>}
+          <div className="situation-tip-effect">{formatIssueEffect(issue.effect_on_fail)}</div>
+        </div>
+        {issue.tags.length ? (
+          <div className="situation-tip-tags">
+            {issue.tags.map((tag) => <small key={tag}>{tag}</small>)}
+          </div>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -3497,6 +4279,7 @@ function ChatModal({
   pendingUserMessage,
   streamingMinisterMessage,
   chatNotice,
+  canUndoLastChat,
   composerHint,
   input,
   busy,
@@ -3504,6 +4287,7 @@ function ChatModal({
   secretOrders,
   onInput,
   onSend,
+  onUndo,
   onHint,
   onFavorite,
   onOpenEdict,
@@ -3516,6 +4300,7 @@ function ChatModal({
   pendingUserMessage: string;
   streamingMinisterMessage: string;
   chatNotice: string;
+  canUndoLastChat: boolean;
   composerHint: string;
   input: string;
   busy: string;
@@ -3523,6 +4308,7 @@ function ChatModal({
   secretOrders: SecretOrder[];
   onInput: (value: string) => void;
   onSend: (text?: string) => void;
+  onUndo: () => void;
   onHint: (value: string) => void;
   onFavorite: () => void;
   onOpenEdict: () => void;
@@ -3666,6 +4452,10 @@ function ChatModal({
             <button className={`primary-action ${!input.trim() ? "is-empty" : ""}`} onClick={handleSend} disabled={!!busy}>
               <Send size={15} />
               发送
+            </button>
+            <button className="secondary-action composer-undo" onClick={onUndo} disabled={!!busy || !canUndoLastChat}>
+              <RotateCcw size={15} />
+              撤回本轮
             </button>
             <button className="secondary-action composer-exit" onClick={onClose}>
               <X size={15} />
@@ -3840,230 +4630,668 @@ function filterConsorts(consorts: Minister[], group: string) {
   return mingConsorts;
 }
 
-const MAP_IMAGE_ASPECT = 16 / 9;
-const MAP_MOBILE_FOCUS_X = 0.66;
+const MING_MAP_COLOR = "#4f8a57";
+const UNREST_MAP_COLOR = "#b83a31";
+const EXTERNAL_MAP_COLOR = "#5f6366";
+const DEFAULT_MAP_COLOR = EXTERNAL_MAP_COLOR;
+const UNREST_DANGER_THRESHOLD = 60;
+const MING_MAP_OPACITY = 0.2;
+const EXTERNAL_MAP_OPACITY = 0.3;
 
-function mapTileSize(viewportWidth: number, viewportHeight: number) {
-  if (viewportWidth <= 600) {
-    const height = Math.ceil(viewportHeight + Math.min(220, viewportHeight * 0.26));
-    return { width: Math.max(viewportWidth, Math.ceil(height * MAP_IMAGE_ASPECT)), height };
-  }
-  return { width: viewportWidth, height: viewportHeight };
+const MAP_DISPLAY_POWER_OVERRIDES: Record<string, string> = {
+  // 崇祯元年辽西只剩山海关外宁锦前线，不能按关内省份红色处理。
+  liaodong: "ming_frontier",
+};
+
+const THEATER_ONLY_REGION_IDS = new Set(["liaodong"]);
+const THEATER_COORD_STORAGE_KEY = "ming-map-theater-coords";
+const MAP_PENCIL_STORAGE_KEY = "ming-map-pencil-line";
+const MAP_TERRAIN_STORAGE_KEY = "ming-map-terrain-transform-v3";
+
+type TerrainTransform = { x: number; y: number; width: number; height: number };
+
+const DEFAULT_TERRAIN_TRANSFORM: TerrainTransform = {
+  x: 840.22,
+  y: 83.48,
+  width: 276,
+  height: 206,
+};
+
+function getRegionMapColor(region: RegionPathRenderItem) {
+  if (region.controlledBy !== "ming") return EXTERNAL_MAP_COLOR;
+  if (region.unrest > UNREST_DANGER_THRESHOLD) return UNREST_MAP_COLOR;
+  return MING_MAP_COLOR;
 }
 
-function normalizeMapOffset(x: number, width: number) {
-  if (width <= 0) return 0;
-  let r = x % width;
-  if (r > 0) r -= width;
-  return r;
-}
-
-function mapMobileTopInset(viewportWidth: number, viewportHeight: number) {
-  if (viewportWidth > 600) return 0;
-  return 0;
-}
-
-function clampMapOffsetY(y: number, viewportWidth: number, viewportHeight: number, contentHeight: number) {
-  const maxY = mapMobileTopInset(viewportWidth, viewportHeight);
-  if (contentHeight <= viewportHeight) return maxY;
-  return Math.max(viewportHeight - contentHeight, Math.min(maxY, y));
-}
-
-function mapInitialOffsetX(viewportWidth: number, viewportHeight: number) {
-  const { width } = mapTileSize(viewportWidth, viewportHeight);
-  if (viewportWidth > 600) return 0;
-  return normalizeMapOffset(viewportWidth / 2 - width * MAP_MOBILE_FOCUS_X, width);
-}
-
-function mapInitialOffsetY(viewportWidth: number, viewportHeight: number) {
-  if (viewportWidth > 600) return 0;
-  return mapMobileTopInset(viewportWidth, viewportHeight);
+function getRegionMapOpacity(region: RegionPathRenderItem) {
+  return region.controlledBy === "ming" ? MING_MAP_OPACITY : EXTERNAL_MAP_OPACITY;
 }
 
 function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedId: string; onSelect: (id: string) => void }) {
   const viewportRef = React.useRef<HTMLDivElement | null>(null);
-  const [tileW, setTileW] = React.useState<number>(() => (
-    typeof window !== "undefined" ? mapTileSize(window.innerWidth, window.innerHeight).width : 1280
-  ));
-  const [tileH, setTileH] = React.useState<number>(() => (
-    typeof window !== "undefined" ? mapTileSize(window.innerWidth, window.innerHeight).height : 720
-  ));
-  const [offsetX, setOffsetX] = React.useState(() => (
-    typeof window !== "undefined" ? mapInitialOffsetX(window.innerWidth, window.innerHeight) : 0
-  ));
-  const [offsetY, setOffsetY] = React.useState(() => (
-    typeof window !== "undefined" ? mapInitialOffsetY(window.innerWidth, window.innerHeight) : 0
-  ));
-  const dragState = React.useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number; moved: boolean } | null>(null);
-  const mobileFocusApplied = React.useRef(false);
-  const [dragging, setDragging] = React.useState(false);
+  const mapTileRef = React.useRef<HTMLDivElement | null>(null);
+  const svgRef = React.useRef<SVGSVGElement | null>(null);
+  const didCenterRef = React.useRef(false);
+  const viewBoxParts = React.useMemo(() => MAP_VIEW_BOX.split(/\s+/).map(Number), []);
+  const defaultTerrainTransform = DEFAULT_TERRAIN_TRANSFORM;
 
-  // 坐标取点工具：URL 加 ?coords=1 开启。点地图打印 x/y%（对照 web_app.py map_nodes）。
+
+  // 坐标取点工具：URL 加 ?coords=1 开启。点地图打印 x/y% 与 SVG viewBox 坐标。
   const coordPick = typeof window !== "undefined" && new URLSearchParams(window.location.search).has("coords");
-  const [pick, setPick] = React.useState<{ x: number; y: number } | null>(null);
+  const [pick, setPick] = React.useState<{ x: number; y: number; svgX: number; svgY: number; label?: string } | null>(null);
+  const [draggedTheaters, setDraggedTheaters] = React.useState<Record<string, { x: number; y: number }>>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = window.localStorage.getItem(THEATER_COORD_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as Record<string, { x: number; y: number }>;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
+  const [pencilMode, setPencilMode] = React.useState(false);
+  const [terrainMode, setTerrainMode] = React.useState(coordPick);
+  const [terrainTransform, setTerrainTransform] = React.useState<TerrainTransform>(() => {
+    if (typeof window === "undefined") return defaultTerrainTransform;
+    try {
+      const raw = window.localStorage.getItem(MAP_TERRAIN_STORAGE_KEY);
+      if (!raw) return defaultTerrainTransform;
+      const parsed = JSON.parse(raw) as TerrainTransform;
+      if (
+        parsed &&
+        Number.isFinite(parsed.x) &&
+        Number.isFinite(parsed.y) &&
+        Number.isFinite(parsed.width) &&
+        Number.isFinite(parsed.height) &&
+        parsed.width > 0 &&
+        parsed.height > 0
+      ) {
+        return parsed;
+      }
+    } catch {}
+    return defaultTerrainTransform;
+  });
+  const [pencilLine, setPencilLine] = React.useState<Array<{ x: number; y: number; svgX: number; svgY: number }>>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(MAP_PENCIL_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw) as Array<{ x: number; y: number; svgX: number; svgY: number }>;
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  const [mapZoom, setMapZoom] = React.useState(1);
+  const [svgLabelPositions, setSvgLabelPositions] = React.useState<Record<string, SvgLabelPosition>>({});
+  const dragRef = React.useRef<{ id: string; pointerId: number; moved: boolean } | null>(null);
+  const pencilDragRef = React.useRef<{ pointerId: number } | null>(null);
+  const terrainDragRef = React.useRef<{ pointerId: number; startSvgX: number; startSvgY: number; start: TerrainTransform } | null>(null);
+  const svgCoordFromPct = React.useCallback((x: number, y: number) => ({
+    svgX: +(viewBoxParts[0] + (x / 100) * viewBoxParts[2]).toFixed(2),
+    svgY: +(viewBoxParts[1] + (y / 100) * viewBoxParts[3]).toFixed(2),
+  }), [viewBoxParts]);
+  const pickFromClient = React.useCallback((clientX: number, clientY: number, label?: string) => {
+    const rect = mapTileRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const x = +(((clientX - rect.left) / rect.width) * 100).toFixed(2);
+    const y = +(((clientY - rect.top) / rect.height) * 100).toFixed(2);
+    const clampedX = Math.min(100, Math.max(0, x));
+    const clampedY = Math.min(100, Math.max(0, y));
+    const svg = svgCoordFromPct(clampedX, clampedY);
+    return { x: clampedX, y: clampedY, ...svg, label };
+  }, [svgCoordFromPct]);
+  const saveDraggedTheater = React.useCallback((id: string, pos: { x: number; y: number }) => {
+    setDraggedTheaters((current) => {
+      const next = { ...current, [id]: pos };
+      try {
+        window.localStorage.setItem(THEATER_COORD_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+  const saveTerrainTransform = React.useCallback((transform: TerrainTransform) => {
+    setTerrainTransform(transform);
+    try {
+      window.localStorage.setItem(MAP_TERRAIN_STORAGE_KEY, JSON.stringify(transform));
+    } catch {}
+  }, []);
+  const resizeTerrain = React.useCallback((factor: number) => {
+    setTerrainTransform((current) => {
+      const nextWidth = +(current.width * factor).toFixed(2);
+      const nextHeight = +(current.height * factor).toFixed(2);
+      const centerX = current.x + current.width / 2;
+      const centerY = current.y + current.height / 2;
+      const next = {
+        x: +(centerX - nextWidth / 2).toFixed(2),
+        y: +(centerY - nextHeight / 2).toFixed(2),
+        width: nextWidth,
+        height: nextHeight,
+      };
+      try {
+        window.localStorage.setItem(MAP_TERRAIN_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+  const savePencilLine = React.useCallback((line: Array<{ x: number; y: number; svgX: number; svgY: number }>) => {
+    setPencilLine(line);
+    try {
+      window.localStorage.setItem(MAP_PENCIL_STORAGE_KEY, JSON.stringify(line));
+    } catch {}
+  }, []);
+  const addPencilPoint = React.useCallback((point: { x: number; y: number; svgX: number; svgY: number }) => {
+    setPencilLine((current) => {
+      const last = current[current.length - 1];
+      if (last) {
+        const dx = point.svgX - last.svgX;
+        const dy = point.svgY - last.svgY;
+        if (Math.hypot(dx, dy) < 1.2) return current;
+      }
+      const next = [...current, point];
+      try {
+        window.localStorage.setItem(MAP_PENCIL_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, []);
   const onPickClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!coordPick || dragState.current?.moved) return;
-    const rect = viewportRef.current?.getBoundingClientRect();
-    if (!rect || tileW <= 0) return;
-    let lx = (e.clientX - rect.left - offsetX) % tileW;
-    if (lx < 0) lx += tileW;
-    const x = +(lx / tileW * 100).toFixed(1);
-    const y = +((e.clientY - rect.top - offsetY) / tileH * 100).toFixed(1);
-    setPick({ x, y });
-    console.log(`map coord: (${x}, ${y})`);
+    if (!coordPick || pencilMode) return;
+    const next = pickFromClient(e.clientX, e.clientY);
+    if (!next) return;
+    setPick(next);
+    console.log(`map pct: (${next.x}, ${next.y}) svg: (${next.svgX}, ${next.svgY})`);
   };
+  const onPencilPointerDown = (ev: React.PointerEvent<HTMLDivElement>) => {
+    if (!coordPick || !pencilMode) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const next = pickFromClient(ev.clientX, ev.clientY, "铅笔");
+    if (!next) return;
+    pencilDragRef.current = { pointerId: ev.pointerId };
+    ev.currentTarget.setPointerCapture(ev.pointerId);
+    const point = { x: next.x, y: next.y, svgX: next.svgX, svgY: next.svgY };
+    savePencilLine([point]);
+    setPick(next);
+  };
+  const onPencilPointerMove = (ev: React.PointerEvent<HTMLDivElement>) => {
+    const drag = pencilDragRef.current;
+    if (!coordPick || !pencilMode || !drag || drag.pointerId !== ev.pointerId) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const next = pickFromClient(ev.clientX, ev.clientY, "铅笔");
+    if (!next) return;
+    addPencilPoint({ x: next.x, y: next.y, svgX: next.svgX, svgY: next.svgY });
+    setPick(next);
+  };
+  const onPencilPointerUp = (ev: React.PointerEvent<HTMLDivElement>) => {
+    const drag = pencilDragRef.current;
+    if (!coordPick || !pencilMode || !drag || drag.pointerId !== ev.pointerId) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    try { ev.currentTarget.releasePointerCapture(ev.pointerId); } catch {}
+    pencilDragRef.current = null;
+    console.log(`pencil svg line: ${JSON.stringify(pencilLine.map((point) => [point.svgX, point.svgY]))}`);
+  };
+  const onTerrainPointerDown = (ev: React.PointerEvent<SVGImageElement>) => {
+    if (!coordPick || !terrainMode) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const next = pickFromClient(ev.clientX, ev.clientY, "底图");
+    if (!next) return;
+    terrainDragRef.current = {
+      pointerId: ev.pointerId,
+      startSvgX: next.svgX,
+      startSvgY: next.svgY,
+      start: terrainTransform,
+    };
+    ev.currentTarget.setPointerCapture(ev.pointerId);
+    setPick(next);
+  };
+  const onTerrainPointerMove = (ev: React.PointerEvent<SVGImageElement>) => {
+    const drag = terrainDragRef.current;
+    if (!coordPick || !terrainMode || !drag || drag.pointerId !== ev.pointerId) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const next = pickFromClient(ev.clientX, ev.clientY, "底图");
+    if (!next) return;
+    saveTerrainTransform({
+      ...drag.start,
+      x: +(drag.start.x + next.svgX - drag.startSvgX).toFixed(2),
+      y: +(drag.start.y + next.svgY - drag.startSvgY).toFixed(2),
+    });
+    setPick(next);
+  };
+  const onTerrainPointerUp = (ev: React.PointerEvent<SVGImageElement>) => {
+    const drag = terrainDragRef.current;
+    if (!coordPick || !terrainMode || !drag || drag.pointerId !== ev.pointerId) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    try { ev.currentTarget.releasePointerCapture(ev.pointerId); } catch {}
+    terrainDragRef.current = null;
+  };
+  const onTheaterPointerDown = (node: MapNode) => (ev: React.PointerEvent<HTMLButtonElement>) => {
+    if (!coordPick || node.kind !== "theater") return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    dragRef.current = { id: node.id, pointerId: ev.pointerId, moved: false };
+    ev.currentTarget.setPointerCapture(ev.pointerId);
+    const next = pickFromClient(ev.clientX, ev.clientY, node.label || node.id);
+    if (next) {
+      saveDraggedTheater(node.id, { x: next.x, y: next.y });
+      setPick(next);
+    }
+  };
+  const onTheaterPointerMove = (node: MapNode) => (ev: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (!coordPick || !drag || drag.id !== node.id || drag.pointerId !== ev.pointerId) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    drag.moved = true;
+    const next = pickFromClient(ev.clientX, ev.clientY, node.label || node.id);
+    if (!next) return;
+    saveDraggedTheater(node.id, { x: next.x, y: next.y });
+    setPick(next);
+  };
+  const onTheaterPointerUp = (node: MapNode) => (ev: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (!coordPick || !drag || drag.id !== node.id || drag.pointerId !== ev.pointerId) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    try { ev.currentTarget.releasePointerCapture(ev.pointerId); } catch {}
+    const next = pickFromClient(ev.clientX, ev.clientY, node.label || node.id);
+    if (next) {
+      saveDraggedTheater(node.id, { x: next.x, y: next.y });
+      setPick(next);
+      console.log(`${node.id}: pct=(${next.x}, ${next.y}) svg=(${next.svgX}, ${next.svgY})`);
+    }
+    dragRef.current = null;
+  };
+  const changeMapZoom = React.useCallback((delta: number) => {
+    setMapZoom((current) => Math.min(2.6, Math.max(0.8, +(current + delta).toFixed(2))));
+  }, []);
+  const nodeById = React.useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const regionPathItems = React.useMemo<RegionPathRenderItem[]>(
+    () => REGION_PATH_GROUPS.filter((group) => !THEATER_ONLY_REGION_IDS.has(group.regionId)).map((group) => {
+      const node = nodeById.get(group.regionId);
+      return {
+        id: group.regionId,
+        name: node?.region?.name || group.regionId,
+        controlledBy: MAP_DISPLAY_POWER_OVERRIDES[group.regionId] || String(node?.region?.controlled_by || "ming"),
+        unrest: node?.region?.unrest || 0,
+        risk: node?.risk || 0,
+        labelX: node?.x ?? 50,
+        labelY: node?.y ?? 50,
+        paths: group.paths,
+      };
+    }),
+    [nodeById],
+  );
+  const externalPathItems = React.useMemo<ExternalPathRenderItem[]>(
+    () => {
+      return EXTERNAL_PATH_GROUPS.filter((group) => group.paths.length > 0).map((group) => {
+        const node = nodeById.get(group.id);
+        return {
+          ...group,
+          labelX: node?.x ?? 50,
+          labelY: node?.y ?? 50,
+        };
+      });
+    },
+    [nodeById],
+  );
 
-  const wrap = React.useCallback((x: number, w: number) => {
-    return normalizeMapOffset(x, w);
+  React.useLayoutEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const next: Record<string, SvgLabelPosition> = {};
+    const pathsByRegion = new Map<string, SVGGraphicsElement[]>();
+    svg.querySelectorAll<SVGGraphicsElement>("path[data-region-id]").forEach((path) => {
+      const id = path.getAttribute("data-region-id");
+      if (!id) return;
+      const current = pathsByRegion.get(id) || [];
+      current.push(path);
+      pathsByRegion.set(id, current);
+    });
+    for (const [id, paths] of pathsByRegion.entries()) {
+      let minX = Number.POSITIVE_INFINITY;
+      let minY = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      let maxY = Number.NEGATIVE_INFINITY;
+      for (const path of paths) {
+        const box = path.getBBox();
+        if (!Number.isFinite(box.x) || !Number.isFinite(box.y) || box.width <= 0 || box.height <= 0) continue;
+        minX = Math.min(minX, box.x);
+        minY = Math.min(minY, box.y);
+        maxX = Math.max(maxX, box.x + box.width);
+        maxY = Math.max(maxY, box.y + box.height);
+      }
+      if (Number.isFinite(minX) && Number.isFinite(minY) && Number.isFinite(maxX) && Number.isFinite(maxY)) {
+        next[id] = {
+          svgX: +((minX + maxX) / 2).toFixed(2),
+          svgY: +((minY + maxY) / 2).toFixed(2),
+        };
+      }
+    }
+    setSvgLabelPositions(next);
+  }, [regionPathItems, externalPathItems]);
+
+  React.useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || didCenterRef.current) return;
+    const board = viewport.querySelector<HTMLElement>(".map-tile");
+    if (!board) return;
+    didCenterRef.current = true;
+    const mingCenterX = 0.58;
+    const mingCenterY = 0.42;
+    viewport.scrollLeft = Math.max(0, board.offsetLeft + board.clientWidth * mingCenterX - viewport.clientWidth / 2);
+    viewport.scrollTop = Math.max(0, board.offsetTop + board.clientHeight * mingCenterY - viewport.clientHeight / 2);
   }, []);
 
-  React.useEffect(() => {
-    const measure = () => {
-      const viewport = viewportRef.current;
-      const viewportWidth = viewport?.clientWidth ?? window.innerWidth;
-      const viewportHeight = viewport?.clientHeight ?? window.innerHeight;
-      const size = mapTileSize(viewportWidth, viewportHeight);
-      const w = size.width;
-      setTileW(w);
-      setTileH(size.height);
-      setOffsetX((cur) => {
-        if (viewportWidth <= 600 && !mobileFocusApplied.current) {
-          mobileFocusApplied.current = true;
-          return mapInitialOffsetX(viewportWidth, viewportHeight);
-        }
-        mobileFocusApplied.current = true;
-        return wrap(cur, w);
-      });
-      setOffsetY((cur) => (
-        viewportWidth <= 600 && mobileFocusApplied.current
-          ? clampMapOffsetY(cur, viewportWidth, viewportHeight, size.height)
-          : mapInitialOffsetY(viewportWidth, viewportHeight)
-      ));
-    };
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, [wrap]);
-
-  React.useEffect(() => {
-    const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey) return;
-      const target = e.target as HTMLElement | null;
-      if (target && target.closest('button, a, input, textarea, select, [role="dialog"], .court-drawer, .map-intel-panel, .modal-scroll, .fullscreen-modal, .situation-panel, .chat-main')) return;
-      const viewportHeight = viewportRef.current?.clientHeight ?? window.innerHeight;
-      e.preventDefault();
-      if (viewportRef.current?.clientWidth && viewportRef.current.clientWidth <= 600 && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) {
-        const viewportWidth = viewportRef.current.clientWidth;
-        setOffsetY((cur) => clampMapOffsetY(cur - e.deltaY, viewportWidth, viewportHeight, tileH));
-      } else {
-        const dx = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-        if (dx === 0) return;
-        setOffsetX((cur) => wrap(cur - dx, tileW));
-      }
-    };
-    window.addEventListener("wheel", onWheel, { passive: false });
-    return () => window.removeEventListener("wheel", onWheel);
-  }, [wrap, tileW, tileH]);
-
-  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0 && e.pointerType === "mouse") return;
-    // 点在节点按钮上：不抢 pointer capture，否则 click 被劫持到 section，按钮 onClick 不触发。
-    if ((e.target as HTMLElement).closest(".map-node")) return;
-    dragState.current = {
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      originX: offsetX,
-      originY: offsetY,
-      moved: false,
-    };
-    (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-    setDragging(true);
-  };
-
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const st = dragState.current;
-    if (!st || st.pointerId !== e.pointerId) return;
-    const dx = e.clientX - st.startX;
-    const dy = e.clientY - st.startY;
-    if (!st.moved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) st.moved = true;
-    setOffsetX(wrap(st.originX + dx, tileW));
-    const viewportWidth = viewportRef.current?.clientWidth ?? window.innerWidth;
-    const viewportHeight = viewportRef.current?.clientHeight ?? window.innerHeight;
-    setOffsetY(clampMapOffsetY(st.originY + dy, viewportWidth, viewportHeight, tileH));
-  };
-
-  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
-    const st = dragState.current;
-    if (!st || st.pointerId !== e.pointerId) return;
-    try { (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId); } catch {}
-    dragState.current = null;
-    setDragging(false);
-  };
-
-  const wasDragged = () => dragState.current?.moved === true;
-  const tiles = [-1, 0, 1];
 
   return (
     <section
       ref={viewportRef}
-      className={`grand-map ${dragging ? "dragging" : ""}`}
+      className="grand-map"
       aria-label="大明地图"
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      onClick={onPickClick}
     >
-      <div
-        className="map-strip"
-        style={{ transform: `translate3d(${offsetX}px, ${offsetY}px, 0)`, height: tileH }}
-      >
-        {tiles.map((idx) => (
-          <div
-            key={idx}
-            className="map-tile"
-            style={{ width: tileW, height: tileH }}
-            aria-hidden={idx !== 0}
+      {coordPick ? (
+        <div className="coord-toolbox">
+          <button
+            className={`coord-tool-button ${pencilMode ? "active" : ""}`}
+            onClick={(ev) => {
+              ev.stopPropagation();
+              setPencilMode((current) => {
+                const next = !current;
+                if (next) setTerrainMode(false);
+                return next;
+              });
+            }}
+            aria-label="铅笔工具"
+            title="铅笔工具"
           >
-            {nodes.map((node) => {
-              const selected = idx === 0 && selectedId === node.id;
-              const danger = node.risk > 175;
-              if (node.kind === "external") {
+            <Pencil size={16} />
+            <span>{pencilMode ? "铅笔开启" : "铅笔"}</span>
+          </button>
+          <button
+            className="coord-tool-button"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              savePencilLine([]);
+              console.log("pencil line cleared");
+            }}
+            aria-label="清除铅笔线"
+            title="清除铅笔线"
+          >
+            <Eraser size={16} />
+          </button>
+          <button
+            className={`coord-tool-button ${terrainMode ? "active" : ""}`}
+            onClick={(ev) => {
+              ev.stopPropagation();
+              setTerrainMode((current) => {
+                const next = !current;
+                if (next) setPencilMode(false);
+                return next;
+              });
+            }}
+            aria-label="拖动底图"
+            title="拖动底图"
+          >
+            <Move size={16} />
+            <span>{terrainMode ? "底图开启" : "底图"}</span>
+          </button>
+          <button
+            className="coord-tool-button icon-only"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              resizeTerrain(0.96);
+            }}
+            aria-label="缩小底图"
+            title="缩小底图"
+          >
+            <ZoomOut size={16} />
+          </button>
+          <button
+            className="coord-tool-button icon-only"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              resizeTerrain(1.04);
+            }}
+            aria-label="放大底图"
+            title="放大底图"
+          >
+            <ZoomIn size={16} />
+          </button>
+          <button
+            className="coord-tool-button icon-only"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              saveTerrainTransform(defaultTerrainTransform);
+            }}
+            aria-label="重置底图"
+            title="重置底图"
+          >
+            <RotateCcw size={15} />
+          </button>
+          <button
+            className="coord-tool-button icon-only"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              changeMapZoom(-0.15);
+            }}
+            aria-label="缩小地图"
+            title="缩小地图"
+          >
+            <ZoomOut size={16} />
+          </button>
+          <span className="coord-zoom-readout">{Math.round(mapZoom * 100)}%</span>
+          <button
+            className="coord-tool-button icon-only"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              changeMapZoom(0.15);
+            }}
+            aria-label="放大地图"
+            title="放大地图"
+          >
+            <ZoomIn size={16} />
+          </button>
+          <button
+            className="coord-tool-button icon-only"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              setMapZoom(1);
+            }}
+            aria-label="重置缩放"
+            title="重置缩放"
+          >
+            <RotateCcw size={15} />
+          </button>
+        </div>
+      ) : null}
+      <div
+        className={`map-strip ${pencilMode ? "pencil-mode" : ""} ${terrainMode ? "terrain-mode" : ""}`}
+        style={coordPick ? {
+          width: `${1900 * mapZoom + 320}px`,
+          height: `${(1900 * mapZoom * 206) / 276 + 240}px`,
+        } : undefined}
+        onClick={onPickClick}
+        onPointerDown={onPencilPointerDown}
+        onPointerMove={onPencilPointerMove}
+        onPointerUp={onPencilPointerUp}
+        onPointerCancel={onPencilPointerUp}
+      >
+        <div
+          className="map-tile"
+          ref={mapTileRef}
+          style={coordPick ? { width: `${1900 * mapZoom}px` } : undefined}
+        >
+            <svg
+              ref={svgRef}
+              className="province-map-layer"
+              viewBox={MAP_VIEW_BOX}
+              preserveAspectRatio="xMinYMin meet"
+            >
+              <image
+                className={`map-terrain-image ${coordPick && terrainMode ? "draggable" : ""}`}
+                href="/ming-1627-terrain-map.png"
+                x={terrainTransform.x}
+                y={terrainTransform.y}
+                width={terrainTransform.width}
+                height={terrainTransform.height}
+                preserveAspectRatio="xMidYMid slice"
+                onPointerDown={onTerrainPointerDown}
+                onPointerMove={onTerrainPointerMove}
+                onPointerUp={onTerrainPointerUp}
+                onPointerCancel={onTerrainPointerUp}
+              />
+              {externalPathItems.map((group) => {
+                const selected = selectedId === group.id;
+                const fill = EXTERNAL_MAP_COLOR;
                 return (
-                  <div
-                    key={`${idx}:${node.id}`}
-                    className="map-node external"
-                    style={{ left: `${node.x}%`, top: `${node.y}%` }}
-                    aria-hidden="true"
+                  <g
+                    key={`${group.id}:external-paths`}
+                    className={`province-external power-${group.powerId} ${selected ? "selected" : ""}`}
+                    data-external-id={group.id}
+                    style={{ "--province-fill": fill } as React.CSSProperties}
                   >
-                    <span>{node.region?.name.split(" / ")[0] || node.label}</span>
-                  </div>
+                    {group.paths.map((path) => (
+                      <path
+                        key={`${group.id}:${path.id}`}
+                        data-map-path-id={path.id}
+                        data-region-id={group.id}
+                        fill={fill}
+                        fillOpacity={EXTERNAL_MAP_OPACITY}
+                        d={path.d}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          ev.currentTarget.blur();
+                          onSelect(group.id);
+                        }}
+                        role="button"
+                        aria-label={`查看${group.name}`}
+                        onKeyDown={(ev) => {
+                          if (ev.key === "Enter" || ev.key === " ") {
+                            ev.preventDefault();
+                            onSelect(group.id);
+                          }
+                        }}
+                      >
+                        <title>{group.name}</title>
+                      </path>
+                    ))}
+                  </g>
                 );
-              }
+              })}
+              {regionPathItems.map((region) => {
+                const selected = selectedId === region.id;
+                const fill = getRegionMapColor(region);
+                return (
+                  <g
+                    key={`${region.id}:paths`}
+                    data-region-id={region.id}
+                    className={`province-region power-${region.controlledBy} ${selected ? "selected" : ""} ${region.controlledBy === "ming" && region.unrest > UNREST_DANGER_THRESHOLD ? "danger" : ""}`}
+                    style={{ "--province-fill": fill } as React.CSSProperties}
+                  >
+                    {region.paths.map((path) => (
+                      <path
+                        key={path.id}
+                        data-map-path-id={path.id}
+                        data-region-id={region.id}
+                        fill={fill}
+                        fillOpacity={getRegionMapOpacity(region)}
+                        d={path.d}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          ev.currentTarget.blur();
+                          onSelect(region.id);
+                        }}
+                        role="button"
+                        aria-label={`查看${region.name}`}
+                        onKeyDown={(ev) => {
+                          if (ev.key === "Enter" || ev.key === " ") {
+                            ev.preventDefault();
+                            onSelect(region.id);
+                          }
+                        }}
+                      >
+                        <title>{region.name}</title>
+                      </path>
+                    ))}
+                  </g>
+                );
+              })}
+              {pencilLine.length > 1 ? (
+                <polyline
+                  className="coord-pencil-line"
+                  points={pencilLine.map((point) => `${point.svgX},${point.svgY}`).join(" ")}
+                />
+              ) : null}
+              <g className="map-label-layer" aria-hidden="true">
+                {externalPathItems.map((group) => {
+                  const pos = svgLabelPositions[group.id] || svgCoordFromPct(group.labelX, group.labelY);
+                  return (
+                    <text
+                      key={`${group.id}:label`}
+                      className="map-region-label external"
+                      x={pos.svgX}
+                      y={pos.svgY}
+                    >
+                      {group.name.split(" / ")[0]}
+                    </text>
+                  );
+                })}
+                {regionPathItems.map((region) => {
+                  const pos = svgLabelPositions[region.id] || svgCoordFromPct(region.labelX, region.labelY);
+                  return (
+                    <text
+                      key={`${region.id}:label`}
+                      className="map-region-label"
+                      x={pos.svgX}
+                      y={pos.svgY}
+                    >
+                      {region.name.split(" / ")[0]}
+                    </text>
+                  );
+                })}
+              </g>
+            </svg>
+            {nodes.filter((node) => node.kind === "theater").map((node) => {
+              const selected = selectedId === node.id;
+              const danger = node.risk > 175;
+              const override = draggedTheaters[node.id];
+              const nodeX = override?.x ?? node.x;
+              const nodeY = override?.y ?? node.y;
               return (
                 <button
-                  key={`${idx}:${node.id}`}
-                  className={`map-node ${node.kind} ${selected ? "selected" : ""} ${danger ? "danger" : ""}`}
-                  style={{ left: `${node.x}%`, top: `${node.y}%` }}
+                  key={node.id}
+                  className={`map-node ${node.kind} ${coordPick ? "draggable" : ""} ${selected ? "selected" : ""} ${danger ? "danger" : ""}`}
+                  style={{ left: `${nodeX}%`, top: `${nodeY}%` }}
+                  data-node-id={node.id}
+                  onPointerDown={onTheaterPointerDown(node)}
+                  onPointerMove={onTheaterPointerMove(node)}
+                  onPointerUp={onTheaterPointerUp(node)}
+                  onPointerCancel={onTheaterPointerUp(node)}
                   onClick={(ev) => {
-                    if (wasDragged()) { ev.preventDefault(); ev.stopPropagation(); return; }
+                    ev.stopPropagation();
+                    if (coordPick) return;
                     onSelect(node.id);
                   }}
                   aria-label={`查看${node.region?.name || node.label}`}
-                  tabIndex={idx === 0 ? 0 : -1}
+                  tabIndex={0}
                 >
                   {node.kind === "theater" ? <Shield size={16} /> : <MapPinned size={15} />}
                   <span>{node.region?.name.split(" / ")[0] || node.label}</span>
                 </button>
               );
             })}
-          </div>
-        ))}
+        </div>
       </div>
       {coordPick && pick ? (
         <div className="coord-pick-readout">
-          x: {pick.x} &nbsp; y: {pick.y}
+          {pick.label ? `${pick.label} ` : ""}pct: ({pick.x}, {pick.y}) &nbsp; svg: ({pick.svgX}, {pick.svgY})
         </div>
       ) : null}
     </section>
@@ -4072,6 +5300,15 @@ function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedI
 
 function NodeIntel({ node }: { node: MapNode }) {
   const region = node.region;
+  const power = node.power;
+  if (node.kind === "external") {
+    return (
+      <div className="panel-title">
+        <MapPinned size={14} />
+        <span>{region?.name || node.label}</span>
+      </div>
+    );
+  }
   return (
     <>
       <div className="panel-title">
@@ -4084,12 +5321,27 @@ function NodeIntel({ node }: { node: MapNode }) {
             <tr><th>人口</th><td>{region.population}万</td><th>田亩</th><td>{region.registered_land}万亩</td></tr>
             <tr><th>民心</th><td>{region.public_support}</td><th>动乱</th><td>{region.unrest}</td></tr>
             <tr><th>粮食</th><td>{region.grain_security}</td><th>月税</th><td>{monthlyAmount(region.tax_per_turn)}万/月</td></tr>
-            <tr><th>归属</th><td>{region.controlled_by || "ming"}</td><th>类型</th><td>{region.kind}</td></tr>
+            <tr><th>归属</th><td>{labelPower(region.controlled_by || "ming")}</td><th>类型</th><td>{region.kind}</td></tr>
             <tr><th>天灾</th><td colSpan={3}>{region.natural_disaster}</td></tr>
             <tr><th>人祸</th><td colSpan={3}>{region.human_disaster}</td></tr>
             <tr><th>状况</th><td colSpan={3}>{region.status}</td></tr>
           </tbody>
         </table>
+      ) : null}
+      {power && power.id !== "ming" ? (
+        <>
+          <div className="garrison-title">势力归属</div>
+          <table className="intel-table">
+            <tbody>
+              <tr><th>势力</th><td>{power.name}</td><th>首领</th><td>{power.leader}</td></tr>
+              <tr><th>立场</th><td>{power.stance}</td><th>类型</th><td>{power.kind}</td></tr>
+              <tr><th>军力</th><td>{power.military_strength}</td><th>凝聚</th><td>{power.cohesion}</td></tr>
+              <tr><th>影响</th><td>{power.leverage}</td><th>补给</th><td>{power.supply}</td></tr>
+              <tr><th>诉求</th><td colSpan={3}>{power.agenda}</td></tr>
+              <tr><th>近况</th><td colSpan={3}>{power.last_action}</td></tr>
+            </tbody>
+          </table>
+        </>
       ) : null}
       <div className="garrison-title">驻军</div>
       {node.armies.length ? (
@@ -4325,6 +5577,7 @@ function MenuPage({
   const hasKey = !!status?.has_api_key;
   const hasMainDb = !!status?.has_main_db;
   const saves = status?.saves || [];
+  const campaigns = status?.campaigns || [];
 
   return (
     <div className="menu-screen">
@@ -4382,7 +5635,7 @@ function MenuPage({
 
       {showSaveList && (
         <SaveListModal
-          saves={saves}
+          campaigns={campaigns}
           onClose={() => setShowSaveList(false)}
           onLoad={async (name) => {
             setShowSaveList(false);
@@ -4409,9 +5662,11 @@ function ApiSettingsModal({
     has_api_key: boolean;
     max_tokens?: number;
     timeout_seconds?: number;
+    thinking_level?: string;
     advanced_model?: string;
     advanced_base_url?: string;
     has_advanced_api_key?: boolean;
+    advanced_thinking_level?: string;
   };
   onClose: () => void;
   onSaved: () => Promise<void>;
@@ -4421,9 +5676,11 @@ function ApiSettingsModal({
   const [advancedModel, setAdvancedModel] = React.useState(initial?.advanced_model || "");
   const [advancedBaseUrl, setAdvancedBaseUrl] = React.useState(initial?.advanced_base_url || "");
   const [advancedApiKey, setAdvancedApiKey] = React.useState("");
+  const [advancedThinkingLevel, setAdvancedThinkingLevel] = React.useState(initial?.advanced_thinking_level || "");
   const [apiKey, setApiKey] = React.useState("");
   const [maxTokens, setMaxTokens] = React.useState(String(initial?.max_tokens || 8000));
   const [timeoutSeconds, setTimeoutSeconds] = React.useState(String(initial?.timeout_seconds || 180));
+  const [thinkingLevel, setThinkingLevel] = React.useState(initial?.thinking_level || "");
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState("");
 
@@ -4439,9 +5696,11 @@ function ApiSettingsModal({
           api_key: apiKey.trim(),
           max_tokens: parseInt(maxTokens) || 8000,
           timeout_seconds: parseFloat(timeoutSeconds) || 180,
+          thinking_level: thinkingLevel.trim(),
           advanced_model: advancedModel.trim(),
           advanced_base_url: advancedBaseUrl.trim(),
           advanced_api_key: advancedApiKey.trim(),
+          advanced_thinking_level: advancedThinkingLevel.trim(),
         }),
       });
       await onSaved();
@@ -4467,6 +5726,10 @@ function ApiSettingsModal({
           <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="deepseek-chat" />
         </label>
         <label>
+          Thinking Level <small className="menu-hint">（空=默认，请填写你的模型支持的值。）</small>
+          <input value={thinkingLevel} onChange={(e) => setThinkingLevel(e.target.value)} placeholder="默认" />
+        </label>
+        <label>
           Advanced Model <small className="menu-hint">（推演 + 打分专用；留空 fallback）</small>
           <input value={advancedModel} onChange={(e) => setAdvancedModel(e.target.value)} placeholder="deepseek-reasoner / gpt-5" />
         </label>
@@ -4478,6 +5741,10 @@ function ApiSettingsModal({
           Advanced API Key{" "}
           <small className="menu-hint">{initial?.has_advanced_api_key ? "(已配置；留空保留)" : "(留空=复用主 API Key)"}</small>
           <input type="password" value={advancedApiKey} onChange={(e) => setAdvancedApiKey(e.target.value)} placeholder={initial?.has_advanced_api_key ? "(已配置；如需更换请重新填写)" : "留空=复用主 Key"} />
+        </label>
+        <label>
+          Advanced Thinking Level <small className="menu-hint">（空=默认，请填写你的模型支持的值。）</small>
+          <input value={advancedThinkingLevel} onChange={(e) => setAdvancedThinkingLevel(e.target.value)} placeholder="默认" />
         </label>
         <label>
           Max Tokens
@@ -4595,28 +5862,43 @@ function AdminUsersModal({ onClose }: { onClose: () => void }) {
 }
 
 function SaveListModal({
-  saves,
+  campaigns,
   onClose,
   onLoad,
 }: {
-  saves: Array<{ name: string; size: number; mtime: number }>;
+  campaigns: MenuCampaign[];
   onClose: () => void;
   onLoad: (name: string) => Promise<void>;
 }) {
+  const hasAny = campaigns.some((c) => c.saves.length);
   return (
     <div className="menu-modal-bg" onClick={onClose}>
       <div className="menu-modal" onClick={(e) => e.stopPropagation()}>
         <h2>加载存档</h2>
-        <ul className="menu-save-list">
-          {saves.map((s) => (
-            <li key={s.name}>
-              <button onClick={() => onLoad(s.name)}>
-                <span className="save-name">{s.name}</span>
-                <span className="save-meta">{new Date(s.mtime * 1000).toLocaleString("zh-CN")}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
+        {hasAny ? (
+          <div className="menu-campaign-list">
+            {campaigns.map((c) => (
+              <div key={c.campaign_id || "__manual__"} className="menu-campaign">
+                <div className="menu-campaign-head">
+                  <span>{c.kind === "manual" ? "手动存档" : `战局 ${c.campaign_id.slice(0, 6)}`}</span>
+                  {c.current ? <span className="menu-campaign-badge">本局</span> : null}
+                </div>
+                <ul className="menu-save-list">
+                  {c.saves.map((s) => (
+                    <li key={s.name}>
+                      <button onClick={() => onLoad(s.name)}>
+                        <span className="save-name">{s.label || s.name}</span>
+                        <span className="save-meta">{new Date(s.mtime * 1000).toLocaleString("zh-CN")}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="menu-empty">暂无存档。</p>
+        )}
         <div className="menu-modal-actions">
           <button onClick={onClose}>关闭</button>
         </div>

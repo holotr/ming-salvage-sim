@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
-from ming_sim.llm_config import normalize_openai_base_url
+from ming_sim.llm_config import normalize_openai_base_url, normalize_thinking_level
 from ming_sim.models import LLMConfig
 from ming_sim.paths import user_data_path
 from ming_sim.secret_store import SecretStore
@@ -97,8 +97,10 @@ class AuthStore:
                     model TEXT NOT NULL,
                     max_tokens INTEGER NOT NULL DEFAULT 8000,
                     timeout_seconds REAL NOT NULL DEFAULT 180,
+                    thinking_level TEXT NOT NULL DEFAULT '',
                     advanced_model TEXT NOT NULL DEFAULT '',
                     advanced_base_url TEXT NOT NULL DEFAULT '',
+                    advanced_thinking_level TEXT NOT NULL DEFAULT '',
                     encrypted_api_key TEXT NOT NULL DEFAULT '',
                     encrypted_advanced_api_key TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
@@ -111,6 +113,22 @@ class AuthStore:
                 self.conn.execute(
                     "ALTER TABLE user_llm_configs "
                     "ADD COLUMN timeout_seconds REAL NOT NULL DEFAULT 180"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+            try:
+                self.conn.execute(
+                    "ALTER TABLE user_llm_configs "
+                    "ADD COLUMN thinking_level TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+            try:
+                self.conn.execute(
+                    "ALTER TABLE user_llm_configs "
+                    "ADD COLUMN advanced_thinking_level TEXT NOT NULL DEFAULT ''"
                 )
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
@@ -355,8 +373,10 @@ class AuthStore:
                 "model": DEFAULT_MODEL,
                 "max_tokens": DEFAULT_MAX_TOKENS,
                 "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+                "thinking_level": "",
                 "advanced_model": "",
                 "advanced_base_url": "",
+                "advanced_thinking_level": "",
                 "has_api_key": False,
                 "has_advanced_api_key": False,
                 "api_key": "",
@@ -372,8 +392,10 @@ class AuthStore:
             "model": str(row["model"] or DEFAULT_MODEL),
             "max_tokens": int(row["max_tokens"] or DEFAULT_MAX_TOKENS),
             "timeout_seconds": float(row["timeout_seconds"] or DEFAULT_TIMEOUT_SECONDS),
+            "thinking_level": str(row["thinking_level"] or ""),
             "advanced_model": str(row["advanced_model"] or ""),
             "advanced_base_url": str(row["advanced_base_url"] or ""),
+            "advanced_thinking_level": str(row["advanced_thinking_level"] or ""),
             "has_api_key": bool(row["encrypted_api_key"]),
             "has_advanced_api_key": bool(row["encrypted_advanced_api_key"]),
             "api_key": api_key,
@@ -388,11 +410,13 @@ class AuthStore:
             model=str(cfg["model"] or DEFAULT_MODEL),
             max_tokens=int(cfg["max_tokens"] or DEFAULT_MAX_TOKENS),
             timeout_seconds=float(cfg["timeout_seconds"] or DEFAULT_TIMEOUT_SECONDS),
+            thinking_level=normalize_thinking_level(str(cfg["thinking_level"] or "")),
             advanced_model=str(cfg["advanced_model"] or ""),
             advanced_base_url=normalize_openai_base_url(str(cfg["advanced_base_url"]))
             if str(cfg["advanced_base_url"] or "").strip()
             else "",
             advanced_api_key=str(cfg["advanced_api_key"] or ""),
+            advanced_thinking_level=normalize_thinking_level(str(cfg["advanced_thinking_level"] or "")),
         )
 
     def save_llm_config(
@@ -405,9 +429,11 @@ class AuthStore:
         api_key: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        thinking_level: str = "",
         advanced_model: str = "",
         advanced_base_url: str = "",
         advanced_api_key: Optional[str] = None,
+        advanced_thinking_level: str = "",
     ) -> Dict[str, object]:
         existing = self.get_llm_config(user_id)
         clean_base = normalize_openai_base_url((base_url or str(existing["base_url"])).strip())
@@ -430,9 +456,10 @@ class AuthStore:
                 self.conn.execute(
                     """
                     INSERT INTO user_llm_configs
-                        (user_id, base_url, model, max_tokens, timeout_seconds, advanced_model, advanced_base_url,
+                        (user_id, base_url, model, max_tokens, timeout_seconds, thinking_level,
+                         advanced_model, advanced_base_url, advanced_thinking_level,
                          encrypted_api_key, encrypted_advanced_api_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         int(user_id),
@@ -440,8 +467,10 @@ class AuthStore:
                         clean_model,
                         int(max_tokens or DEFAULT_MAX_TOKENS),
                         float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS),
+                        normalize_thinking_level(thinking_level),
                         (advanced_model or "").strip(),
                         clean_adv_base,
+                        normalize_thinking_level(advanced_thinking_level),
                         encrypted_api_key or "",
                         encrypted_advanced_api_key or "",
                         now,
@@ -454,8 +483,10 @@ class AuthStore:
                     "model = ?",
                     "max_tokens = ?",
                     "timeout_seconds = ?",
+                    "thinking_level = ?",
                     "advanced_model = ?",
                     "advanced_base_url = ?",
+                    "advanced_thinking_level = ?",
                     "updated_at = ?",
                 ]
                 values: List[object] = [
@@ -463,8 +494,10 @@ class AuthStore:
                     clean_model,
                     int(max_tokens or DEFAULT_MAX_TOKENS),
                     float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS),
+                    normalize_thinking_level(thinking_level),
                     (advanced_model or "").strip(),
                     clean_adv_base,
+                    normalize_thinking_level(advanced_thinking_level),
                     int(time.time()),
                 ]
                 if encrypted_api_key is not None:

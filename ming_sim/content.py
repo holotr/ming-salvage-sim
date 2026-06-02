@@ -26,6 +26,7 @@ from ming_sim.models import (
     Character,
     Event,
     Faction,
+    OpeningLegacy,
     Power,
     Region,
     SocialClass,
@@ -124,6 +125,17 @@ def load_event_content(filename: str = "events.json") -> List[Event]:
                 precondition=str(item.get("precondition") or ""),
                 event_type=event_type,
                 trigger_gate=trigger_gate,
+                auto_trigger=bool(item.get("auto_trigger") or False),
+                bar_value=int(item.get("bar_value") or 0),
+                bar_good_meaning=str(item.get("bar_good_meaning") or ""),
+                bar_bad_meaning=str(item.get("bar_bad_meaning") or ""),
+                issue_inertia=int(item.get("inertia") or 0),
+                stage_text=str(item.get("stage_text") or ""),
+                region_hint=str(item.get("region_hint") or ""),
+                issue_tags=string_list(item.get("tags"), f"{filename}[{idx}].tags") if item.get("tags") else [],
+                ongoing_effects=dict(item.get("ongoing_effects") or {}),
+                effect_on_resolve=dict(item.get("effect_on_resolve") or {}),
+                effect_on_fail=dict(item.get("effect_on_fail") or {}),
             )
         )
     if not events:
@@ -279,6 +291,31 @@ def load_powers() -> Dict[str, Power]:
     return powers
 
 
+def load_opening_legacies() -> List[OpeningLegacy]:
+    """开局负面帝国修正：content/opening_legacies.json。无 fallback，缺字段直接 SystemExit。"""
+    raw = require_dict(load_json_asset("opening_legacies.json"), "opening_legacies.json")
+    items = require_list(raw.get("legacies"), "opening_legacies.json::legacies")
+    out: List[OpeningLegacy] = []
+    for idx, item in enumerate(items, 1):
+        path = f"opening_legacies.json::legacies[{idx}]"
+        entry = require_dict(item, path)
+        modifiers = require_dict(entry.get("modifiers"), f"{path}.modifiers")
+        clear_gate = require_dict(entry.get("clear_gate"), f"{path}.clear_gate")
+        if not clear_gate:
+            raise SystemExit(f"{path}.clear_gate 不能为空（开局负面修正必须有程序判定的消除条件）。")
+        out.append(OpeningLegacy(
+            key=str_field(entry, "key", path),
+            name=str_field(entry, "name", path),
+            modifiers=modifiers,
+            narrative_hint=str_field(entry, "narrative_hint", path),
+            clear_gate={str(k): str(v) for k, v in clear_gate.items()},
+            clear_narrative=str(entry.get("clear_narrative") or "").strip(),
+        ))
+    if not out:
+        raise SystemExit("opening_legacies.json 必须至少定义一条开局负面修正。")
+    return out
+
+
 def dict_of_string_lists(value: object, path: str) -> Dict[str, List[str]]:
     data = require_dict(value, path)
     return {str(key): string_list(item, f"{path}.{key}") for key, item in data.items()}
@@ -363,6 +400,52 @@ def load_skill_content() -> Tuple[
     )
 
 
+def load_fiscal_config() -> "List[Dict[str, object]]":
+    """财政科目目录（content/fiscal_config.json）。无 fallback，缺字段直接 SystemExit。
+
+    每项必含 key/value/kind/budget_role/note。`budget_role=fixed` 的 base 项额外必含
+    account/direction/display（供 flows 生成预算行）。rate 项与 dynamic 项不强制这三字段。
+    返回有序 list（保留 JSON 顺序），db.init_fiscal_config 据此 seed。
+    """
+    raw = require_dict(load_json_asset("fiscal_config.json"), "fiscal_config.json")
+    items_raw = require_list(raw.get("items"), "fiscal_config.json.items")
+    schema_version = int_field(raw, "schema_version", "fiscal_config.json")
+    items: List[Dict[str, object]] = []
+    seen: Set[str] = set()
+    for idx, entry in enumerate(items_raw):
+        path = f"fiscal_config.json.items[{idx}]"
+        item = require_dict(entry, path)
+        key = str_field(item, "key", path)
+        if key in seen:
+            raise SystemExit(f"{path}: fiscal key 重复：{key}")
+        seen.add(key)
+        kind = str_field(item, "kind", path)
+        role = str_field(item, "budget_role", path)
+        if role not in ("fixed", "dynamic"):
+            raise SystemExit(f"{path}: budget_role 必须是 fixed/dynamic，得到 {role}")
+        record: Dict[str, object] = {
+            "key": key,
+            "value": int_field(item, "value", path),
+            "kind": kind,
+            "budget_role": role,
+            "note": str_field(item, "note", path),
+            "order": int(item["order"]) if "order" in item else 9999,
+        }
+        # fixed 的 base 项必须给 account/direction/display；flows 据此生成预算行。
+        if role == "fixed" and kind == "base":
+            account = str_field(item, "account", path)
+            direction = str_field(item, "direction", path)
+            if account not in ("国库", "内库"):
+                raise SystemExit(f"{path}: account 必须是 国库/内库，得到 {account}")
+            if direction not in ("income", "expense"):
+                raise SystemExit(f"{path}: direction 必须是 income/expense，得到 {direction}")
+            record["account"] = account
+            record["direction"] = direction
+            record["display"] = str_field(item, "display", path)
+        items.append(record)
+    return [{"__schema_version": schema_version}, *items]
+
+
 @dataclass
 class GameContent:
     """游戏全部静态设定。GameContent.load() 一次性读盘填充。
@@ -375,6 +458,7 @@ class GameContent:
     characters: Dict[str, Character] = field(default_factory=dict)
     events: List[Event] = field(default_factory=list)
     seed_events: List[Event] = field(default_factory=list)
+    opening_legacies: List[OpeningLegacy] = field(default_factory=list)
     event_by_id: Dict[str, Event] = field(default_factory=dict)
     regions: Dict[str, Region] = field(default_factory=dict)
     armies: Dict[str, Army] = field(default_factory=dict)
@@ -403,17 +487,19 @@ class GameContent:
 
     decree_writer_prompt: str = ""
     season_simulator_prompt: str = ""
-    score_extractor_prompt: str = ""
     score_extractor_shared_prompt: str = ""
     score_extractor_module_prompts: Dict[str, str] = field(default_factory=dict)
-    memory_extractor_prompt: str = ""
-    chat_memory_extractor_prompt: str = ""
+    chapter_memory_prompt: str = ""
+    ending_summary_prompt: str = ""
+
+    fiscal_items: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def load(cls) -> "GameContent":
         factions, characters = load_character_content()
         events = load_event_content("events.json")
         seed_events = load_event_content("seed_events.json")
+        opening_legacies = load_opening_legacies()
         regions = load_region_content()
         armies = load_army_content()
         buildings = load_building_content()
@@ -436,6 +522,7 @@ class GameContent:
             characters=characters,
             events=events,
             seed_events=seed_events,
+            opening_legacies=opening_legacies,
             event_by_id={ev.id: ev for ev in (*events, *seed_events)},
             regions=regions,
             armies=armies,
@@ -453,13 +540,13 @@ class GameContent:
             directive_keywords=directive_keywords,
             directive_skill_ids=directive_skill_ids,
             office_definitions=office_definitions,
+            fiscal_items=load_fiscal_config(),
             skill_tool_templates=dict_of_strings(load_json_asset("skill_tools.json"), "skill_tools.json"),
             game_world_prompt=load_text_asset("prompts/game_world.md"),
             minister_agent_prompt=load_text_asset("prompts/minister_agent.md"),
             consort_agent_prompt=load_text_asset("prompts/consort_agent.md"),
             decree_writer_prompt=load_text_asset("prompts/decree_writer.md"),
             season_simulator_prompt=load_text_asset("prompts/season_simulator.md"),
-            score_extractor_prompt=load_text_asset("prompts/score_extractor.md"),
             score_extractor_shared_prompt=load_text_asset("prompts/score_extractor_shared.md"),
             score_extractor_module_prompts={
                 "internal": load_text_asset("prompts/score_extractor_internal.md"),
@@ -467,6 +554,6 @@ class GameContent:
                 "issues": load_text_asset("prompts/score_extractor_issues.md"),
                 "personnel_secret": load_text_asset("prompts/score_extractor_personnel_secret.md"),
             },
-            memory_extractor_prompt=load_text_asset("prompts/memory_extractor.md"),
-            chat_memory_extractor_prompt=load_text_asset("prompts/chat_memory_extractor.md"),
+            chapter_memory_prompt=load_text_asset("prompts/chapter_memory.md"),
+            ending_summary_prompt=load_text_asset("prompts/ending_summary.md"),
         )

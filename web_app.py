@@ -13,6 +13,7 @@ import os
 import queue
 import random
 import secrets
+import re
 import threading
 import time
 from contextvars import ContextVar
@@ -20,7 +21,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -32,8 +33,10 @@ from ming_sim.llm_config import (
     load_llm_config,
     load_runtime_llm,
     normalize_openai_base_url,
+    normalize_thinking_level,
     save_runtime_llm,
 )
+from ming_sim.agents import _dump_llm_messages
 from ming_sim.llm_model import extract_agent_text, verify_llm_available
 from ming_sim.llm_contract import fail_if_llm_error
 from ming_sim.issues import _format_issue_ongoing
@@ -42,9 +45,9 @@ from ming_sim.session import AUTO_SAVE_PREFIX
 from ming_sim.secret_store import SecretStore, SecretStoreError
 from ming_sim.skills import available_skill_ids, skill_display_name, skill_source_labels
 from ming_sim.context import match_minister_from_text
-from ming_sim.flows import calc_province_fiscal
+from ming_sim.flows import compute_budget_lines
 from ming_sim.exceptions import LLMContractError  # noqa: F401  (保留：供错误处理)
-from ming_sim.models import Character, LLMConfig, monthly_amount
+from ming_sim.models import Character, LLMConfig
 
 WEB_DIST = bundled_path("web", "dist")
 # 自定义立绘 portrait_id 前缀；前端据此解析到 /portraits/custom/<name>.png。
@@ -67,6 +70,195 @@ def _user_path(user_id: int, *parts: str) -> str:
     target = path.joinpath(*parts)
     target.parent.mkdir(parents=True, exist_ok=True)
     return str(target)
+
+# resolve/fail_condition 同时喂 extractor（需 input.factions/leverage 等技术 key）与展示给玩家。
+# 展示前把技术词替换成中文，原文不动（LLM 仍读原文判定）。按长键先替，避免子串误伤。
+_CONDITION_DISPLAY_REPLACEMENTS = [
+    ("input.factions", "派系盘面"),
+    ("input.classes", "阶级盘面"),
+    ("input.regions", "地区盘面"),
+    ("input.armies", "军队盘面"),
+    ("input.current_state", "国势盘面"),
+    ("region.", "地区："),
+    ("army.", "军队："),
+    ("faction.", "派系："),
+    ("class.", "阶级："),
+    ("power.", "势力："),
+    ("maintenance_per_turn", "月饷"),
+    ("registered_land", "已册田亩"),
+    ("hidden_land", "隐田"),
+    ("tax_per_turn", "月税"),
+    ("public_support", "民心"),
+    ("grain_security", "粮食"),
+    ("unrest", "动乱"),
+    ("gentry_resistance", "士绅阻力"),
+    ("military_pressure", "边防压力"),
+    ("supply", "补给"),
+    ("morale", "士气"),
+    ("training", "操练"),
+    ("equipment", "军械"),
+    ("arrears", "欠饷"),
+    ("mobility", "机动"),
+    ("loyalty", "忠诚"),
+    ("controlled_by", "归属"),
+    ("leverage", "影响力"),
+    ("satisfaction", "满意度"),
+    ("resolved", "达成"),
+    ("failed", "失败"),
+    ("region ", "地区 "),
+    ("shenyang_liaoyang", "沈阳辽阳"),
+    ("dongjiang_area", "东江海域"),
+    ("mongol_chahar", "察哈尔蒙古"),
+    ("beizhili", "北直隶"),
+    ("nanzhili", "南直隶"),
+    ("shandong", "山东"),
+    ("shanxi", "山西"),
+    ("henan", "河南"),
+    ("shaanxi", "陕西"),
+    ("zhejiang", "浙江"),
+    ("jiangxi", "江西"),
+    ("huguang", "湖广"),
+    ("sichuan", "四川"),
+    ("fujian", "福建"),
+    ("guangdong", "广东"),
+    ("guangxi", "广西"),
+    ("yunnan", "云南"),
+    ("guizhou", "贵州"),
+    ("liaodong", "辽东"),
+    ("dongjiang", "东江"),
+    ("xuan_da", "宣大"),
+    ("guanning", "关宁军"),
+    ("jingying", "京营"),
+    ("jizhen", "蓟镇"),
+    ("houjin", "后金"),
+    ("ming", "大明"),
+    (".max", "最高值"),
+    (".min", "最低值"),
+    (".sum", "合计"),
+    (".avg", "均值"),
+    ("|", "、"),
+    (".", "·"),
+]
+
+
+def _humanize_condition(text: str) -> str:
+    """把结案/失败条件里的技术 key 替换成玩家可读中文（仅用于展示）。"""
+    if not text:
+        return text
+    for src, dst in _CONDITION_DISPLAY_REPLACEMENTS:
+        text = text.replace(src, dst)
+    return text
+
+
+_LEGACY_GATE_FIELD_LABELS = {
+    "leverage": "影响力",
+    "satisfaction": "满意度",
+    "controlled_by": "归属",
+    "hidden_land": "隐田",
+    "gentry_resistance": "士绅阻力",
+    "public_support": "民心",
+    "unrest": "动乱",
+    "military_pressure": "边防压力",
+    "tax_per_turn": "税收",
+    "morale": "士气",
+    "training": "训练",
+    "loyalty": "忠诚",
+    "supply": "补给",
+    "equipment": "装备",
+}
+
+_LEGACY_GATE_AGG_LABELS = {
+    "max": "最高",
+    "min": "最低",
+    "sum": "合计",
+    "avg": "平均",
+}
+
+_LEGACY_GATE_VALUE_LABELS = {
+    "ming": "大明",
+    "houjin": "后金",
+    "bandits": "流寇",
+}
+
+
+def _legacy_gate_subject(raw_key: str, content: Any) -> str:
+    parts = raw_key.split(".")
+    if len(parts) < 3:
+        return _humanize_condition(raw_key)
+    scope, raw_ids, field = parts[0], parts[1], parts[2]
+    agg = parts[3] if len(parts) > 3 else ""
+    ids = [item for item in raw_ids.split("|") if item]
+    if scope == "region":
+        names = [getattr(content.regions.get(item), "name", item) for item in ids]
+    elif scope == "faction":
+        names = ids
+    elif scope == "army":
+        names = [getattr(content.armies.get(item), "name", item) for item in ids]
+    else:
+        names = ids
+    entity = "、".join(str(name) for name in names)
+    field_label = _LEGACY_GATE_FIELD_LABELS.get(field, _humanize_condition(field))
+    agg_label = _LEGACY_GATE_AGG_LABELS.get(agg, "")
+    return f"{entity}{field_label}{agg_label}"
+
+
+def _humanize_legacy_gate(gate: Dict[str, str], content: Any) -> str:
+    """把开局帝国修正的 clear_gate 转为中文展示文案。"""
+    clauses: List[str] = []
+    for raw_key, raw_expr in gate.items():
+        subject = _legacy_gate_subject(str(raw_key), content)
+        expr = str(raw_expr).strip()
+        match = re.match(r"^(<=|>=|==|!=|<|>)\s*(.+)$", expr)
+        if not match:
+            clauses.append(f"{subject}达到 {expr}")
+            continue
+        op, value = match.groups()
+        value = _LEGACY_GATE_VALUE_LABELS.get(value.strip(), value.strip())
+        op_label = {
+            "<=": "≤",
+            ">=": "≥",
+            "==": "为",
+            "!=": "不为",
+            "<": "<",
+            ">": ">",
+        }.get(op, op)
+        clauses.append(f"{subject}{op_label}{value}")
+    return "；".join(clauses)
+
+
+def _legacy_effect_entity_name(scope: str, entity_id: str, content: Any) -> str:
+    if scope == "regions":
+        return str(getattr(content.regions.get(entity_id), "name", entity_id))
+    if scope == "armies":
+        return str(getattr(content.armies.get(entity_id), "name", entity_id))
+    return entity_id
+
+
+def _legacy_pct(value: int) -> str:
+    return f"{'+' if value > 0 else ''}{value}%"
+
+
+def _humanize_legacy_effect(modifiers: Dict[str, Any], content: Any) -> str:
+    """把 legacy modifiers 转为中文展示，避免前端露出 nanzhili/guanning 等内部 id。"""
+    parts: List[str] = []
+    for account in ("国库", "内库", "民心", "皇威"):
+        value = modifiers.get(account)
+        if isinstance(value, (int, float)):
+            parts.append(f"{account}{_legacy_pct(int(value))}")
+    for scope in ("regions", "armies"):
+        block = modifiers.get(scope)
+        if not isinstance(block, dict):
+            continue
+        for entity_id, fields in block.items():
+            if not isinstance(fields, dict):
+                continue
+            entity_name = _legacy_effect_entity_name(scope, str(entity_id), content)
+            for field, value in fields.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                field_label = _LEGACY_GATE_FIELD_LABELS.get(str(field), _humanize_condition(str(field)))
+                parts.append(f"{entity_name}{field_label}{_legacy_pct(int(value))}")
+    return "、".join(parts)
 
 
 def _delete_sqlite_db_files_or_raise(db_path: str) -> None:
@@ -118,9 +310,11 @@ def _verify_llm_configs_or_raise(config: LLMConfig) -> None:
         model=advanced_model,
         max_tokens=config.max_tokens,
         timeout_seconds=config.timeout_seconds,
+        thinking_level=config.advanced_thinking_level,
         advanced_model=config.advanced_model,
         advanced_base_url=config.advanced_base_url,
         advanced_api_key=config.advanced_api_key,
+        advanced_thinking_level=config.advanced_thinking_level,
     )
     try:
         verify_llm_available(advanced_config)
@@ -187,7 +381,7 @@ class WebGame:
             self.chat_history.setdefault(name, []).extend(msgs)
         _DEFAULT_FAVORITES = {"王承恩", "曹化淳", "李若琏", "魏忠贤", "田尔耕"}
         _fav_raw = self.db.kv_get("favorites")
-        self.favorites: set = json.loads(_fav_raw) if _fav_raw else _DEFAULT_FAVORITES
+        self.favorites: set = set(json.loads(_fav_raw)) if _fav_raw else set(_DEFAULT_FAVORITES)
         if not _fav_raw:
             self.db.kv_set("favorites", json.dumps(sorted(self.favorites)))
 
@@ -278,7 +472,7 @@ class WebGame:
             self.chat_history.setdefault(name, []).extend(msgs)
         _DEFAULT_FAVORITES = {"王承恩", "曹化淳", "李若琏", "魏忠贤", "田尔耕"}
         _fav_raw = self.db.kv_get("favorites")
-        self.favorites = json.loads(_fav_raw) if _fav_raw else _DEFAULT_FAVORITES
+        self.favorites = set(json.loads(_fav_raw)) if _fav_raw else set(_DEFAULT_FAVORITES)
         if not _fav_raw:
             self.db.kv_set("favorites", json.dumps(sorted(self.favorites)))
 
@@ -289,15 +483,21 @@ class WebGame:
         api_key: str,
         max_tokens: int = 0,
         timeout_seconds: float = 0,
+        thinking_level: Optional[str] = None,
         advanced_model: Optional[str] = None,
         advanced_base_url: Optional[str] = None,
         advanced_api_key: Optional[str] = None,
+        advanced_thinking_level: Optional[str] = None,
     ) -> LLMConfig:
         base = normalize_openai_base_url(base_url.strip() or self.session.llm_config.base_url)
         new_model = model.strip() or self.session.llm_config.model
         new_key = api_key.strip() or self.session.llm_config.api_key
         new_max = max_tokens if max_tokens > 0 else self.session.llm_config.max_tokens
         new_timeout = timeout_seconds if timeout_seconds > 0 else self.session.llm_config.timeout_seconds
+        if thinking_level is None:
+            new_thinking_level = self.session.llm_config.thinking_level
+        else:
+            new_thinking_level = normalize_thinking_level(thinking_level)
         # advanced_* = None 表示不动；传空串表示显式清空。
         if advanced_model is None:
             new_advanced = self.session.llm_config.advanced_model
@@ -312,15 +512,21 @@ class WebGame:
             new_adv_key = self.session.llm_config.advanced_api_key
         else:
             new_adv_key = advanced_api_key.strip()
+        if advanced_thinking_level is None:
+            new_adv_thinking_level = self.session.llm_config.advanced_thinking_level
+        else:
+            new_adv_thinking_level = normalize_thinking_level(advanced_thinking_level)
         new_config = LLMConfig(
             api_key=new_key,
             base_url=base,
             model=new_model,
             max_tokens=new_max,
             timeout_seconds=new_timeout,
+            thinking_level=new_thinking_level,
             advanced_model=new_advanced,
             advanced_base_url=new_adv_base,
             advanced_api_key=new_adv_key,
+            advanced_thinking_level=new_adv_thinking_level,
         )
         _verify_llm_configs_or_raise(new_config)
         auth_store.save_llm_config(
@@ -331,9 +537,11 @@ class WebGame:
             api_key=new_config.api_key,
             max_tokens=new_config.max_tokens,
             timeout_seconds=new_config.timeout_seconds,
+            thinking_level=new_config.thinking_level,
             advanced_model=new_config.advanced_model,
             advanced_base_url=new_config.advanced_base_url,
             advanced_api_key=new_config.advanced_api_key if advanced_api_key is not None else None,
+            advanced_thinking_level=new_config.advanced_thinking_level,
         )
         self.session.llm_config = new_config
         # 重建 registry 让大臣 Agent 用新配置
@@ -441,19 +649,22 @@ class WebGame:
 
     def map_nodes(self) -> List[Dict[str, Any]]:
         region_positions = {
-            "beizhili": (66, 30), "nanzhili": (70, 41), "shandong": (71, 38.5),
-            "shanxi": (57, 30), "henan": (58, 46), "shaanxi": (51, 38),
+            "beizhili": (55.5, 41.2), "nanzhili": (70, 41), "shandong": (56.8, 47.9),
+            "shanxi": (48.8, 45.2), "henan": (58, 46), "shaanxi": (51, 38),
             "zhejiang": (73.7, 57.9), "jiangxi": (67, 55), "huguang": (59, 59),
             "sichuan": (57, 52), "fujian": (73.2, 65.1), "guangdong": (62.5, 73.6),
             "guangxi": (53.9, 69.6), "yunnan": (47, 69), "guizhou": (52, 56),
-            "liaodong": (72.8, 25.5), "dongjiang_area": (78, 31),
-            "shenyang_liaoyang": (75.4, 24.2), "jianzhou": (82, 8),
-            "korea": (84, 31), "mongol_chahar": (63, 17), "nurgan": (74, 1.8),
+            "liaodong": (61.0, 37.6), "dongjiang_area": (68.9, 43.7),
+            "shenyang_liaoyang": (61.3, 39.6), "jianzhou": (64.6, 31.0),
+            "korea": (67.0, 44.8), "mongol_chahar": (47.0, 31.0), "nurgan": (58.2, 21.2),
+            "outer_mongolia": (43.0, 24.0), "western_regions": (25.0, 40.0),
+            "tibet": (31.0, 57.0), "amur_frontier": (70.0, 24.0),
+            "japan": (83.0, 49.0), "southwest_frontier": (45.0, 75.0),
             "taiwan": (78, 67),
         }
         theater_positions = {
-            "liaodong": (72.8, 25.5), "dongjiang": (78, 31),
-            "xuan_da": (60, 20), "shanhaiguan": (69.5, 27.7),
+            "liaodong": (57.76, 42.21), "dongjiang": (63.95, 42.39),
+            "xuan_da": (50.49, 40.08), "shanhaiguan": (55.52, 42.84),
         }
         armies = self.db.army_payload(danger_order=True)
         nodes: List[Dict[str, Any]] = []
@@ -538,75 +749,56 @@ class WebGame:
                 "severity": int(row["severity"]),
                 "tags": list(json.loads(str(row["tags"] or "[]"))),
                 "inertia": int(row["inertia"] or 0),
-                "resolve_condition": row["resolve_condition"] or "",
-                "fail_condition": row["fail_condition"] or "",
+                "resolve_condition": _humanize_condition(row["resolve_condition"] or ""),
+                "fail_condition": _humanize_condition(row["fail_condition"] or ""),
                 "ongoing_text": _format_issue_ongoing(str(row["ongoing_effects"] or "{}")),
                 "effect_on_resolve": dict(json.loads(str(row["effect_on_resolve"] or "{}"))),
                 "effect_on_fail": dict(json.loads(str(row["effect_on_fail"] or "{}"))),
             })
         return payloads
 
-    def budget_payload(self) -> Dict[str, Any]:
-        cfg = self.db.get_fiscal_config()
-        army_total = self.db.conn.execute("SELECT SUM(maintenance_per_turn) FROM armies").fetchone()[0] or 0
-
-        def rated(base: int, rate_key: str) -> int:
-            return monthly_amount(round(int(base) * cfg.get(rate_key, 100) / 100))
-
-        # 用动态省级财政模型预测本月国库收入（与实际结算算法一致）
-        guo_income_est, _nei_income_est, _province_details = calc_province_fiscal(self.state, self.db)
-
-        budget = {
-            "国库": {
-                "balance": int(self.state.metrics["国库"]),
-                "income": [
-                    {"name": "田赋辽饷盐商", "amount": int(guo_income_est), "note": "各省田赋+辽饷+盐税+商税（按腐败度/士绅阻力/民变动态折算）"},
-                ],
-                "expense": [
-                    {"name": "各军军饷", "amount": int(army_total), "note": "各军月度维护/军饷合计"},
-                    {"name": "宗室禄米", "amount": rated(cfg.get("宗室禄米_base", 80), "宗室禄米_rate"), "note": "诸藩宗室月禄米"},
-                    {"name": "百官俸禄", "amount": rated(cfg.get("官俸_base", 35), "官俸_rate"), "note": "在京百官月俸禄"},
-                    {"name": "工部", "amount": rated(cfg.get("工程_base", 22), "工程_rate"), "note": "工部月维护支出"},
-                    {"name": "赈灾备用", "amount": rated(cfg.get("赈灾_base", 25), "赈灾_rate"), "note": "制度性赈灾预留"},
-                ],
-            },
-            "内库": {
-                "balance": int(self.state.metrics["内库"]),
-                "income": [
-                    {"name": "皇庄", "amount": rated(cfg.get("皇庄_base", 60), "皇庄_rate"), "note": "皇庄地租月上缴"},
-                    {"name": "织造", "amount": rated(cfg.get("织造_base", 35), "织造_rate"), "note": "苏杭织造局月上缴"},
-                    {"name": "矿税", "amount": rated(cfg.get("矿税_base", 10), "矿税_rate"), "note": "矿税残余"},
-                ],
-                "expense": [
-                    {"name": "宫廷开支", "amount": rated(cfg.get("宫廷_base", 18), "宫廷_rate"), "note": "皇室日常用度"},
-                    {"name": "内廷俸禄", "amount": rated(cfg.get("内廷俸_base", 12), "内廷俸_rate"), "note": "太监宫女俸禄"},
-                    {"name": "妃嫔供奉", "amount": rated(cfg.get("妃嫔_base", 8), "妃嫔_rate"), "note": "后宫妃嫔月供奉"},
-                ],
-            },
+    def legacies_payload(self) -> List[Dict[str, Any]]:
+        """现行帝国修正（长期百分比修正符），给状态栏小条用。"""
+        out: List[Dict[str, Any]] = []
+        opening_clear_text = {
+            leg.key: leg.clear_narrative
+            for leg in self.content.opening_legacies
+            if leg.clear_narrative
         }
-        # 建筑产出/维护并入内库固定栏（按当前 condition 折算的月预算）
-        building_rows = self.db.conn.execute(
-            "SELECT name, category, condition, maintenance, output_metric, output_amount FROM buildings"
-        ).fetchall()
-        bld_produce_by_acc: dict[str, int] = {"国库": 0, "内库": 0}
-        bld_maintain_by_acc: dict[str, int] = {"国库": 0, "内库": 0}
-        for br in building_rows:
-            cond = max(0, min(100, int(br["condition"])))
-            out_acc = str(br["output_metric"] or "")
-            if out_acc in ("国库", "内库") and br["output_amount"]:
-                bld_produce_by_acc[out_acc] += round(int(br["output_amount"]) * cond / 100)
-            maint_acc = "内库" if str(br["category"] or "") == "内廷" else "国库"
-            bld_maintain_by_acc[maint_acc] += max(0, int(br["maintenance"]))
-        for acc in ("国库", "内库"):
-            if bld_produce_by_acc[acc] > 0:
-                budget[acc]["income"].append(
-                    {"name": "建筑产出", "amount": bld_produce_by_acc[acc], "note": "建筑月产出"}
-                )
-            if bld_maintain_by_acc[acc] > 0:
-                budget[acc]["expense"].append(
-                    {"name": "建筑维护", "amount": bld_maintain_by_acc[acc], "note": "建筑月维护"}
-                )
-        for account in budget.values():
+        for row in self.db.list_active_legacies(self.state):
+            try:
+                eff = json.loads(str(row["modifiers"] or "{}"))
+            except Exception:
+                eff = {}
+            try:
+                clear_gate = json.loads(str(row["clear_gate"] or "{}"))
+            except Exception:
+                clear_gate = {}
+            remaining_months = self.db.legacy_remaining_months(row, self.state)
+            clear_condition = opening_clear_text.get(str(row["legacy_key"] or ""), "")
+            if not clear_condition and clear_gate:
+                clear_condition = _humanize_legacy_gate(clear_gate, self.content)
+            elif clear_condition and clear_gate:
+                clear_condition = f"{clear_condition}（{_humanize_legacy_gate(clear_gate, self.content)}）"
+            if not clear_condition:
+                clear_condition = "无固定消除条件" if remaining_months < 0 else f"再过 {remaining_months} 月自然消退"
+            out.append({
+                "id": int(row["id"]),
+                "name": row["name"],
+                "narrative_hint": row["narrative_hint"],
+                "modifiers": eff,
+                "effect_text": _humanize_legacy_effect(eff, self.content),
+                "remaining_months": remaining_months,
+                "clear_condition": clear_condition,
+            })
+        return out
+
+    def budget_payload(self) -> Dict[str, Any]:
+        # 唯一定额源：flows.compute_budget_lines（与实际落账 / 大臣 treasury_budget_summary 三处统一）。
+        budget = compute_budget_lines(self.db, self.state)
+        budget["国库"]["balance"] = int(self.state.metrics["国库"])
+        budget["内库"]["balance"] = int(self.state.metrics["内库"])
+        for account in (budget["国库"], budget["内库"]):
             income_total = sum(int(item["amount"]) for item in account["income"])
             expense_total = sum(int(item["amount"]) for item in account["expense"])
             account["income_total"] = income_total
@@ -651,6 +843,19 @@ class WebGame:
             account["movements_total"] = sum(m["delta"] for m in movements)
         return budget
 
+    def ending_payload(self) -> Optional[Dict[str, Any]]:
+        """结局已触发时返回 {status,label,summary,timeline}，否则 None。"""
+        if not self.state.ended:
+            return None
+        from ming_sim.context import ENDING_LABELS
+        row = self.db.get_ending_summary() or {}
+        return {
+            "status": self.state.ending_status,
+            "label": ENDING_LABELS.get(self.state.ending_status, "结局"),
+            "summary": row.get("summary", ""),
+            "timeline": row.get("timeline", []),
+        }
+
     def state_payload(self) -> Dict[str, Any]:
         directives = [self.directive_payload(row) for row in self.directive_rows()]
         return {
@@ -660,6 +865,7 @@ class WebGame:
             "previous_summary": self.previous_summary,
             "treasury": self.db.treasury_report(self.state),
             "issues": self.issue_payloads(),
+            "legacies": self.legacies_payload(),
             "closed_this_turn": self.closed_this_turn_payloads(),
             "budget": self.budget_payload(),
             "region_warning": self.db.region_report(limit=5),
@@ -667,6 +873,7 @@ class WebGame:
             "power_warning": self.db.power_report(exclude_self=True),
             "powers": self.db.power_payload(),
             "victory_status": self.session.victory(),
+            "ending": self.ending_payload(),
             "events": [],
             "regions": self.db.region_payload(),
             "armies": self.db.army_payload(),
@@ -688,6 +895,76 @@ class WebGame:
         }
 
     # ── 聊天 ──────────────────────────────────────────────────────────────
+    def _persistent_chat_minister(self, minister_name: str) -> bool:
+        return minister_name not in self.session.temporary_characters
+
+    def _minister_agno_session_id(self, minister_name: str) -> str:
+        registry = self.session.registry
+        if registry is None:
+            return f"minister-{minister_name}-turn-{self.state.turn}"
+        return registry.session_ids.get(minister_name, f"minister-{minister_name}-turn-{self.state.turn}")
+
+    def can_undo_last_chat(self, minister_name: str) -> bool:
+        if not self._persistent_chat_minister(minister_name):
+            return False
+        if self.state.turn_phase not in ("summoning", "reviewing"):
+            return False
+        return self.db.can_undo_last_chat_turn(minister_name, self.state.turn)
+
+    def _start_chat_turn(self, minister_name: str) -> tuple[int, Dict[str, Any]]:
+        agno_session_id = self._minister_agno_session_id(minister_name)
+        runs_before = self.db.agno_runs_length(agno_session_id)
+        snapshot = self.db.capture_chat_rollback_snapshot()
+        chat_turn_id = self.db.create_chat_turn(
+            self.state,
+            minister_name,
+            agno_session_id,
+            runs_before,
+        )
+        return chat_turn_id, snapshot
+
+    def _record_chat_rollback_items(
+        self,
+        chat_turn_id: int,
+        before_snapshot: Dict[str, Any],
+    ) -> None:
+        if not chat_turn_id:
+            return
+        after_snapshot = self.db.capture_chat_rollback_snapshot()
+        self.db.record_chat_turn_rollback_diffs(chat_turn_id, before_snapshot, after_snapshot)
+
+    def undo_last_chat(self, minister_name: str) -> Dict[str, Any]:
+        if self.state.turn_phase not in ("summoning", "reviewing"):
+            raise HTTPException(status_code=409, detail="本回合已经进入颁诏结算，不能撤回召对。")
+        if not self._persistent_chat_minister(minister_name):
+            raise HTTPException(status_code=409, detail="临时召见人物暂不支持撤回。")
+        row = self.db.get_last_active_chat_turn(minister_name, self.state.turn)
+        if row is None:
+            raise HTTPException(status_code=404, detail="本回合没有可撤回的召对。")
+        if not self.db.is_global_last_active_chat_turn(int(row["id"])):
+            raise HTTPException(status_code=409, detail="只能撤回全局最后一轮召对。")
+        if not row.get("user_message_id") or not row.get("minister_message_id"):
+            raise HTTPException(status_code=409, detail="该召对尚未完整完成，不能撤回。")
+        try:
+            undone = self.db.undo_chat_turn(int(row["id"]))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        self.session.refresh_runtime_after_chat_rollback()
+        self.chat_history = {name: [] for name in self.session.content.characters}
+        for name, msgs in self.db.load_all_chat_history().items():
+            self.chat_history.setdefault(name, []).extend(msgs)
+        character = self.session._character(minister_name)
+        return {
+            "minister": minister_name,
+            "undone_chat_turn_id": int(undone["id"]),
+            "history": self.chat_history.get(minister_name, []),
+            "directives": [self.directive_payload(row) for row in self.directive_rows()],
+            "pending_count": self.session.pending_count(),
+            "secret_orders": self.db.list_secret_orders(),
+            "suggestions": self.suggestions_for(character),
+            "can_undo_last_chat": self.can_undo_last_chat(minister_name),
+        }
+
     def _chat_payload(
         self,
         minister_name: str,
@@ -699,11 +976,14 @@ class WebGame:
         registered_minister: str = "",
         displaced_minister: str = "",
         secret_order_id: int = 0,
+        chat_turn_id: int = 0,
     ) -> Dict[str, Any]:
         character = self.session._character(minister_name)
         self.chat_history[minister_name].append({"role": "minister", "content": answer})
         if minister_name not in self.session.temporary_characters:
-            self.db.append_chat_message(minister_name, self.state.turn, "minister", answer)
+            message_id = self.db.append_chat_message(minister_name, self.state.turn, "minister", answer)
+            if chat_turn_id:
+                self.db.update_chat_turn_messages(chat_turn_id, minister_message_id=message_id)
         return {
             "minister": minister_name,
             "answer": answer,
@@ -716,7 +996,9 @@ class WebGame:
             "displaced_minister": displaced_minister,
             "secret_order_id": secret_order_id or 0,
             "directives": [self.directive_payload(row) for row in self.directive_rows()],
+            "pending_count": self.session.pending_count(),
             "suggestions": self.suggestions_for(character),
+            "can_undo_last_chat": self.can_undo_last_chat(minister_name),
         }
 
     def chat(self, minister_name: str, message: str) -> Dict[str, Any]:
@@ -725,10 +1007,22 @@ class WebGame:
         text = message.strip()
         if not text:
             raise HTTPException(status_code=400, detail="问话不能为空。")
+        chat_turn_id = 0
+        before_snapshot: Dict[str, Any] = {}
+        if self._persistent_chat_minister(minister_name):
+            chat_turn_id, before_snapshot = self._start_chat_turn(minister_name)
         self.chat_history.setdefault(minister_name, []).append({"role": "user", "content": text})
         if minister_name not in self.session.temporary_characters:
-            self.db.append_chat_message(minister_name, self.state.turn, "user", text)
-        result = self.session.chat(minister_name, text)
+            message_id = self.db.append_chat_message(minister_name, self.state.turn, "user", text)
+            if chat_turn_id:
+                self.db.update_chat_turn_messages(chat_turn_id, user_message_id=message_id)
+        try:
+            result = self.session.chat(minister_name, text)
+            self._record_chat_rollback_items(chat_turn_id, before_snapshot)
+        except Exception:
+            if chat_turn_id:
+                self.db.mark_chat_turn_failed(chat_turn_id)
+            raise
         proposed = None
         if result.proposed_directive is not None:
             d = result.proposed_directive
@@ -740,6 +1034,7 @@ class WebGame:
             registered_minister=result.registered_minister,
             displaced_minister=result.displaced_minister,
             secret_order_id=result.secret_order_id,
+            chat_turn_id=chat_turn_id,
         )
 
     def chat_stream(self, minister_name: str, message: str) -> Iterator[Dict[str, Any]]:
@@ -750,9 +1045,15 @@ class WebGame:
         if not text:
             yield {"type": "error", "message": "问话不能为空。"}
             return
+        chat_turn_id = 0
+        before_snapshot: Dict[str, Any] = {}
+        if self._persistent_chat_minister(minister_name):
+            chat_turn_id, before_snapshot = self._start_chat_turn(minister_name)
         self.chat_history.setdefault(minister_name, []).append({"role": "user", "content": text})
         if minister_name not in self.session.temporary_characters:
-            self.db.append_chat_message(minister_name, self.state.turn, "user", text)
+            message_id = self.db.append_chat_message(minister_name, self.state.turn, "user", text)
+            if chat_turn_id:
+                self.db.update_chat_turn_messages(chat_turn_id, user_message_id=message_id)
         character = self.session._character(minister_name)
         chunks: List[str] = []
         try:
@@ -768,6 +1069,9 @@ class WebGame:
                     yield {"type": "delta", "content": delta}
                 if type(event).__name__ in ("RunOutput", "RunCompletedEvent"):
                     run_output = event
+            # 流式跑完补 dump：流式 run_output(RunCompletedEvent)常无 .messages，
+            # 传 agent= 让 _dump_llm_messages 走 agent.get_last_run_output() fallback 取 system/user。
+            _dump_llm_messages(run_output, f"大臣对话/{minister_name}", agent=agent)
             answer = "".join(chunks).strip()
             fail_if_llm_error(answer, "LLM 调用")
             if not answer and run_output is not None:
@@ -845,15 +1149,19 @@ class WebGame:
                                 payload_json = json.dumps(args, ensure_ascii=False)
                             secret_order_id = self.session._apply_secret_order(payload_json, minister_name)
                     # 密令结案不再走大臣工具，由月末推演 + extractor 写入
+            self._record_chat_rollback_items(chat_turn_id, before_snapshot)
             payload = self._chat_payload(
                 minister_name, answer, court_action=court_action, next_minister=next_minister,
                 proposed_directive=proposed, appointed_minister=appointed,
                 registered_minister=registered,
                 displaced_minister=displaced,
                 secret_order_id=secret_order_id,
+                chat_turn_id=chat_turn_id,
             )
             yield {"type": "done", "payload": payload}
         except Exception as error:
+            if chat_turn_id:
+                self.db.mark_chat_turn_failed(chat_turn_id)
             if isinstance(error, LLMUnavailable):
                 yield {"type": "error", "detail": _llm_error_detail(error)}
             else:
@@ -988,11 +1296,34 @@ async def csrf_middleware(request: Request, call_next):
             _request_user.reset(user_token)
 
 
-def _save_visible_for_campaign(fname: str, campaign_id: str) -> bool:
-    if not fname.startswith(AUTO_SAVE_PREFIX):
-        return True
-    campaign_id = (campaign_id or "").strip()
-    return bool(campaign_id and fname.startswith(f"{AUTO_SAVE_PREFIX}{campaign_id}_"))
+# 自动存档文件名：auto_<campaign_id>_<year>_<period>_t<turn>_<tag>.db
+_AUTO_SAVE_RE = re.compile(
+    rf"^{re.escape(AUTO_SAVE_PREFIX)}(?P<cid>[0-9a-f]+)_"
+    r"(?P<year>\d{4})_(?P<period>\d{2})_t(?P<turn>\d{4})_(?P<tag>\w+)$"
+)
+
+_AUTO_TAG_LABEL = {"begin": "月初", "preresolve": "结算前"}
+
+
+def _parse_save_name(name: str) -> Dict[str, Any]:
+    """把存档名解析成元信息。自动档归到对应 campaign，手动档 campaign_id 留空。"""
+    m = _AUTO_SAVE_RE.match(name)
+    if not m:
+        return {"campaign_id": "", "kind": "manual", "label": name}
+    year = int(m.group("year"))
+    period = int(m.group("period"))
+    turn = int(m.group("turn"))
+    tag = m.group("tag")
+    tag_label = _AUTO_TAG_LABEL.get(tag, tag)
+    return {
+        "campaign_id": m.group("cid"),
+        "kind": "auto",
+        "year": year,
+        "period": period,
+        "turn": turn,
+        "tag": tag,
+        "label": f"{year}年{period}月 · 第{turn}回合 · {tag_label}",
+    }
 
 
 def _main_db_campaign_id(user_id: int) -> str:
@@ -1013,28 +1344,57 @@ def _main_db_campaign_id(user_id: int) -> str:
 
 
 def _scan_saves(user_id: int) -> List[Dict[str, Any]]:
-    """扫存档目录，独立于 WebGame 实例（菜单页无 game 也要能列）。"""
+    """扫当前用户存档目录，独立于 WebGame 实例（菜单页无 game 也要能列）。"""
     saves_dir = os.path.dirname(_user_path(user_id, "saves", "_keep"))
     out: List[Dict[str, Any]] = []
     if not os.path.isdir(saves_dir):
         return out
-    campaign_id = _main_db_campaign_id(user_id)
     for fname in sorted(os.listdir(saves_dir)):
         if not fname.endswith(".db"):
             continue
-        if not _save_visible_for_campaign(fname, campaign_id):
-            continue
+        name = fname[:-3]
         full = os.path.join(saves_dir, fname)
         try:
             st = os.stat(full)
         except OSError:
             continue
+        meta = _parse_save_name(name)
         out.append({
-            "name": fname[:-3],
+            "name": name,
             "size": st.st_size,
             "mtime": int(st.st_mtime),
+            **meta,
         })
     out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+def _scan_campaigns(user_id: int) -> List[Dict[str, Any]]:
+    """把当前用户存档按局（campaign_id）分组，当前主 DB 的局标 current=True。"""
+    saves = _scan_saves(user_id)
+    cur_campaign = _main_db_campaign_id(user_id)
+    groups: Dict[str, Dict[str, Any]] = {}
+    for s in saves:
+        cid = s.get("campaign_id") or ""
+        key = cid or "__manual__"
+        group = groups.get(key)
+        if group is None:
+            group = {
+                "campaign_id": cid,
+                "kind": "manual" if not cid else "auto",
+                "current": bool(cid) and cid == cur_campaign,
+                "saves": [],
+                "latest_mtime": 0,
+            }
+            groups[key] = group
+        group["saves"].append(s)
+        group["latest_mtime"] = max(group["latest_mtime"], s["mtime"])
+    out = list(groups.values())
+    # 当前局置顶，其余按最新档时间倒序；手动组排最后。
+    out.sort(key=lambda g: (
+        0 if g["current"] else (2 if g["kind"] == "manual" else 1),
+        -g["latest_mtime"],
+    ))
     return out
 
 
@@ -1084,9 +1444,11 @@ def _migrate_runtime_llm_to_user(user_id: int, store: SecretStore) -> bool:
         api_key=runtime.get("api_key") or "",
         max_tokens=int(runtime.get("max_tokens") or DEFAULT_MAX_TOKENS),
         timeout_seconds=float(runtime.get("timeout_seconds") or 180),
+        thinking_level=runtime.get("thinking_level") or "",
         advanced_model=runtime.get("advanced_model") or "",
         advanced_base_url=runtime.get("advanced_base_url") or "",
         advanced_api_key=runtime.get("advanced_api_key") or "",
+        advanced_thinking_level=runtime.get("advanced_thinking_level") or "",
     )
     save_runtime_llm(
         runtime.get("base_url") or DEFAULT_BASE_URL,
@@ -1094,9 +1456,11 @@ def _migrate_runtime_llm_to_user(user_id: int, store: SecretStore) -> bool:
         "",
         int(runtime.get("max_tokens") or DEFAULT_MAX_TOKENS),
         float(runtime.get("timeout_seconds") or 180),
+        runtime.get("thinking_level") or "",
         runtime.get("advanced_model") or "",
         runtime.get("advanced_base_url") or "",
         "",
+        runtime.get("advanced_thinking_level") or "",
     )
     return True
 
@@ -1201,15 +1565,19 @@ async def api_menu_status(user: AuthUser = Depends(require_user)) -> Dict[str, A
         "has_running_game": user.id in games_by_user_id,
         "has_main_db": _has_main_db(user.id),
         "saves": _scan_saves(user.id),
+        "campaigns": _scan_campaigns(user.id),
+        "current_campaign": _main_db_campaign_id(user.id),
         "llm": {
             "base_url": llm.get("base_url") or DEFAULT_BASE_URL,
             "model": llm.get("model") or DEFAULT_MODEL,
             "has_api_key": has_api_key,
             "max_tokens": int(llm.get("max_tokens") or DEFAULT_MAX_TOKENS),
             "timeout_seconds": float(llm.get("timeout_seconds") or 180),
+            "thinking_level": llm.get("thinking_level") or "",
             "advanced_model": llm.get("advanced_model") or "",
             "advanced_base_url": llm.get("advanced_base_url") or "",
             "has_advanced_api_key": bool(llm.get("has_advanced_api_key")),
+            "advanced_thinking_level": llm.get("advanced_thinking_level") or "",
         },
     }
 
@@ -1319,9 +1687,11 @@ class LlmSetupRequest(BaseModel):
     api_key: str
     max_tokens: int = 8000
     timeout_seconds: float = 180
+    thinking_level: str = ""
     advanced_model: str = ""
     advanced_base_url: str = ""
     advanced_api_key: str = ""
+    advanced_thinking_level: str = ""
 
 
 @app.post("/api/menu/llm")
@@ -1336,6 +1706,8 @@ async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(r
     advanced_api_key = (request.advanced_api_key or "").strip()
     max_tokens = request.max_tokens if request.max_tokens > 0 else 8000
     timeout_seconds = request.timeout_seconds if request.timeout_seconds > 0 else 180
+    thinking_level = normalize_thinking_level(request.thinking_level)
+    advanced_thinking_level = normalize_thinking_level(request.advanced_thinking_level)
     if not (base_url and model):
         raise HTTPException(status_code=400, detail="base_url / model 不能为空。")
     existing = auth_store.get_llm_config(user.id)
@@ -1354,9 +1726,11 @@ async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(r
             model=model,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            thinking_level=thinking_level,
             advanced_model=advanced_model,
             advanced_base_url=advanced_base_url,
             advanced_api_key=advanced_api_key or (current_cfg.advanced_api_key if current_cfg else ""),
+            advanced_thinking_level=advanced_thinking_level,
         )
         _verify_llm_configs_or_raise(config)
     except HTTPException:
@@ -1376,9 +1750,11 @@ async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(r
             api_key=api_key_to_save,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            thinking_level=thinking_level,
             advanced_model=advanced_model,
             advanced_base_url=advanced_base_url,
             advanced_api_key=adv_key_to_save,
+            advanced_thinking_level=advanced_thinking_level,
         )
     except SecretStoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
@@ -1398,9 +1774,11 @@ async def api_menu_save_llm(request: LlmSetupRequest, user: AuthUser = Depends(r
             "has_api_key": True,
             "max_tokens": max_tokens,
             "timeout_seconds": timeout_seconds,
+            "thinking_level": thinking_level,
             "advanced_model": advanced_model,
             "advanced_base_url": advanced_base_url,
             "has_advanced_api_key": bool(saved_llm.get("has_advanced_api_key")),
+            "advanced_thinking_level": advanced_thinking_level,
         },
     }
 app.add_middleware(
@@ -1521,6 +1899,7 @@ async def api_chat_history(minister_name: str) -> Dict[str, Any]:
         "minister": get_game().public_character(character),
         "history": get_game().chat_history.get(minister_name, []),
         "suggestions": get_game().suggestions_for(character),
+        "can_undo_last_chat": get_game().can_undo_last_chat(minister_name),
     }
 
 
@@ -1551,6 +1930,11 @@ async def api_create_secret_order(minister_name: str, request: SecretOrderReques
 async def api_chat(minister_name: str, request: ChatRequest) -> Dict[str, Any]:
     _require_active_minister(minister_name)
     return get_game().chat(minister_name, request.message)
+
+
+@app.post("/api/ministers/{minister_name}/chat/undo")
+async def api_undo_chat(minister_name: str) -> Dict[str, Any]:
+    return get_game().undo_last_chat(minister_name)
 
 
 @app.post("/api/ministers/{minister_name}/chat/stream")
@@ -1630,11 +2014,16 @@ async def api_write_decree() -> Dict[str, Any]:
     return {"decree": decree}
 
 
+class IssueDecreeRequest(BaseModel):
+    # 作弊控制台（Ctrl+~）下的强制结算项；一次性，颁诏即用。普通颁诏留空。
+    cheat: str = ""
+
+
 @app.post("/api/decree/issue")
-async def api_issue_decree() -> Dict[str, Any]:
+async def api_issue_decree(body: IssueDecreeRequest = IssueDecreeRequest()) -> Dict[str, Any]:
     """非流式颁诏（保留兼容）。前端默认走 /api/decree/issue/stream。"""
     try:
-        report = get_game().session.resolve_turn()
+        report = get_game().session.resolve_turn(cheat_directive=body.cheat)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
     decree = get_game().session.last_decree
@@ -1643,7 +2032,7 @@ async def api_issue_decree() -> Dict[str, Any]:
 
 
 @app.post("/api/decree/issue/stream")
-async def api_issue_decree_stream() -> StreamingResponse:
+async def api_issue_decree_stream(body: IssueDecreeRequest = IssueDecreeRequest()) -> StreamingResponse:
     """流式颁诏：推演过程（阶段/思考/正文）实时 SSE 推给前端。
 
     resolve_turn 是阻塞的同步调用，且 on_event 是 push 式回调。
@@ -1658,7 +2047,7 @@ async def api_issue_decree_stream() -> StreamingResponse:
 
     def worker() -> None:
         try:
-            report = game.session.resolve_turn(on_event=on_event)
+            report = game.session.resolve_turn(on_event=on_event, cheat_directive=body.cheat)
             decree = game.session.last_decree
             game.refresh_turn()
             ev_queue.put(("__done__", {
@@ -1699,10 +2088,12 @@ class LLMConfigRequest(BaseModel):
     api_key: str = ""
     max_tokens: int = 0
     timeout_seconds: float = 0
+    thinking_level: str = "__keep__"
     # None=不动，""=显式清空，其他=覆写。pydantic v1 默认 None 走不进来；用 sentinel "__keep__"
     advanced_model: str = "__keep__"
     advanced_base_url: str = "__keep__"
     advanced_api_key: str = "__keep__"
+    advanced_thinking_level: str = "__keep__"
 
 
 @app.get("/api/consorts/candidates")
@@ -1777,9 +2168,11 @@ async def api_get_llm_config() -> Dict[str, Any]:
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
         "timeout_seconds": cfg.timeout_seconds,
+        "thinking_level": cfg.thinking_level,
         "advanced_model": cfg.advanced_model,
         "advanced_base_url": cfg.advanced_base_url,
         "has_advanced_api_key": bool(cfg.advanced_api_key),
+        "advanced_thinking_level": cfg.advanced_thinking_level,
         "has_api_key": bool(cfg.api_key),
         "persisted": {
             "base_url": saved.get("base_url", ""),
@@ -1787,18 +2180,22 @@ async def api_get_llm_config() -> Dict[str, Any]:
             "has_api_key": bool(saved.get("has_api_key")),
             "max_tokens": int(saved.get("max_tokens") or 8000),
             "timeout_seconds": float(saved.get("timeout_seconds") or 180),
+            "thinking_level": saved.get("thinking_level", ""),
             "advanced_model": saved.get("advanced_model", ""),
             "advanced_base_url": saved.get("advanced_base_url", ""),
             "has_advanced_api_key": bool(saved.get("has_advanced_api_key")),
+            "advanced_thinking_level": saved.get("advanced_thinking_level", ""),
         },
     }
 
 
 @app.post("/api/llm/config")
 async def api_set_llm_config(request: LLMConfigRequest) -> Dict[str, Any]:
+    thinking_level = None if request.thinking_level == "__keep__" else request.thinking_level
     advanced = None if request.advanced_model == "__keep__" else request.advanced_model
     adv_base = None if request.advanced_base_url == "__keep__" else request.advanced_base_url
     adv_key = None if request.advanced_api_key == "__keep__" else request.advanced_api_key
+    adv_thinking = None if request.advanced_thinking_level == "__keep__" else request.advanced_thinking_level
     try:
         cfg = get_game().apply_llm_config(
             request.base_url,
@@ -1806,9 +2203,11 @@ async def api_set_llm_config(request: LLMConfigRequest) -> Dict[str, Any]:
             request.api_key,
             request.max_tokens,
             request.timeout_seconds,
+            thinking_level=thinking_level,
             advanced_model=advanced,
             advanced_base_url=adv_base,
             advanced_api_key=adv_key,
+            advanced_thinking_level=adv_thinking,
         )
     except LLMUnavailable as e:
         raise HTTPException(status_code=400, detail=_llm_error_detail(e)) from None
@@ -1819,9 +2218,11 @@ async def api_set_llm_config(request: LLMConfigRequest) -> Dict[str, Any]:
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
         "timeout_seconds": cfg.timeout_seconds,
+        "thinking_level": cfg.thinking_level,
         "advanced_model": cfg.advanced_model,
         "advanced_base_url": cfg.advanced_base_url,
         "has_advanced_api_key": bool(cfg.advanced_api_key),
+        "advanced_thinking_level": cfg.advanced_thinking_level,
         "has_api_key": bool(cfg.api_key),
     }
 
@@ -1905,5 +2306,160 @@ async def api_get_portrait(name: str, user: AuthUser = Depends(require_user)):
     return FileResponse(path)
 
 
+# ── 调试台：直接读写核心表 ─────────────────────────────────────
+@app.get("/api/admin/tables")
+async def api_admin_tables() -> Dict[str, Any]:
+    return {"tables": list(get_game().db.ADMIN_TABLES.keys())}
+
+
+@app.get("/api/admin/table/{table}")
+async def api_admin_table(table: str) -> Dict[str, Any]:
+    db = get_game().db
+    try:
+        return {
+            "table": table,
+            "pk": db.admin_check_table(table),
+            "columns": db.admin_columns(table),
+            "rows": db.admin_rows(table),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/admin/table/{table}/upsert")
+async def api_admin_upsert(table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    game = get_game()
+    try:
+        row = game.db.admin_upsert(table, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # 同步当前回合内存 state，否则改动要到下回合 begin_turn 才生效。
+    st = game.state
+    if table == "metrics" and row.get("key") in st.metrics:
+        st.metrics[row["key"]] = int(row["value"])
+    elif table == "game_state":
+        st.year, st.period, st.turn = int(row["year"]), int(row["period"]), int(row["turn"])
+    return {"row": row}
+
+
+@app.post("/api/admin/table/{table}/delete")
+async def api_admin_delete(table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    pk_value = payload.get("pk_value")
+    if pk_value in (None, ""):
+        raise HTTPException(status_code=400, detail="缺 pk_value")
+    try:
+        return {"deleted": get_game().db.admin_delete(table, pk_value)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/admin")
+async def admin_page():
+    return HTMLResponse(_ADMIN_HTML)
+
+
 if os.path.isdir(WEB_DIST):
     app.mount("/", StaticFiles(directory=WEB_DIST, html=True), name="web")
+
+
+_ADMIN_HTML = """<!doctype html>
+<html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>调试台 · 核心表增删改查</title>
+<style>
+  :root{--bg:#1b1712;--panel:#26211a;--line:#3a3228;--txt:#e8dcc6;--accent:#c8a35a;--danger:#b5503f;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 -apple-system,"PingFang SC",monospace}
+  header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0 12px 0 0;color:var(--accent)}
+  .tab{padding:5px 12px;border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:4px;cursor:pointer}
+  .tab.active{background:var(--accent);color:#1b1712;font-weight:600}
+  #bar{padding:8px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+  button.act{padding:5px 12px;border:1px solid var(--accent);background:transparent;color:var(--accent);border-radius:4px;cursor:pointer}
+  button.act:hover{background:var(--accent);color:#1b1712}
+  #wrap{overflow:auto;height:calc(100vh - 110px)}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{border:1px solid var(--line);padding:4px 6px;text-align:left;white-space:nowrap}
+  th{position:sticky;top:0;background:var(--panel);color:var(--accent);z-index:1}
+  th.pk{color:#e8c87a}
+  td input{width:100%;min-width:90px;background:#15110c;border:1px solid var(--line);color:var(--txt);padding:3px 5px;border-radius:3px;font:13px monospace}
+  td input:focus{border-color:var(--accent);outline:none}
+  tr.dirty td{background:#2e2718}
+  td.ops{white-space:nowrap}
+  .sm{padding:3px 8px;font-size:12px;border-radius:3px;cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--txt)}
+  .sm.save{border-color:var(--accent);color:var(--accent)}
+  .sm.del{border-color:var(--danger);color:var(--danger)}
+  #msg{margin-left:auto;color:#9c8c6a;font-size:12px}
+  .hint{color:#6f6552;font-size:12px}
+</style></head><body>
+<header><h1>调试台 · 直改核心表</h1><span id="tabs"></span></header>
+<div id="bar">
+  <button class="act" id="addBtn">+ 新增行</button>
+  <button class="act" id="reload">↻ 重载</button>
+  <span class="hint">改格变黄→点行尾「存」。新增行须填主键才能存。删除不可撤销。</span>
+  <span id="msg"></span>
+</div>
+<div id="wrap"><table id="grid"></table></div>
+<script>
+let cur=null, cols=[], pk=null, rows=[];
+const $=s=>document.querySelector(s), msg=t=>{$("#msg").textContent=t;};
+async function jget(u){const r=await fetch(u);if(!r.ok)throw new Error((await r.json()).detail||r.status);return r.json();}
+async function jpost(u,b){const r=await fetch(u,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b)});if(!r.ok)throw new Error((await r.json()).detail||r.status);return r.json();}
+async function init(){
+  const tabs=(await jget("/api/admin/tables")).tables;
+  $("#tabs").innerHTML=tabs.map(t=>`<span class="tab" data-t="${t}">${t}</span>`).join("");
+  document.querySelectorAll(".tab").forEach(e=>e.onclick=()=>load(e.dataset.t));
+  load(tabs[0]);
+}
+async function load(t){
+  cur=t; msg("加载…");
+  document.querySelectorAll(".tab").forEach(e=>e.classList.toggle("active",e.dataset.t===t));
+  const d=await jget("/api/admin/table/"+t);
+  cols=d.columns; pk=d.pk; rows=d.rows; render(); msg(rows.length+" 行");
+}
+function render(){
+  const g=$("#grid");
+  const head="<tr>"+cols.map(c=>`<th class="${c.pk?'pk':''}">${c.name}${c.pk?' 🔑':''}<br><span class="hint">${c.type}</span></th>`).join("")+"<th>操作</th></tr>";
+  g.innerHTML=head+rows.map((r,i)=>rowHtml(r,i)).join("");
+  g.querySelectorAll("input").forEach(inp=>inp.oninput=()=>inp.closest("tr").classList.add("dirty"));
+  g.querySelectorAll(".save").forEach(b=>b.onclick=()=>saveRow(+b.dataset.i));
+  g.querySelectorAll(".del").forEach(b=>b.onclick=()=>delRow(+b.dataset.i));
+}
+function rowHtml(r,i){
+  const tds=cols.map(c=>{
+    const v=r[c.name]==null?"":r[c.name];
+    return `<td><input data-c="${c.name}" value="${String(v).replace(/"/g,'&quot;')}"></td>`;
+  }).join("");
+  return `<tr data-i="${i}">${tds}<td class="ops"><button class="sm save" data-i="${i}">存</button> <button class="sm del" data-i="${i}">删</button></td></tr>`;
+}
+function readRow(i){
+  const tr=document.querySelector(`tr[data-i="${i}"]`), o={};
+  tr.querySelectorAll("input").forEach(inp=>{
+    const c=cols.find(x=>x.name===inp.dataset.c); let v=inp.value;
+    if(v===""){o[inp.dataset.c]=null;return;}
+    if(c && /INT/i.test(c.type)) v=parseInt(v,10);
+    o[inp.dataset.c]=v;
+  });
+  return o;
+}
+async function saveRow(i){
+  try{
+    const body=readRow(i);
+    if(body[pk]==null||body[pk]===""){msg("⚠ 主键 "+pk+" 不能空");return;}
+    const d=await jpost(`/api/admin/table/${cur}/upsert`,body);
+    rows[i]=d.row; render(); msg("✓ 已存 "+body[pk]);
+  }catch(e){msg("✗ "+e.message);}
+}
+async function delRow(i){
+  const key=rows[i][pk];
+  if(key!=null&&key!==""&&!confirm(`删除 ${cur} 行：${pk}=${key} ？不可撤销`))return;
+  try{
+    if(key==null||key===""){rows.splice(i,1);render();msg("已移除未存行");return;}
+    const d=await jpost(`/api/admin/table/${cur}/delete`,{pk_value:key});
+    rows.splice(i,1); render(); msg("✓ 删 "+d.deleted+" 行");
+  }catch(e){msg("✗ "+e.message);}
+}
+$("#addBtn").onclick=()=>{const o={};cols.forEach(c=>o[c.name]=null);rows.unshift(o);render();msg("新增空行，填主键后点存");};
+$("#reload").onclick=()=>load(cur);
+init().catch(e=>msg("初始化失败:"+e.message));
+</script></body></html>"""

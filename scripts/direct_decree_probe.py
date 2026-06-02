@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--directive", action="append", required=True,
                    help="一条诏书草案文本，可多次传入")
     p.add_argument("--decree", default="", help="最终诏书文本；空=由 LLM 写诏")
+    p.add_argument("--cheat", default="", help="作弊强制结算项，拼到邸报最前喂 extractor 当既成事实")
     p.add_argument("--resume", action="store_true",
                    help="续跑既有 DB，不清库；默认不清库（脚本本身不删 DB）")
     p.add_argument("--reset", action="store_true",
@@ -40,6 +41,9 @@ def parse_args() -> argparse.Namespace:
                    help="开局后直接把回合跳到年.月，如 1631.07。会覆写 game_state.year/period。turn 同步推进。")
     p.add_argument("--sql", action="append", default=[],
                    help="结算前执行的任意 SQL，可多次。用于直接改 DB 状态（人物/军队/数值等）。")
+    p.add_argument("--set-metric", action="append", default=[], metavar="KEY=VAL",
+                   help="结算前直接改核心指标内存值，如 国库=99999。metrics 是内存态，"
+                        "必须走这条而非 --sql（--sql 改 DB 行会被结算回写覆盖）。可多次。")
     return p.parse_args()
 
 
@@ -93,6 +97,17 @@ def main() -> int:
     snap = session.begin_turn()
     print(f"[turn] year={snap.year} period={snap.period} turn={snap.turn} phase={snap.phase}")
 
+    for spec in args.set_metric:
+        try:
+            key, val = spec.split("=", 1)
+            key = key.strip()
+            session.state.metrics[key] = int(val)
+            session.db.save_state(session.state)
+            print(f"[set-metric] OK: {key}={int(val)}")
+        except Exception as e:
+            print(f"[set-metric] FAIL: {spec} → {e}", file=sys.stderr)
+            return 2
+
     for sql in args.sql:
         try:
             session.db.conn.execute(sql)
@@ -114,7 +129,7 @@ def main() -> int:
         print(f"[evt] {kind}: {str(data)[:200]}")
 
     print("[resolve] 开始结算 ...")
-    report = session.resolve_turn(decree=args.decree, on_event=on_event)
+    report = session.resolve_turn(decree=args.decree, on_event=on_event, cheat_directive=args.cheat)
     print(f"[resolve] 完成。Report 字符数={len(report)}")
     print("---- REPORT 头 300 ----")
     print(report[:300])

@@ -20,6 +20,8 @@ TOP_LEVEL_ALIASES = {
     "国势变化": "metric_delta",
     "钱粮收支": "economy_moves",
     "财政制度变化": "fiscal_changes",
+    "新立月度收支": "fiscal_creates",
+    "裁撤月度收支": "fiscal_removes",
     "派系变化": "faction_delta",
     "阶级变化": "class_delta",
     "地区变化": "region_delta",
@@ -39,11 +41,15 @@ TOP_LEVEL_ALIASES = {
     "后宫册封": "appointments",
     "密令副作用": "secret_order_updates",
     "密令结案": "secret_order_closes",
+    "崇祯结局": "emperor_fate",
 }
 TOP_LEVEL_LABELS = {value: key for key, value in TOP_LEVEL_ALIASES.items()}
 
 ITEM_FIELD_ALIASES = {
     "account": "account", "账户": "account",
+    "direction": "direction", "方向": "direction",
+    "display": "display", "显示名": "display", "名称": "display",
+    "init_value": "init_value", "初值": "init_value", "初始值": "init_value",
     "delta": "delta", "增量": "delta",
     "category": "category", "分类": "category",
     "reason": "reason", "原因": "reason",
@@ -72,6 +78,14 @@ ITEM_FIELD_ALIASES = {
     "economy": "economy", "钱粮": "economy",
     "factions": "factions", "派系": "factions",
     "buildings": "buildings", "建筑": "buildings",
+    # 帝国修正（旧称遗产）子字段
+    "legacy": "legacy", "帝国修正": "legacy", "遗产": "legacy",
+    "duration": "duration", "时长": "duration",
+    "modifiers": "modifiers", "修正": "modifiers",
+    "narrative_hint": "narrative_hint", "叙事提示": "narrative_hint",
+    # 帝国修正的 regions/armies 维度块（值是 {entity_id: {field: pct}}，原样透传）
+    "regions": "regions", "地区": "regions",
+    "armies": "armies", "军队": "armies",
     "action": "action", "动作": "action",
     "region_id": "region_id", "地区编号": "region_id",
     "category": "category", "类别": "category",
@@ -145,6 +159,10 @@ ITEM_FIELD_LABELS = {
     "economy": "钱粮",
     "factions": "派系",
     "buildings": "建筑",
+    "legacy": "帝国修正",
+    "duration": "时长",
+    "modifiers": "修正",
+    "narrative_hint": "叙事提示",
     "action": "动作",
     "region_id": "地区编号",
     "level": "等级",
@@ -208,6 +226,7 @@ def build_simulator_payload(
         issue_to_payload(row, db.list_recent_issue_advances(int(row["id"]), 1))
         for row in active
     ]
+    # 帝国修正不进 simulator payload：它是纯机械的百分比修正符，由落账层自动放大/缩小增量，不进叙事。
     candidate_events = [
         {
             "id": ev.id,
@@ -226,7 +245,7 @@ def build_simulator_payload(
         dict(r) for r in db.conn.execute(
             "SELECT name,kind,population,public_support,unrest,natural_disaster,"
             "human_disaster,registered_land,hidden_land,tax_per_turn,grain_security,"
-            "gentry_resistance,military_pressure,status,"
+            "gentry_resistance,military_pressure,status,controlled_by,"
             "json_extract(fiscal,'$.corruption') as corruption FROM regions ORDER BY id"
         ).fetchall()
     ]
@@ -237,12 +256,12 @@ def build_simulator_payload(
             "loyalty,status,owner_power FROM armies ORDER BY id"
         ).fetchall()
     ]
-    court_roster = [
+    court_roster = _auto_table([
         dict(r) for r in db.conn.execute(
             "SELECT name,office,office_type,faction,status,power_id,location FROM characters "
             "WHERE status!='offstage' AND office_type!='后宫' ORDER BY rowid"
         ).fetchall()
-    ]
+    ])
     return {
         "year": state.year,
         "period": state.period,
@@ -267,7 +286,7 @@ def build_simulator_payload(
         "debuts_this_turn": debuts_this_turn or [],
         "relevant_memories": relevant_memories or [],
         "secret_orders": secret_orders or [],
-        "data_note": "regions/armies/buildings 均为 header+二维数组（cols 列名 + rows 数据）。secret_orders 为皇帝密令列表，独立于 relevant_memories，每条含 id/minister_name/title/content/status/result 字段。",
+        "data_note": "盘面表（buildings/court_roster/armies/regions）在本输入的开头以 TSV 文本块给出（首行列名、tab 分隔、每行一条记录），不在本 JSON 内；本 JSON 只含其余字段（含 powers_brief/factions_brief/classes_brief 叙述串、active_issues 等）。secret_orders 为皇帝密令列表，独立于 relevant_memories，每条含 id/minister_name/title/content/status/result 字段。",
     }
 
 
@@ -340,101 +359,6 @@ def simulate_season_with_payload(
     return raw.strip(), payload
 
 
-def extract_scores_with_agno(
-    agent: Agent,
-    db: GameDB,
-    state: GameState,
-    narrative: str,
-    decree_text: str = "",
-    sanitizer: Optional[Agent] = None,
-    relevant_memories: Optional[List[Dict[str, object]]] = None,
-    secret_orders: Optional[List[Dict[str, object]]] = None,
-) -> tuple[Dict[str, object], str, str]:
-    """结算 agent: 读邸报抽 JSON。"""
-    active = db.list_active_issues()
-    issues_brief = [
-        {
-            "issue_id": int(r["id"]),
-            "title": r["title"],
-            "bar_value": int(r["bar_value"]),
-            "inertia": int(r["inertia"]),
-            "stage_text": r["stage_text"],
-            "cancellable": r["cancellable"],
-            "resolve_condition": (r["resolve_condition"] if "resolve_condition" in r.keys() else "") or "(未填)",
-            "fail_condition": (r["fail_condition"] if "fail_condition" in r.keys() else "") or "(未填)",
-        }
-        for r in active
-    ]
-    region_ids = [r["id"] for r in db.conn.execute("SELECT id FROM regions").fetchall()]
-    army_ids = [r["id"] for r in db.conn.execute("SELECT id FROM armies").fetchall()]
-    candidate_events = [
-        {"id": ev.id, "title": ev.title}
-        for ev in gather_candidate_events(state, db)
-    ]
-    region_rows = [
-        dict(r) for r in db.conn.execute(
-            "SELECT id,name,kind,population,public_support,unrest,natural_disaster,"
-            "human_disaster,registered_land,hidden_land,tax_per_turn,grain_security,"
-            "gentry_resistance,military_pressure,status,"
-            "json_extract(fiscal,'$.corruption') as corruption FROM regions ORDER BY id"
-        ).fetchall()
-    ]
-    army_rows = [
-        dict(r) for r in db.conn.execute(
-            "SELECT id,name,station,theater,commander,controller,troop_type,manpower,"
-            "maintenance_per_turn,supply,morale,training,equipment,arrears,mobility,"
-            "loyalty,status FROM armies ORDER BY id"
-        ).fetchall()
-    ]
-    active_ministers = [
-        dict(r) for r in db.conn.execute(
-            "SELECT name,office,office_type,faction,power_id,location FROM characters WHERE status='active' ORDER BY rowid"
-        ).fetchall()
-    ]
-    offstage_ministers = [
-        dict(r) for r in db.conn.execute(
-            "SELECT name,office,faction,power_id,location,debut_year,debut_month "
-            "FROM characters WHERE status='offstage' ORDER BY name"
-        ).fetchall()
-    ]
-    payload = {
-        "turn": {"year": state.year, "period": state.period, "turn": state.turn},
-        "narrative": narrative,
-        "decree_text": decree_text,
-        "active_issues": issues_brief,
-        "candidate_events": candidate_events,
-        "current_state": dict(state.metrics),
-        "factions": db.faction_report(),
-        "classes": db.class_report(),
-        "powers": _auto_table(db.power_payload()),
-        "regions": _auto_table(region_rows),
-        "armies": _auto_table(army_rows),
-        "buildings": _auto_table(db.building_payload()),
-        "active_ministers": _auto_table(active_ministers),
-        "offstage_ministers": _auto_table(offstage_ministers),
-        "region_ids": region_ids,
-        "army_ids": army_ids,
-        "class_names": [r["name"] for r in db.conn.execute("SELECT DISTINCT name FROM classes ORDER BY name").fetchall()],
-        "power_ids": [str(r["id"]) for r in db.conn.execute("SELECT id FROM powers").fetchall()],
-        "fiscal_config": db.get_fiscal_config(),
-        "relevant_memories": relevant_memories or [],
-        "secret_orders": secret_orders or [],
-        "_format_note": "regions/armies/buildings/powers/active_ministers/offstage_ministers 均为 header+二维数组（cols 列名 + rows 数据）。secret_orders 独立字段，含 id/minister_name/title/content/status/result。",
-    }
-    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
-    tlog(f"[extractor] user payload total={len(payload_json)} chars (~{len(payload_json)//1.5:.0f} tok)")
-    raw = run_agent_text(agent, payload_json, tag="extractor")
-    try:
-        return parse_agent_json(raw, "结算抽取"), raw, payload_json
-    except Exception as parse_err:
-        if sanitizer is None:
-            raise
-        tlog(f"[extractor] 主输出解析失败：{parse_err}；调 sanitizer 重整")
-        cleaned = run_agent_text(sanitizer, raw, tag="sanitizer")
-        # 留痕用原始 raw（sanitizer 前），追查时能看到 extractor 真实吐了什么。
-        return parse_agent_json(cleaned, "结算抽取（sanitizer）"), raw, payload_json
-
-
 EXTRACTION_MODULES = ("internal", "military_external", "issues", "personnel_secret")
 
 EMPTY_EXTRACTION: Dict[str, object] = {
@@ -452,21 +376,24 @@ EMPTY_EXTRACTION: Dict[str, object] = {
     "cancels": [],
     "close_issues": [],
     "fiscal_changes": [],
+    "fiscal_creates": [],
+    "fiscal_removes": [],
     "office_changes": [],
     "appointments": [],
     "character_status_changes": [],
     "character_power_changes": [],
     "secret_order_updates": [],
     "secret_order_closes": [],
+    "emperor_fate": None,  # 崇祯结局：abdicate(退位/禅让)/suicide(自尽/殉国)/null(无)
 }
 
 MODULE_FIELDS: Dict[str, set[str]] = {
-    "internal": {"metric_delta", "economy_moves", "faction_delta", "class_delta", "region_delta", "fiscal_changes"},
+    "internal": {"metric_delta", "economy_moves", "faction_delta", "class_delta", "region_delta", "fiscal_changes", "fiscal_creates", "fiscal_removes"},
     "military_external": {"army_delta", "new_armies", "power_updates", "world_advance"},
     "issues": {"issue_advances", "new_issues", "cancels", "close_issues"},
     "personnel_secret": {
         "office_changes", "character_status_changes", "character_power_changes", "appointments",
-        "secret_order_updates", "secret_order_closes",
+        "secret_order_updates", "secret_order_closes", "emperor_fate",
     },
 }
 
@@ -497,7 +424,7 @@ def _extractor_context_payload(
         dict(r) for r in db.conn.execute(
             "SELECT id,name,kind,population,public_support,unrest,natural_disaster,"
             "human_disaster,registered_land,hidden_land,tax_per_turn,grain_security,"
-            "gentry_resistance,military_pressure,status,"
+            "gentry_resistance,military_pressure,status,controlled_by,"
             "json_extract(fiscal,'$.corruption') as corruption FROM regions ORDER BY id"
         ).fetchall()
     ]
@@ -572,6 +499,15 @@ def _extractor_compat_payload(base: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+# module 模式专用：simulator_payload 已在同一 system 前缀给出全量盘面，这些字段同名同格式
+# 重复，从补充上下文里剔除，省掉约一半 extractor system 体积。
+_MODULE_DROP_FIELDS = (
+    "regions", "armies", "buildings", "current_state",
+    "active_issues", "candidate_events", "decree_text",
+    "relevant_memories", "secret_orders",
+)
+
+
 def build_extractor_shared_context(
     db: GameDB,
     state: GameState,
@@ -580,13 +516,26 @@ def build_extractor_shared_context(
     relevant_memories: Optional[List[Dict[str, object]]] = None,
     secret_orders: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
-    """供模块 extractor 放入 system 前缀的共同结算补充上下文。"""
+    """供模块 extractor 放入 system 前缀的共同结算补充上下文。
+
+    盘面（regions/armies/buildings/current_state/active_issues/candidate_events…）
+    已由同 system 前缀的 simulator_payload 全量给出，这里剔除重复，只留 extractor 独有的
+    校验集（region_ids/army_ids/class_names/power_ids/fiscal_config）与人事元数据
+    （active/offstage_ministers/factions/classes/powers）+ turn/narrative。"""
     base = _extractor_context_payload(
         db, state, narrative, decree_text,
         relevant_memories=relevant_memories,
         secret_orders=secret_orders,
     )
-    return _extractor_compat_payload(base)
+    compat = _extractor_compat_payload(base)
+    slim = {k: v for k, v in compat.items() if k not in _MODULE_DROP_FIELDS}
+    slim["_dedup_note"] = (
+        "盘面与诏书已在 system 的 simulator_payload 中给出（regions/armies/buildings/"
+        "current_state/active_issues/candidate_events/decree_text/relevant_memories/"
+        "secret_orders），抽取时直接读 simulator_payload，本 extractor_context 只补"
+        "校验用 id 集、fiscal_config 与人事/派系/阶级/势力元数据。"
+    )
+    return slim
 
 
 def _payload_for_module(
@@ -599,7 +548,7 @@ def _payload_for_module(
     return {
         "module": module,
         "module_allowed_fields": sorted(MODULE_FIELDS[module]),
-        "instruction": "simulator_payload 与 extractor_context 已在 system 中给出。只输出当前模块允许的中文顶层字段 JSON object。",
+        "instruction": "盘面（regions/armies/buildings/current_state/active_issues/candidate_events 等）看 system 的 simulator_payload；extractor_context 只补 id 校验集与人事/派系元数据。只输出当前模块允许的中文顶层字段 JSON object。",
     }
 
 
@@ -658,6 +607,8 @@ def _sanitize_module_output(module: str, data: Dict[str, object]) -> Dict[str, o
     if module == "internal":
         cleaned["economy_moves"] = _clean_economy_moves(cleaned.get("economy_moves"))
         cleaned["fiscal_changes"] = _clean_fiscal_changes(cleaned.get("fiscal_changes"))
+        cleaned["fiscal_creates"] = _clean_fiscal_creates(cleaned.get("fiscal_creates"))
+        cleaned["fiscal_removes"] = _clean_fiscal_removes(cleaned.get("fiscal_removes"))
     if module == "military_external":
         cleaned["world_advance"] = _clean_world_advance(cleaned.get("world_advance"))
     return cleaned
@@ -751,6 +702,74 @@ def _clean_fiscal_changes(raw: object) -> List[Dict[str, object]]:
         cleaned.append({
             "key": key,
             "delta": delta,
+            "reason": str(item.get("reason") or "")[:120],
+        })
+    return cleaned
+
+
+_DIRECTION_NORMALIZE = {
+    "income": "income", "收": "income", "收入": "income", "进账": "income",
+    "expense": "expense", "支": "expense", "支出": "expense", "出账": "expense",
+}
+
+
+def _clean_fiscal_creates(raw: object) -> List[Dict[str, object]]:
+    """LLM 推演中凭空新立的月固定收支项（税是其一种）。完全放开——
+    只做枚举校验：account∈{国库,内库}、direction∈{income,expense}、key 非空。
+    税种／数值由 LLM 全权裁夺，代码不预设白名单。
+    """
+    cleaned: List[Dict[str, object]] = []
+    if not isinstance(raw, list):
+        return cleaned
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        item = _canonical_item_fields(item)
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        account = str(item.get("account") or "").strip()
+        if account not in ("国库", "内库"):
+            continue
+        direction = _DIRECTION_NORMALIZE.get(str(item.get("direction") or "").strip())
+        if direction is None:
+            continue
+        try:
+            init_value = int(item.get("init_value") or 0)
+        except (TypeError, ValueError):
+            init_value = 0
+        display = str(item.get("display") or "").strip() or key.replace("_base", "")
+        cleaned.append({
+            "key": key,
+            "account": account,
+            "direction": direction,
+            "display": display,
+            "init_value": max(0, init_value),
+            "reason": str(item.get("reason") or "")[:120],
+        })
+    return cleaned
+
+
+def _clean_fiscal_removes(raw: object) -> List[Dict[str, object]]:
+    """LLM 推演中彻底裁撤一个月固定收支项（罢税/裁俸）。删项只需 key。
+    完全放开——含 dynamic（田赋/辽饷/盐税/商税/皇庄），后果玩家自负。落库阶段删 base+rate 两行。
+    """
+    cleaned: List[Dict[str, object]] = []
+    if not isinstance(raw, list):
+        return cleaned
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        item = _canonical_item_fields(item)
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        cleaned.append({
+            "key": key,
             "reason": str(item.get("reason") or "")[:120],
         })
     return cleaned

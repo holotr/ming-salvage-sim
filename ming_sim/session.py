@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
-from ming_sim.agents import bind_content as _bind_agents, create_memory_retrieval_agent
-from ming_sim.agents import parse_agent_json, run_agent_text
+from ming_sim.agents import bind_content as _bind_agents
+from ming_sim.agents import _dump_llm_messages
 from ming_sim.constants import TURN_UNIT
 from ming_sim.content import GameContent
 from ming_sim.context import (
@@ -25,6 +25,7 @@ from ming_sim.context import (
 from ming_sim.db import GameDB, infer_office_type_from_office, normalize_office
 from ming_sim.decree import advance_without_edict, resolve_directives, write_decree_with_agno
 from ming_sim.issues import bind_content as _bind_issues
+from ming_sim.issues import sync_opening_legacies
 from ming_sim.llm_model import create_agno_db, extract_agent_text, verify_llm_available
 from ming_sim.models import Character, CourtContext, GameState, LLMConfig
 from ming_sim.paths import user_data_path
@@ -369,6 +370,8 @@ class GameSession:
         _sync_offices_from_db_impl(self.content, self.db)
         self.agno_db = create_agno_db(db_path)
         self.state = self.db.load_state(start_ym)
+        # 开局负面帝国修正：新档补全、旧档补缺、已达消除条件的不补/清残。不立 issue、不进推演。
+        sync_opening_legacies(self.db, self.state)
         self.deaths_this_turn: List[Dict[str, str]] = []
         self.debuts_this_turn: List[Dict[str, str]] = []
         self.power_renames_this_turn: List[Dict[str, object]] = []
@@ -423,6 +426,18 @@ class GameSession:
         self.state.turn_phase = TurnPhase.SUMMONING.value
         self.db.save_state(self.state)
 
+    def refresh_runtime_after_chat_rollback(self) -> None:
+        """撤回召对副作用后，用 DB 真相刷新内存人物表和本回合 Agent registry。"""
+        self.state = self.db.load_state()
+        _sync_offices_from_db_impl(self.content, self.db)
+        if self.registry is not None:
+            context = CourtContext(
+                state=self.state,
+                db=self.db,
+                previous_summary=self.previous_summary,
+            )
+            self.registry = MinisterRegistry(self.llm_config, self.agno_db, context)
+
     # ── 召见阶段 ──────────────────────────────────────────────────────────
 
     def list_ministers(self) -> List[MinisterView]:
@@ -446,38 +461,26 @@ class GameSession:
         return character_from_name(name)
 
     def _retrieve_memories_for_message(self, message: str) -> str:
-        """用轻量 retrieval agent 从皇帝输入提关键词，检索相关旧事注入message头部。"""
+        """注入近几回合章节记忆，让大臣知道近来朝局大事。章节记忆是回合粒度全局摘要，
+        直接取最近 N 回合，不再按关键词检索（旧原子记忆已废）。"""
         from ming_sim.token_stats import tlog
         try:
-            import json
-            tlog(f"[MEM-IO/chat-memory-retrieval/INPUT] ({len(message)}字): {message!r}")
-            retrieval_agent = create_memory_retrieval_agent(self.llm_config, self.agno_db)
-            raw = run_agent_text(retrieval_agent, message, tag="chat-memory-retrieval")
-            tlog(f"[MEM-IO/chat-memory-retrieval/OUTPUT] ({len(raw)}字):\n{raw}")
-            kw_data = parse_agent_json(raw, "对话记忆检索")
-            keywords: list = []
-            for field in ("characters", "regions", "armies", "powers", "keywords"):
-                keywords.extend(str(k) for k in (kw_data.get(field) or []) if k)
-            if not keywords:
-                tlog("[MEM-IO/chat-memory-retrieval/INJECT] keywords=[] 跳过注入")
+            chapters = self.db.list_chapter_memories(upto_turn=self.state.turn, recent=4)
+            if not chapters:
                 return message
-            memories = self.db.get_memories_by_keywords(keywords, turn=self.state.turn, limit=6)
-            if not memories:
-                tlog(f"[MEM-IO/chat-memory-retrieval/INJECT] keywords={keywords} 无命中")
+            lines = ["【近来朝局（近几月章节）】"]
+            for c in chapters:
+                body = (c.get("body") or "").strip()
+                if not body:
+                    continue
+                lines.append(f"- {c['year']}年{c['period']}月：{body}")
+            if len(lines) == 1:
                 return message
-            tlog(f"[chat/memory-retrieval] keywords={keywords} hit={len(memories)}")
-            tlog(f"[MEM-IO/chat-memory-retrieval/INJECT] full={json.dumps(memories, ensure_ascii=False)}")
-            lines = ["【相关旧事】"]
-            for m in memories:
-                lines.append(
-                    f"- #{m['id']} {m['year']}年{m['period']}月 {m['subject_id']}："
-                    f"{m['title']}。起因：{m['cause']}。结果：{m['outcome']}。"
-                )
             new_msg = "\n".join(lines) + "\n\n" + message
-            tlog(f"[MEM-IO/chat-memory-retrieval/FINAL-MSG] ({len(new_msg)}字):\n{new_msg}")
+            tlog(f"[chat/chapter-recall] hit={len(chapters)} ({len(new_msg)}字)")
             return new_msg
         except Exception as exc:
-            tlog(f"[chat/memory-retrieval] 失败跳过：{exc}")
+            tlog(f"[chat/chapter-recall] 失败跳过：{exc}")
             return message
 
     def _temporary_character(self, name: str) -> Character:
@@ -558,6 +561,7 @@ class GameSession:
         if draft_line and draft_line != "无":
             augmented = f"【本{TURN_UNIT}已核定草案】{draft_line}\n\n{augmented}"
         run_output = agent.run(augmented)
+        _dump_llm_messages(run_output, f"大臣对话/{minister_name}")
         answer = extract_agent_text(run_output)
         result = ChatTurnResult(answer=answer)
         for tool_exec in getattr(run_output, "tools", None) or []:
@@ -796,10 +800,11 @@ class GameSession:
         self.last_decree = decree
         return decree
 
-    def resolve_turn(self, decree: str = "", on_event=None) -> str:
+    def resolve_turn(self, decree: str = "", on_event=None, cheat_directive: str = "") -> str:
         """颁诏并推演本回合。要求无 pending 残留、≥1 条 draft。
 
         on_event(kind, data): 推演过程实时回调，透传给 resolve_directives。
+        cheat_directive: 作弊控制台强制结算项，一次性透传给 resolve_directives。
         """
         if self.pending_count() > 0:
             raise ValueError(f"尚有 {self.pending_count()} 道大臣拟旨待陛下核定（准/驳），不能颁诏。")
@@ -817,6 +822,7 @@ class GameSession:
             debuts_this_turn=self.debuts_this_turn,
             on_event=on_event,
             content=self.content, registry=self.registry,
+            cheat_directive=cheat_directive,
         )
         self.last_report = report
         self.last_decree = decree_text

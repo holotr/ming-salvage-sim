@@ -25,9 +25,11 @@ class LLMConfig:
     model: str
     max_tokens: int = 8000
     timeout_seconds: float = 180.0
+    thinking_level: str = ""  # 空=沿用旧逻辑；否则原样传给 reasoning_effort
     advanced_model: str = ""  # 空=fallback model；非空=推演/打分专用更强模型（如 deepseek-reasoner / gpt-5）
     advanced_base_url: str = ""  # 空=复用主 base_url；非空=advanced 角色专用网关
     advanced_api_key: str = ""  # 空=复用主 api_key；非空=advanced 角色专用 key
+    advanced_thinking_level: str = ""  # 空=沿用旧逻辑；advanced 角色原样传给 reasoning_effort
 
 
 @dataclass
@@ -75,6 +77,19 @@ class Event:
     precondition: str = ""  # 触发前提+改写口子人话说明，喂 simulator 由 LLM 据盘面判断是否改写/跳过（见 season_simulator.md 候选情势触发判定）
     event_type: str = "situation"  # situation=转 bar issue；node=只播报不转 issue；ending=交结局判定
     trigger_gate: Dict[str, str] = field(default_factory=dict)  # seed 候选门槛：{metric: 比较式}，全满足才进候选
+    auto_trigger: bool = False  # True=gate 达标即由程序硬立项，绕过 LLM 因果判定（不进候选池等 extractor 决定）
+    # 以下为可选「精调 issue 字段」：原 opening_crises 那种手调危机用，立项时 event_to_issue 优先读这些，
+    # 缺省（0/空）则按 severity/kind 自动推导。合并 opening_crises → seed_events 后承接其手调值。
+    bar_value: int = 0                                            # 0=自动推导
+    bar_good_meaning: str = ""
+    bar_bad_meaning: str = ""
+    issue_inertia: int = 0                                        # 立项时初始 inertia（默认 0=不漂；要每月漂移就在 seed/event 里显式填）
+    stage_text: str = ""                                          # issue 阶段文案（空=用 summary）
+    region_hint: str = ""
+    issue_tags: List[str] = field(default_factory=list)           # 空=用 [kind]
+    ongoing_effects: Dict[str, object] = field(default_factory=dict)
+    effect_on_resolve: Dict[str, object] = field(default_factory=dict)
+    effect_on_fail: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -186,11 +201,25 @@ class Power:
 
 
 @dataclass
+class OpeningLegacy:
+    """开局即存在的负面帝国修正：永久 legacy（duration=-1），靠 clear_gate 程序判定消除。
+    不立 issue、不进推演。见 content/opening_legacies.json 与 db.sync_opening_legacies。"""
+    key: str
+    name: str
+    modifiers: Dict[str, object]
+    narrative_hint: str
+    clear_gate: Dict[str, str]
+    clear_narrative: str = ""
+
+
+@dataclass
 class GameState:
     year: int = 1627
     period: int = 10
     turn: int = 1
     turn_phase: str = "summoning"  # summoning | reviewing | issued —— 见 session.TurnPhase
+    ended: bool = False  # 结局已触发：游戏终结，拒绝继续召见/结算
+    ending_status: str = ""  # 结局类型（context.ENDING_*），ended=True 时有值
     metrics: Dict[str, int] = field(
         default_factory=lambda: {
             "国库": 320,
@@ -228,4 +257,5 @@ def period_label(year: int, month: int) -> str:
 
 
 def monthly_amount(amount: int) -> int:
-    return max(0, round(int(amount) / 3))
+    # 全盘已按月度：base/maint/tax 都是月值，不再除 3。保留函数仅为兼容旧调用点（恒等）。
+    return max(0, int(amount))
