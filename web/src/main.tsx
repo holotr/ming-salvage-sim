@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import "./mobile.css";
 
 type Metrics = Record<string, number>;
 
@@ -1362,23 +1363,28 @@ function MinisterPortrait({ primary, fallback, name }: { primary: string; fallba
 // 左列：韩爌(外) → 黄立极(内)；右列：张瑞图(外) → 施凤来(内)
 const LEFT_ANCHOR  = { near: { px: 0.077, py: 0.532 }, far: { px: 0.377, py: 0.066 } };
 const RIGHT_ANCHOR = { near: { px: 0.862, py: 0.532 }, far: { px: 0.558, py: 0.045 } };
+const LEFT_ANCHOR_MOBILE  = { near: { px: 0.28, py: 0.532 }, far: { px: 0.46, py: 0.066 } };
+const RIGHT_ANCHOR_MOBILE = { near: { px: 0.66, py: 0.532 }, far: { px: 0.54, py: 0.045 } };
 
 // 每列槽位数
 const COURT_SLOTS_PER_ROW = 10;
 
 // 生成两列所有槽位坐标（百分比）
 function courtSlots(): { px: number; py: number; side: "left" | "right"; slot: number }[] {
+  const isMobile = typeof window !== "undefined" && window.innerWidth <= 600;
+  const leftAnchor = isMobile ? LEFT_ANCHOR_MOBILE : LEFT_ANCHOR;
+  const rightAnchor = isMobile ? RIGHT_ANCHOR_MOBILE : RIGHT_ANCHOR;
   const slots = [];
   for (let i = 0; i < COURT_SLOTS_PER_ROW; i++) {
     const t = i / (COURT_SLOTS_PER_ROW - 1);
     slots.push({
-      px: LEFT_ANCHOR.near.px + t * (LEFT_ANCHOR.far.px - LEFT_ANCHOR.near.px),
-      py: LEFT_ANCHOR.near.py + t * (LEFT_ANCHOR.far.py - LEFT_ANCHOR.near.py),
+      px: leftAnchor.near.px + t * (leftAnchor.far.px - leftAnchor.near.px),
+      py: leftAnchor.near.py + t * (leftAnchor.far.py - leftAnchor.near.py),
       side: "left" as const, slot: i,
     });
     slots.push({
-      px: RIGHT_ANCHOR.near.px + t * (RIGHT_ANCHOR.far.px - RIGHT_ANCHOR.near.px),
-      py: RIGHT_ANCHOR.near.py + t * (RIGHT_ANCHOR.far.py - RIGHT_ANCHOR.near.py),
+      px: rightAnchor.near.px + t * (rightAnchor.far.px - rightAnchor.near.px),
+      py: rightAnchor.near.py + t * (rightAnchor.far.py - rightAnchor.near.py),
       side: "right" as const, slot: i,
     });
   }
@@ -1406,7 +1412,10 @@ function defaultCourtPct(index: number, total: number): { px: number; py: number
   const leftCount = Math.ceil(total / 2);
   const isLeft = index < leftCount;
   const posInRow = isLeft ? index : index - leftCount;
-  const anchor = isLeft ? LEFT_ANCHOR : RIGHT_ANCHOR;
+  const mobile = typeof window !== "undefined" && window.innerWidth <= 600;
+  const anchor = isLeft
+    ? (mobile ? LEFT_ANCHOR_MOBILE : LEFT_ANCHOR)
+    : (mobile ? RIGHT_ANCHOR_MOBILE : RIGHT_ANCHOR);
   const t = posInRow * COURT_SLOT_STEP;  // 从槽0开始连续，不跳格
   return {
     px: anchor.near.px + t * (anchor.far.px - anchor.near.px),
@@ -3372,7 +3381,7 @@ function BriefReport({ title, items }: { title: string; items: string[] }) {
 
 function SituationPanel({ issues, closedIssues }: { issues: Issue[]; closedIssues: ClosedIssue[] }) {
   const active = issues.filter((issue) => issue.kind === "situation" || issue.kind === "initiative");
-  const [collapsed, setCollapsed] = React.useState(false);
+  const [collapsed, setCollapsed] = React.useState(() => typeof window !== "undefined" && window.innerWidth <= 600);
   if (!active.length && !closedIssues.length) return null;
   active.sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "initiative" ? -1 : 1;
@@ -3831,11 +3840,62 @@ function filterConsorts(consorts: Minister[], group: string) {
   return mingConsorts;
 }
 
+const MAP_IMAGE_ASPECT = 16 / 9;
+const MAP_MOBILE_FOCUS_X = 0.66;
+
+function mapTileSize(viewportWidth: number, viewportHeight: number) {
+  if (viewportWidth <= 600) {
+    const height = Math.ceil(viewportHeight + Math.min(220, viewportHeight * 0.26));
+    return { width: Math.max(viewportWidth, Math.ceil(height * MAP_IMAGE_ASPECT)), height };
+  }
+  return { width: viewportWidth, height: viewportHeight };
+}
+
+function normalizeMapOffset(x: number, width: number) {
+  if (width <= 0) return 0;
+  let r = x % width;
+  if (r > 0) r -= width;
+  return r;
+}
+
+function mapMobileTopInset(viewportWidth: number, viewportHeight: number) {
+  if (viewportWidth > 600) return 0;
+  return 0;
+}
+
+function clampMapOffsetY(y: number, viewportWidth: number, viewportHeight: number, contentHeight: number) {
+  const maxY = mapMobileTopInset(viewportWidth, viewportHeight);
+  if (contentHeight <= viewportHeight) return maxY;
+  return Math.max(viewportHeight - contentHeight, Math.min(maxY, y));
+}
+
+function mapInitialOffsetX(viewportWidth: number, viewportHeight: number) {
+  const { width } = mapTileSize(viewportWidth, viewportHeight);
+  if (viewportWidth > 600) return 0;
+  return normalizeMapOffset(viewportWidth / 2 - width * MAP_MOBILE_FOCUS_X, width);
+}
+
+function mapInitialOffsetY(viewportWidth: number, viewportHeight: number) {
+  if (viewportWidth > 600) return 0;
+  return mapMobileTopInset(viewportWidth, viewportHeight);
+}
+
 function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedId: string; onSelect: (id: string) => void }) {
   const viewportRef = React.useRef<HTMLDivElement | null>(null);
-  const [tileW, setTileW] = React.useState<number>(() => (typeof window !== "undefined" ? window.innerWidth : 1280));
-  const [offsetX, setOffsetX] = React.useState(0);
-  const dragState = React.useRef<{ pointerId: number; startX: number; originX: number; moved: boolean } | null>(null);
+  const [tileW, setTileW] = React.useState<number>(() => (
+    typeof window !== "undefined" ? mapTileSize(window.innerWidth, window.innerHeight).width : 1280
+  ));
+  const [tileH, setTileH] = React.useState<number>(() => (
+    typeof window !== "undefined" ? mapTileSize(window.innerWidth, window.innerHeight).height : 720
+  ));
+  const [offsetX, setOffsetX] = React.useState(() => (
+    typeof window !== "undefined" ? mapInitialOffsetX(window.innerWidth, window.innerHeight) : 0
+  ));
+  const [offsetY, setOffsetY] = React.useState(() => (
+    typeof window !== "undefined" ? mapInitialOffsetY(window.innerWidth, window.innerHeight) : 0
+  ));
+  const dragState = React.useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number; moved: boolean } | null>(null);
+  const mobileFocusApplied = React.useRef(false);
   const [dragging, setDragging] = React.useState(false);
 
   // 坐标取点工具：URL 加 ?coords=1 开启。点地图打印 x/y%（对照 web_app.py map_nodes）。
@@ -3848,23 +3908,37 @@ function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedI
     let lx = (e.clientX - rect.left - offsetX) % tileW;
     if (lx < 0) lx += tileW;
     const x = +(lx / tileW * 100).toFixed(1);
-    const y = +((e.clientY - rect.top) / rect.height * 100).toFixed(1);
+    const y = +((e.clientY - rect.top - offsetY) / tileH * 100).toFixed(1);
     setPick({ x, y });
     console.log(`map coord: (${x}, ${y})`);
   };
 
   const wrap = React.useCallback((x: number, w: number) => {
-    if (w <= 0) return 0;
-    let r = x % w;
-    if (r > 0) r -= w;
-    return r;
+    return normalizeMapOffset(x, w);
   }, []);
 
   React.useEffect(() => {
     const measure = () => {
-      const w = viewportRef.current?.clientWidth ?? window.innerWidth;
+      const viewport = viewportRef.current;
+      const viewportWidth = viewport?.clientWidth ?? window.innerWidth;
+      const viewportHeight = viewport?.clientHeight ?? window.innerHeight;
+      const size = mapTileSize(viewportWidth, viewportHeight);
+      const w = size.width;
       setTileW(w);
-      setOffsetX((cur) => wrap(cur, w));
+      setTileH(size.height);
+      setOffsetX((cur) => {
+        if (viewportWidth <= 600 && !mobileFocusApplied.current) {
+          mobileFocusApplied.current = true;
+          return mapInitialOffsetX(viewportWidth, viewportHeight);
+        }
+        mobileFocusApplied.current = true;
+        return wrap(cur, w);
+      });
+      setOffsetY((cur) => (
+        viewportWidth <= 600 && mobileFocusApplied.current
+          ? clampMapOffsetY(cur, viewportWidth, viewportHeight, size.height)
+          : mapInitialOffsetY(viewportWidth, viewportHeight)
+      ));
     };
     measure();
     window.addEventListener("resize", measure);
@@ -3876,14 +3950,20 @@ function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedI
       if (e.ctrlKey) return;
       const target = e.target as HTMLElement | null;
       if (target && target.closest('button, a, input, textarea, select, [role="dialog"], .court-drawer, .map-intel-panel, .modal-scroll, .fullscreen-modal, .situation-panel, .chat-main')) return;
-      const dx = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-      if (dx === 0) return;
+      const viewportHeight = viewportRef.current?.clientHeight ?? window.innerHeight;
       e.preventDefault();
-      setOffsetX((cur) => wrap(cur - dx, viewportRef.current?.clientWidth ?? tileW));
+      if (viewportRef.current?.clientWidth && viewportRef.current.clientWidth <= 600 && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) {
+        const viewportWidth = viewportRef.current.clientWidth;
+        setOffsetY((cur) => clampMapOffsetY(cur - e.deltaY, viewportWidth, viewportHeight, tileH));
+      } else {
+        const dx = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+        if (dx === 0) return;
+        setOffsetX((cur) => wrap(cur - dx, tileW));
+      }
     };
     window.addEventListener("wheel", onWheel, { passive: false });
     return () => window.removeEventListener("wheel", onWheel);
-  }, [wrap, tileW]);
+  }, [wrap, tileW, tileH]);
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0 && e.pointerType === "mouse") return;
@@ -3892,7 +3972,9 @@ function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedI
     dragState.current = {
       pointerId: e.pointerId,
       startX: e.clientX,
+      startY: e.clientY,
       originX: offsetX,
+      originY: offsetY,
       moved: false,
     };
     (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
@@ -3903,8 +3985,12 @@ function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedI
     const st = dragState.current;
     if (!st || st.pointerId !== e.pointerId) return;
     const dx = e.clientX - st.startX;
-    if (!st.moved && Math.abs(dx) > 4) st.moved = true;
+    const dy = e.clientY - st.startY;
+    if (!st.moved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) st.moved = true;
     setOffsetX(wrap(st.originX + dx, tileW));
+    const viewportWidth = viewportRef.current?.clientWidth ?? window.innerWidth;
+    const viewportHeight = viewportRef.current?.clientHeight ?? window.innerHeight;
+    setOffsetY(clampMapOffsetY(st.originY + dy, viewportWidth, viewportHeight, tileH));
   };
 
   const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -3931,13 +4017,13 @@ function GrandMap({ nodes, selectedId, onSelect }: { nodes: MapNode[]; selectedI
     >
       <div
         className="map-strip"
-        style={{ transform: `translate3d(${offsetX}px, 0, 0)` }}
+        style={{ transform: `translate3d(${offsetX}px, ${offsetY}px, 0)`, height: tileH }}
       >
         {tiles.map((idx) => (
           <div
             key={idx}
             className="map-tile"
-            style={{ width: tileW }}
+            style={{ width: tileW, height: tileH }}
             aria-hidden={idx !== 0}
           >
             {nodes.map((node) => {

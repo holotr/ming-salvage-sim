@@ -1,0 +1,239 @@
+@media (max-width: 600px) {
+  .game-shell {
+    --mobile-status-height: 116px;
+    --mobile-situation-height: 58px;
+    --mobile-situation-expanded-height: 170px;
+    --mobile-top-stack: calc(var(--mobile-status-height) + var(--mobile-situation-height));
+  }
+
+  .grand-map {
+    top: var(--mobile-top-stack);
+    bottom: 0;
+    background-color: #d5c18b;
+  }
+
+  .fullscreen-layer,
+  .center-layer {
+    z-index: 80;
+  }
+
+  .drawer-scrim {
+    z-index: 68;
+  }
+
+  .court-drawer {
+    z-index: 70;
+  }
+
+  .status-bar {
+    left: 0;
+    right: 0;
+    top: 0;
+    width: 100vw;
+    max-width: none;
+    height: var(--mobile-status-height);
+    gap: 3px;
+    padding: 4px;
+    border-left: 0;
+    border-right: 0;
+    border-radius: 0;
+    z-index: 34;
+  }
+
+  .status-emblem {
+    min-height: 22px;
+    padding: 1px 6px;
+    font-size: 0.72rem;
+  }
+
+  .emblem-art {
+    width: 20px;
+    height: 20px;
+  }
+
+  .status-money,
+  .status-pill,
+  .budget-trigger {
+    min-height: 23px;
+    padding: 2px 4px;
+    font-size: 0.68rem;
+  }
+
+  .budget-trigger small {
+    font-size: 0.62rem;
+  }
+
+  .status-menu {
+    min-height: 25px;
+    font-size: 0.76rem;
+  }
+
+  .budget-popover,
+  .budget-hover:nth-child(2) .budget-popover {
+    top: 48px;
+    z-index: 90;
+    font-size: 0.78rem;
+    line-height: 1.25;
+  }
+
+  .budget-popover-head b,
+  .budget-row b,
+  .budget-row strong,
+  .budget-summary strong {
+    font-size: 0.84rem;
+  }
+
+  .budget-row small,
+  .budget-summary small,
+  .budget-list-title {
+    font-size: 0.72rem;
+  }
+
+  .situation-panel {
+    top: var(--mobile-status-height);
+    left: 0;
+    right: 0;
+    width: 100vw;
+    max-width: none;
+    min-height: var(--mobile-situation-height);
+    padding: 8px 12px;
+    border-left: 0;
+    border-right: 0;
+    border-radius: 0;
+    z-index: 31;
+  }
+
+  .game-shell:has(.center-layer) .situation-panel {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: none;
+  }
+
+  .situation-panel.collapsed {
+    height: var(--mobile-situation-height);
+    min-height: var(--mobile-situation-height);
+    overflow: hidden;
+  }
+
+  .situation-panel.collapsed .situation-panel-title {
+    margin-bottom: 0;
+  }
+
+  .situation-panel:not(.collapsed) {
+    height: auto;
+    max-height: min(var(--mobile-situation-expanded-height), calc(100dvh - var(--mobile-status-height) - 12px));
+    overflow: visible;
+  }
+
+  .minister-list {
+    grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+    gap: 5px;
+    margin-top: 7px;
+  }
+
+  .minister-card-portrait-wrap {
+    height: 122px;
+  }
+
+  .minister-list-court .minister-card {
+    width: clamp(58px, 17vw, 78px);
+  }
+
+  .minister-list-court .minister-card-portrait-wrap {
+    height: clamp(88px, 23vh, 142px);
+  }
+
+  .minister-card-info {
+    padding-top: 3px;
+  }
+
+  .minister-name {
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+  }
+
+  .minister-office {
+    max-width: 8em;
+    font-size: 0.56rem;
+  }
+
+  .drawer-brand {
+    padding: 6px 2px 4px;
+  }
+
+  .drawer-brand strong {
+    font-size: 0.86rem;
+  }
+
+  .drawer-brand span {
+    font-size: 0.68rem;
+  }
+
+  .segmented {
+    gap: 3px;
+    padding: 3px;
+  }
+
+  .segmented button {
+    min-height: 25px;
+    min-width: 44px;
+    padding: 0 7px;
+    font-size: 0.72rem;
+  }
+
+  .modal-bg-chat .chat-full-grid {
+    gap: 6px;
+    padding: 6px;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .modal-bg-chat .minister-side {
+    max-height: 118px;
+    gap: 4px;
+    overflow: hidden;
+    padding: 6px;
+  }
+
+  .modal-bg-chat .minister-profile {
+    gap: 6px;
+  }
+
+  .modal-bg-chat .minister-profile h2 {
+    font-size: 0.86rem;
+    line-height: 1.1;
+  }
+
+  .modal-bg-chat .minister-profile p,
+  .modal-bg-chat .profile-copy {
+    margin: 0;
+    font-size: 0.72rem;
+    line-height: 1.22;
+  }
+
+  .modal-bg-chat .profile-copy {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+
+  .modal-bg-chat .minister-side .icon-button {
+    width: 30px;
+    height: 30px;
+  }
+
+  .modal-bg-chat .chat-main {
+    min-height: 0;
+  }
+
+  .menu-hint,
+  .menu-modal .menu-hint,
+  .menu-llm-info {
+    font-size: 0.66rem;
+    line-height: 1.2;
+  }
+
+  .menu-modal label {
+    font-size: 0.7rem;
+  }
+}
