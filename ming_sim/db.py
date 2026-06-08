@@ -265,7 +265,6 @@ class GameDB:
                 registered_land INTEGER NOT NULL,
                 hidden_land INTEGER NOT NULL,
                 tax_per_turn INTEGER NOT NULL,
-                grain_security INTEGER NOT NULL,
                 gentry_resistance INTEGER NOT NULL,
                 military_pressure INTEGER NOT NULL,
                 status TEXT NOT NULL,
@@ -1247,9 +1246,9 @@ class GameDB:
                 """
                 INSERT OR IGNORE INTO regions
                 (id, name, kind, population, public_support, unrest, natural_disaster, human_disaster,
-                 registered_land, hidden_land, tax_per_turn, grain_security, gentry_resistance,
+                 registered_land, hidden_land, tax_per_turn, gentry_resistance,
                  military_pressure, status, controlled_by, fiscal)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     region.id,
@@ -1263,7 +1262,6 @@ class GameDB:
                     region.registered_land,
                     region.hidden_land,
                     region.tax_per_turn,
-                    region.grain_security,
                     region.gentry_resistance,
                     region.military_pressure,
                     region.status,
@@ -2335,7 +2333,6 @@ class GameDB:
                     "registered_land": int(row["registered_land"]),
                     "hidden_land": int(row["hidden_land"]),
                     "tax_per_turn": int(row["tax_per_turn"]),
-                    "grain_security": int(row["grain_security"]),
                     "gentry_resistance": int(row["gentry_resistance"]),
                     "military_pressure": int(row["military_pressure"]),
                     "status": row["status"],
@@ -2365,7 +2362,7 @@ class GameDB:
             defense = f"、城防炮{int(row['cannon'])}门" if int(row["cannon"] or 0) > 0 else ""
             parts.append(
                 f"{row['name']}{held}：民心{row['public_support']}、动乱{row['unrest']}、"
-                f"粮食{row['grain_security']}万石、税{format_money(monthly_amount(int(row['tax_per_turn'])))}/{TURN_UNIT}{defense}，{row['status']}"
+                f"税{format_money(monthly_amount(int(row['tax_per_turn'])))}/{TURN_UNIT}{defense}，{row['status']}"
             )
         return f"地区警讯：{'；'.join(parts)}。两京十三省账面{TURN_UNIT}税合计{format_money(monthly_amount(total_tax_value))}。"
 
@@ -2381,7 +2378,7 @@ class GameDB:
             held = f"，控制权：已为{self.power_display_name(row['controlled_by'])}所据（非大明辖治）"
         return (
             f"{row['name']}（{row['kind']}）{held}：人口{row['population']}万人，"
-            f"民心{row['public_support']}，动乱{row['unrest']}，粮食{row['grain_security']}万石，"
+            f"民心{row['public_support']}，动乱{row['unrest']}，"
             f"田亩{row['registered_land']}万亩，隐田{row['hidden_land']}万亩，"
             f"账面税收{format_money(monthly_amount(int(row['tax_per_turn'])))}/{TURN_UNIT}，"
             f"士绅阻力{row['gentry_resistance']}，军事压力{row['military_pressure']}，"
