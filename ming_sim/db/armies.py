@@ -1,0 +1,551 @@
+"""armies / army_logs：军队盘面、名册、增量、从推演新建军。
+
+_ArmiesMixin：拆自原 db.py，方法体逐字未改。"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from typing import Any, Dict, List, Optional, Tuple
+
+from ming_sim.assets import format_money, format_money_delta
+from ming_sim.constants import (
+    ARMY_FIELD_ALIASES, ARMY_FIELD_LABELS, ARMY_QUANTITY_FIELDS, ARMY_SCORE_FIELDS, ARMY_TEXT_FIELDS,
+    BUILDING_CATEGORIES, BUILDING_FIELD_LABELS, BUILDING_OUTPUT_METRICS,
+    BUILDING_QUANTITY_FIELDS, BUILDING_SCORE_FIELDS, BUILDING_TEXT_FIELDS,
+    ECONOMY_ACCOUNTS, POWER_FIELD_LABELS, POWER_SCORE_FIELDS,
+    POWER_FIELD_ALIASES, POWER_TEXT_FIELDS, MONEY_UNIT, REGION_FIELD_LABELS, REGION_QUANTITY_FIELDS,
+    FISCAL_SCORE_FIELDS, REGION_FIELD_ALIASES, REGION_SCORE_FIELDS, REGION_TEXT_FIELDS, TURN_UNIT,
+)
+from ming_sim.content import GameContent
+from ming_sim.matching import match_army_id_from_text, match_region_id_from_text
+from ming_sim.models import Event, GameState, monthly_amount, period_label
+from ming_sim.token_stats import tlog
+from ming_sim.db._helpers import (
+    normalize_office, infer_office_type_from_office,
+    _compact_lookup_text, _normalize_power_id,
+    COURT_OFFICE_TYPES, MINISTRY_OFFICE_TYPES,
+)
+
+
+class _ArmiesMixin:
+    def army_rows(self, limit: int | None = None, danger_order: bool = False) -> List[sqlite3.Row]:
+        # arrears 是累计欠饷万两，须按 maintenance 归一成"欠饷月数*10"再加权（0-100 量级）
+        # CASE 兼容 SQLite（无标量 MIN/LEAST）：maintenance=0 视为 0；归一后截至 100。
+        arrears_norm = (
+            "CASE "
+            "WHEN maintenance_per_turn IS NULL OR maintenance_per_turn = 0 THEN 0 "
+            "WHEN arrears * 10 / maintenance_per_turn > 100 THEN 100 "
+            "ELSE arrears * 10 / maintenance_per_turn "
+            "END"
+        )
+        order = (
+            f"({arrears_norm} + (100 - supply) + (100 - morale) + (100 - loyalty) + (100 - training)) DESC, name"
+            if danger_order
+            else "theater, name"
+        )
+        sql = f"""
+            SELECT *
+            FROM armies
+            WHERE active = 1
+            ORDER BY {order}
+        """
+        params: Tuple[object, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        return self.conn.execute(sql, params).fetchall()
+
+    def army_payload(self, limit: int | None = None, danger_order: bool = False) -> List[Dict[str, object]]:
+        payload: List[Dict[str, object]] = []
+        for row in self.army_rows(limit=limit, danger_order=danger_order):
+            payload.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "station": row["station"],
+                    "theater": row["theater"],
+                    "commander": row["commander"],
+                    "controller": row["controller"],
+                    "troop_type": row["troop_type"],
+                    "manpower": int(row["manpower"]),
+                    "maintenance_per_turn": int(row["maintenance_per_turn"]),
+                    "supply": int(row["supply"]),
+                    "morale": int(row["morale"]),
+                    "training": int(row["training"]),
+                    "equipment": int(row["equipment"]),
+                    "arrears": int(row["arrears"]),
+                    "mobility": int(row["mobility"]),
+                    "loyalty": int(row["loyalty"]),
+                    "status": row["status"],
+                    "owner_power": row["owner_power"],
+                }
+            )
+        return payload
+
+    def army_report(self, limit: int = 5) -> str:
+        rows = self.army_rows(limit=limit, danger_order=True)
+        if not rows:
+            return "军队尚未建档。"
+        total_manpower = self.conn.execute("SELECT SUM(manpower) AS total FROM armies WHERE active = 1").fetchone()
+        total_maintenance = self.conn.execute("SELECT SUM(maintenance_per_turn) AS total FROM armies WHERE active = 1").fetchone()
+        parts = []
+        for row in rows:
+            maint = int(row["maintenance_per_turn"]) or 0
+            arr = int(row["arrears"]) or 0
+            if maint > 0 and arr > 0:
+                months = arr / maint
+                arr_text = f"欠饷{arr}万两（约{months:.1f}月军饷）"
+            else:
+                arr_text = f"欠饷{arr}万两"
+            parts.append(
+                f"{row['name']}：驻{row['station']}，兵{row['manpower']}，"
+                f"饷{format_money(monthly_amount(maint))} /{TURN_UNIT}，补给{row['supply']}、"
+                f"士气{row['morale']}、{arr_text}，{row['status']}"
+            )
+        return (
+            f"军队警讯：{'；'.join(parts)}。"
+            f"建档兵力合计{int(total_manpower['total'] or 0)}人，账面{TURN_UNIT}维护费{format_money(monthly_amount(int(total_maintenance['total'] or 0)))}。"
+        )
+
+    def army_detail(self, raw_name: str) -> str:
+        army_id = match_army_id_from_text(raw_name, self.content.armies)
+        if army_id is None:
+            raise ValueError(f"未找到军队：{raw_name}")
+        row = self.conn.execute("SELECT * FROM armies WHERE id = ?", (army_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"军队未入库：{raw_name}")
+        maint = int(row["maintenance_per_turn"]) or 0
+        arr = int(row["arrears"]) or 0
+        if maint > 0 and arr > 0:
+            months = arr / maint
+            arr_text = f"欠饷{arr}万两（约{months:.1f}月军饷）"
+        else:
+            arr_text = f"欠饷{arr}万两"
+        return (
+            f"{row['name']}：驻扎地{row['station']}，统帅{row['commander']}，"
+            f"兵种{row['troop_type']}，人数{row['manpower']}人，"
+            f"维护费{format_money(monthly_amount(maint))} /{TURN_UNIT}，补给{row['supply']}，"
+            f"士气{row['morale']}，训练{row['training']}，装备{row['equipment']}，"
+            f"{arr_text}，机动{row['mobility']}，忠诚{row['loyalty']}。"
+            f"状态：{row['status']}"
+        )
+
+    def army_roster(self, filter_names: Optional[List[str]] = None, index_only: bool = False) -> str:
+        """全军名册。filter_names 非空则只返回指定军队；index_only=True 只返回军名+欠饷+状态索引。"""
+        rows = self.conn.execute(
+            "SELECT * FROM armies WHERE active = 1 ORDER BY owner_power='ming' DESC, theater, name"
+        ).fetchall()
+        if filter_names:
+            rows = [r for r in rows if r["name"] in filter_names or r["id"] in filter_names]
+        if index_only:
+            # 军队超 30 时用索引：仅显示军名+欠饷+状态，完整信息由 query_army_roster tool 提供
+            lines = []
+            for row in rows:
+                if str(row["owner_power"]) == "ming":
+                    arr = int(row["arrears"]) or 0
+                    lines.append(f"{row['name']}：欠饷{arr}万两，{row['status']}")
+            return (
+                "【全军名册索引（涉及军队欠饷/补给/士气时先调 query_army_roster 查完整信息）】\n"
+                + "\n".join(lines)
+            ) if lines else ""
+        if not rows:
+            return ""
+        own: List[str] = []
+        other: List[str] = []
+        for row in rows:
+            maint = int(row["maintenance_per_turn"]) or 0
+            arr = int(row["arrears"]) or 0
+            # 全按月度：maintenance_per_turn 就是月饷，不除 3（别被 monthly_amount 命名误导）。
+            monthly_pay = maint
+            months = f"{arr / monthly_pay:.1f}" if monthly_pay > 0 and arr > 0 else "0"
+            if str(row["owner_power"]) == "ming":
+                # 列序见表头。兵力/月饷/欠饷单位万两；补给…忠诚为 0-100。
+                own.append(
+                    "|".join(str(x) for x in (
+                        row["name"], row["station"], row["commander"], row["troop_type"],
+                        row["manpower"], monthly_pay, row["supply"], row["morale"],
+                        row["training"], row["equipment"], row["mobility"], row["loyalty"],
+                        arr, months, row["status"],
+                    ))
+                )
+            else:
+                other.append(
+                    "|".join(str(x) for x in (
+                        row["name"], row["owner_power"], row["station"],
+                        row["commander"], row["troop_type"], row["manpower"], row["status"],
+                    ))
+                )
+        out = [
+            "【全军名册（现状以此为准，谈某军欠饷/补给/士气直接据此；欠饷万两为精确累计值，非抽象分）】",
+            "大明各军（| 分隔，列序＝军名|驻地|统帅|兵种|兵力|月饷万两|补给|士气|训练|装备|机动|忠诚|欠饷万两|欠饷月数|状态；补给…忠诚为0-100）：",
+            *own,
+        ]
+        if other:
+            out.append("敌对/外藩军（可见情报，列序＝军名|势力|驻地|统帅|兵种|兵力|状态）：")
+            out.extend(other)
+        return "\n".join(out)
+
+    def turn_army_summary(self, turn: int, limit: int = 10) -> str:
+        rows = self.conn.execute(
+            """
+            SELECT al.*, a.name AS army_name
+            FROM army_logs al
+            JOIN armies a ON a.id = al.army_id
+            WHERE al.turn = ?
+            ORDER BY al.id
+            LIMIT ?
+            """,
+            (turn, limit),
+        ).fetchall()
+        if not rows:
+            return f"本{TURN_UNIT}军队盘面无明确变化。"
+        parts = []
+        for row in rows:
+            label = ARMY_FIELD_LABELS.get(str(row["field"]), str(row["field"]))
+            delta = row["delta"]
+            if delta is None:
+                parts.append(f"{row['army_name']}{label}改为{row['new_value']}（{row['reason']}）")
+            else:
+                sign = "+" if int(delta) > 0 else ""
+                if row["field"] == "manpower":
+                    parts.append(f"{row['army_name']}{label}{sign}{int(delta)}人（{row['reason']}）")
+                elif row["field"] == "maintenance_per_turn":
+                    parts.append(f"{row['army_name']}{label}{format_money_delta(int(delta))}（{row['reason']}）")
+                else:
+                    parts.append(f"{row['army_name']}{label}{sign}{int(delta)}（{row['reason']}）")
+        return "；".join(parts) + "。"
+
+    def apply_army_deltas(
+        self,
+        state: GameState,
+        event: Event,
+        edict_id: int | None,
+        actor: str,
+        army_deltas: Dict[str, Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        changes: List[Dict[str, object]] = []
+        for army_id, raw_changes in army_deltas.items():
+            row = self.conn.execute("SELECT * FROM armies WHERE id = ?", (army_id,)).fetchone()
+            if row is None:
+                print(f"[WARN] army_delta 引用未入库军队 '{army_id}' → 跳过")
+                continue
+            reason = str(raw_changes.get("reason") or raw_changes.get("原因") or event.title).strip()[:80]
+            _valid_army_fields = set(ARMY_SCORE_FIELDS + ARMY_QUANTITY_FIELDS + ARMY_TEXT_FIELDS)
+            for raw_field, value in raw_changes.items():
+                field = ARMY_FIELD_ALIASES.get(str(raw_field).strip(), str(raw_field).strip())
+                if field == "reason":
+                    continue
+                if field not in _valid_army_fields:
+                    print(f"[WARN] army_delta 引用非法字段 '{raw_field}' → 跳过")
+                    continue
+                old_value = row[field]
+                if field == "arrears":
+                    # arrears 单位=累计欠饷万两，无上限，按需累加。
+                    # 正常情况由 flows 唯一变更；此处兜底允许 extractor 在战损/裁军等
+                    # 非现金原因下写入（提示词已禁，但保留兜底以防 LLM 越界不至于截断）。
+                    delta = int(value)
+                    new_value = max(0, int(old_value) + delta)
+                    actual_delta = new_value - int(old_value)
+                    if actual_delta == 0:
+                        continue
+                    stored_new: object = new_value
+                    log_delta: int | None = actual_delta
+                elif field in ARMY_SCORE_FIELDS:
+                    delta = int(value)
+                    # 遗产百分比修正：该军该字段若有 active 遗产修正符，先放大/缩小 delta
+                    net_pct = int(((self.legacy_modifiers(state).get("armies") or {})
+                                   .get(army_id) or {}).get(field, 0) or 0)
+                    if net_pct:
+                        delta = self.apply_legacy_pct(delta, net_pct)
+                    new_value = max(0, min(100, int(old_value) + delta))
+                    actual_delta = new_value - int(old_value)
+                    if actual_delta == 0:
+                        continue
+                    stored_new = new_value
+                    log_delta = actual_delta
+                elif field == "manpower":
+                    delta = int(value)
+                    new_value = max(0, int(old_value) + delta)
+                    actual_delta = new_value - int(old_value)
+                    if actual_delta == 0:
+                        continue
+                    stored_new = new_value
+                    log_delta = actual_delta
+                elif field == "maintenance_per_turn":
+                    delta = int(value)
+                    new_value = max(0, int(old_value) + delta)
+                    actual_delta = new_value - int(old_value)
+                    if actual_delta == 0:
+                        continue
+                    stored_new = new_value
+                    log_delta = actual_delta
+                elif field in ARMY_TEXT_FIELDS:
+                    text_value = str(value).strip()[:160]
+                    if field == "owner_power":
+                        text_value = _normalize_power_id(self.conn, text_value)
+                        valid_powers = {r["id"] for r in self.conn.execute("SELECT id FROM powers").fetchall()}
+                        if text_value not in valid_powers:
+                            print(f"[WARN] army_delta 归属 '{value}' 未在 powers → 跳过")
+                            continue
+                    if not text_value or text_value == str(old_value):
+                        continue
+                    stored_new = text_value
+                    log_delta = None
+                else:
+                    print(f"[WARN] army_delta 未处理字段 '{field}' → 跳过")
+                    continue
+                self.conn.execute(
+                    f"UPDATE armies SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (stored_new, army_id),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO army_logs
+                    (turn, year, period, army_id, field, old_value, new_value, delta, reason, event_id, edict_id, actor)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        state.turn,
+                        state.year,
+                        state.period,
+                        army_id,
+                        field,
+                        str(old_value),
+                        str(stored_new),
+                        log_delta,
+                        reason,
+                        event.id,
+                        edict_id,
+                        actor,
+                    ),
+                )
+                changes.append(
+                    {
+                        "army": row["name"],
+                        "field": field,
+                        "label": ARMY_FIELD_LABELS.get(field, field),
+                        "old": old_value,
+                        "new": stored_new,
+                        "delta": log_delta,
+                        "reason": reason,
+                    }
+                )
+            # 本军本轮全部字段落库后：若 manpower 已归 0 且仍 active，自动撤销番号。
+            # 兵尽即除——置 status='撤销'/active=0，清零维护费与欠饷（空壳不再吃饷累欠），
+            # 行留库可被「收复/重建」事件复活。任何把兵打到 0 的来源（裁撤/战损/叛逃）统一收口于此。
+            changes.extend(self._disband_if_empty(state, army_id, event, edict_id, actor, reason))
+        self.conn.commit()
+        return changes
+
+    def _disband_if_empty(
+        self,
+        state: GameState,
+        army_id: str,
+        event: Event,
+        edict_id: int | None,
+        actor: str,
+        reason: str,
+    ) -> List[Dict[str, object]]:
+        """兵尽（manpower=0）则软删除番号：status='撤销'、active=0、维护费/欠饷清零。
+        已 active=0 的不重复处理。返回追加的变更日志项。"""
+        row = self.conn.execute(
+            "SELECT name, manpower, active, maintenance_per_turn, arrears, status FROM armies WHERE id = ?",
+            (army_id,),
+        ).fetchone()
+        if row is None or int(row["manpower"]) != 0 or int(row["active"]) == 0:
+            return []
+        disband_reason = (reason or f"{event.title}：兵尽番号裁撤").strip()[:80]
+        extra: List[Dict[str, object]] = []
+        # active / status 翻转 + 维护费、欠饷清零，逐项写 army_logs 留审计。
+        field_updates = [
+            ("active", int(row["active"]), 0),
+            ("maintenance_per_turn", int(row["maintenance_per_turn"]), 0),
+            ("arrears", int(row["arrears"]), 0),
+        ]
+        for field, old_v, new_v in field_updates:
+            if old_v == new_v:
+                continue
+            self.conn.execute(
+                f"UPDATE armies SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_v, army_id),
+            )
+            self._log_army_field(state, army_id, field, old_v, new_v, new_v - old_v, disband_reason, event, edict_id, actor)
+        old_status = str(row["status"])
+        if old_status != "撤销":
+            self.conn.execute(
+                "UPDATE armies SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ("撤销", army_id),
+            )
+            self._log_army_field(state, army_id, "status", old_status, "撤销", None, disband_reason, event, edict_id, actor)
+            extra.append({
+                "army": str(row["name"]),
+                "field": "status",
+                "label": ARMY_FIELD_LABELS.get("status", "status"),
+                "old": old_status,
+                "new": "撤销",
+                "delta": None,
+                "reason": disband_reason,
+            })
+        return extra
+
+    def _log_army_field(
+        self, state: GameState, army_id: str, field: str,
+        old_value: object, new_value: object, delta: int | None,
+        reason: str, event: Event, edict_id: int | None, actor: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO army_logs
+            (turn, year, period, army_id, field, old_value, new_value, delta, reason, event_id, edict_id, actor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state.turn, state.year, state.period, army_id, field,
+                str(old_value), str(new_value), delta, reason,
+                event.id, edict_id, actor,
+            ),
+        )
+
+    def _reactivate_if_refilled(
+        self, state: GameState, army_id: str, item: Dict[str, object],
+        reason: str, event: Event, actor: str,
+    ) -> None:
+        """已撤销番号（active=0）补兵满员后翻回 active=1，并把状态从「撤销」改成本次叙事状态。"""
+        row = self.conn.execute(
+            "SELECT manpower, active, status FROM armies WHERE id = ?", (army_id,)
+        ).fetchone()
+        if row is None or int(row["active"]) == 1 or int(row["manpower"]) <= 0:
+            return
+        new_status = str(item.get("status") or "重建").strip()[:160] or "重建"
+        self.conn.execute(
+            "UPDATE armies SET active = 1, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (new_status, army_id),
+        )
+        self._log_army_field(state, army_id, "active", 0, 1, 1, reason, event, None, actor)
+        self._log_army_field(state, army_id, "status", str(row["status"]), new_status, None, reason, event, None, actor)
+
+    def create_armies_from_extraction(
+        self,
+        state: GameState,
+        new_armies: List[Dict[str, object]],
+        actor: str = "档房",
+    ) -> List[Dict[str, object]]:
+        """据 extractor 输出建新军队。同 id/name 已存在 → 把 manpower 当扩军增量。owner_power 必须是已知 power。"""
+        valid_powers = {r["id"] for r in self.conn.execute("SELECT id FROM powers").fetchall()}
+        created: List[Dict[str, object]] = []
+        for raw in new_armies:
+            if not isinstance(raw, dict):
+                continue
+            item = {POWER_FIELD_ALIASES.get(k, k) if False else k: v for k, v in raw.items()}
+            # 规范键：复用 ARMY_FIELD_ALIASES（兼容中文）
+            from ming_sim.constants import ARMY_FIELD_ALIASES as _AA
+            item = {_AA.get(str(k).strip(), str(k).strip()): v for k, v in raw.items()}
+            aid = str(item.get("id") or "").strip()
+            if not aid:
+                print(f"[WARN] new_armies 缺 id → 跳过: {raw}")
+                continue
+            owner = _normalize_power_id(self.conn, item.get("owner_power") or "ming") or "ming"
+            if owner not in valid_powers:
+                print(f"[WARN] new_armies owner_power '{owner}' 未在 powers → 跳过 {aid}")
+                continue
+            name = str(item.get("name") or aid).strip()
+            # 查重：同 id 或 同 name → 转 manpower 扩军增量
+            existing = self.conn.execute(
+                "SELECT id, name FROM armies WHERE id = ? OR name = ?", (aid, name)
+            ).fetchone()
+            if existing is not None:
+                manpower = item.get("manpower")
+                if manpower is None:
+                    print(f"[WARN] new_armies 重复 id/name '{aid}' 且无 manpower → 跳过")
+                    continue
+                try:
+                    delta = int(manpower)
+                except (TypeError, ValueError):
+                    print(f"[WARN] new_armies '{aid}' manpower 非整数 → 跳过")
+                    continue
+                if delta == 0:
+                    continue
+                reason = str(item.get("reason") or item.get("status") or "扩军")[:80]
+                pseudo_event = type("E", (), {"id": "season", "title": reason})()
+                self.apply_army_deltas(
+                    state, pseudo_event, None, actor, {existing["id"]: {"manpower": delta, "reason": reason}}
+                )
+                # 复活：已撤销番号（active=0）被重新募兵补满 → 翻回 active=1，
+                # 顺手把状态从「撤销」改成本次叙事状态（缺则给「重建」）。
+                self._reactivate_if_refilled(state, existing["id"], item, reason, pseudo_event, actor)
+                created.append({"army": existing["name"], "manpower_added": delta, "merged_into_existing": True})
+                continue
+            # 必填字段
+            try:
+                manpower = int(item["manpower"])
+                maintenance = int(item["maintenance_per_turn"])
+            except (KeyError, TypeError, ValueError):
+                print(f"[WARN] new_armies '{aid}' 缺 manpower/maintenance_per_turn → 跳过")
+                continue
+            def _score(field: str, default: int = 50) -> int:
+                try:
+                    return max(0, min(100, int(item.get(field, default))))
+                except (TypeError, ValueError):
+                    return default
+            def _arrears_init() -> int:
+                # arrears 单位=累计欠饷万两，无上限；新军默认 0
+                try:
+                    return max(0, int(item.get("arrears", 0)))
+                except (TypeError, ValueError):
+                    return 0
+            commander = str(item.get("commander") or "")
+            row = (
+                aid,
+                name,
+                str(item.get("station") or ""),
+                str(item.get("theater") or ""),
+                commander,
+                str(item.get("controller") or commander),
+                str(item.get("troop_type") or ""),
+                max(0, manpower),
+                max(0, maintenance),
+                _score("supply"),
+                _score("morale"),
+                _score("training"),
+                _score("equipment"),
+                _arrears_init(),
+                _score("mobility"),
+                _score("loyalty"),
+                str(item.get("status") or "新立"),
+                owner,
+            )
+            try:
+                self.conn.execute(
+                    """
+                    INSERT INTO armies
+                    (id, name, station, theater, commander, controller, troop_type, manpower,
+                     maintenance_per_turn, supply, morale, training, equipment, arrears,
+                     mobility, loyalty, status, owner_power)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    row,
+                )
+            except sqlite3.IntegrityError as exc:
+                print(f"[WARN] new_armies INSERT 失败 '{aid}': {exc}")
+                continue
+            reason = str(item.get("reason") or item.get("status") or "新立军队")[:80]
+            self.conn.execute(
+                """
+                INSERT INTO army_logs
+                (turn, year, period, army_id, field, old_value, new_value, delta, reason, event_id, edict_id, actor)
+                VALUES (?, ?, ?, ?, 'created', '', ?, ?, ?, 'season', NULL, ?)
+                """,
+                (state.turn, state.year, state.period, aid, str(manpower), manpower, reason, actor),
+            )
+            created.append({
+                "army": name,
+                "id": aid,
+                "owner_power": owner,
+                "manpower": manpower,
+                "created": True,
+                "reason": reason,
+            })
+        self.conn.commit()
+        return created
