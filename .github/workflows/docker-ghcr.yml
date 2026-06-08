@@ -1,0 +1,186 @@
+name: docker-ghcr
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-fork:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta-fork
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push fork image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-fork.outputs.tags }}
+          labels: ${{ steps.meta-fork.outputs.labels }}
+          cache-from: type=gha,scope=fork
+          cache-to: type=gha,mode=max,scope=fork
+
+  build-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve upstream revision
+        id: upstream-rev
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(git ls-remote https://github.com/wangwei-ying3/ming-salvage-sim.git refs/heads/main | awk '{print $1}')"
+          if [[ -z "${rev}" ]]; then
+            echo "Unable to resolve upstream revision" >&2
+            exit 1
+          fi
+          echo "sha=${rev}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata upstream
+        id: meta-upstream
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=upstream-latest,enable={{is_default_branch}}
+            type=ref,event=branch,prefix=upstream-
+            type=ref,event=tag,prefix=upstream-
+            type=sha,prefix=upstream-sha-
+
+      - name: Build and push upstream image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.upstream
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            UPSTREAM_REPO=https://github.com/wangwei-ying3/ming-salvage-sim.git
+            UPSTREAM_REF=main
+            UPSTREAM_REV=${{ steps.upstream-rev.outputs.sha }}
+          tags: ${{ steps.meta-upstream.outputs.tags }}
+          labels: ${{ steps.meta-upstream.outputs.labels }}
+          cache-from: type=gha,scope=upstream
+          cache-to: type=gha,mode=max,scope=upstream
+
+  prune-ghcr:
+    runs-on: ubuntu-latest
+    needs:
+      - build-fork
+      - build-upstream
+    if: ${{ needs.build-fork.result == 'success' && needs.build-upstream.result == 'success' }}
+
+    steps:
+      - name: Prune old GHCR images
+        uses: actions/github-script@v7
+        env:
+          KEEP_BUILDS: "3"
+        with:
+          script: |
+            const keepBuilds = Number(process.env.KEEP_BUILDS || "3");
+            const owner = context.repo.owner;
+            const packageName = context.repo.repo.toLowerCase();
+            const ownerType = context.payload.repository.owner.type;
+            const isOrg = ownerType === "Organization";
+
+            const listRoute = isOrg
+              ? "GET /orgs/{org}/packages/{package_type}/{package_name}/versions"
+              : "GET /users/{username}/packages/{package_type}/{package_name}/versions";
+            const deleteRoute = isOrg
+              ? "DELETE /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}"
+              : "DELETE /users/{username}/packages/{package_type}/{package_name}/versions/{package_version_id}";
+            const packageParams = isOrg
+              ? { org: owner, package_type: "container", package_name: packageName }
+              : { username: owner, package_type: "container", package_name: packageName };
+            const listParams = isOrg
+              ? { org: owner, package_type: "container", package_name: packageName, per_page: 100 }
+              : { username: owner, package_type: "container", package_name: packageName, per_page: 100 };
+
+            const versions = await github.paginate(listRoute, listParams);
+            const tagsOf = (version) => version.metadata?.container?.tags || [];
+            const byCreatedDesc = (a, b) => new Date(b.created_at) - new Date(a.created_at);
+            const tagged = versions.filter((version) => tagsOf(version).length > 0);
+
+            const forkBuilds = tagged
+              .filter((version) => tagsOf(version).some((tag) => /^sha-[0-9a-f]/.test(tag)))
+              .sort(byCreatedDesc);
+            const upstreamBuilds = tagged
+              .filter((version) => tagsOf(version).some((tag) => /^upstream-sha-[0-9a-f]/.test(tag)))
+              .sort(byCreatedDesc);
+
+            const keep = [...forkBuilds.slice(0, keepBuilds), ...upstreamBuilds.slice(0, keepBuilds)];
+            const remove = [...forkBuilds.slice(keepBuilds), ...upstreamBuilds.slice(keepBuilds)];
+            if (keep.length) {
+              const oldestKeptMs = Math.min(...keep.map((version) => new Date(version.created_at).getTime()));
+              const untaggedCutoffMs = oldestKeptMs - 2 * 60 * 60 * 1000;
+              remove.push(
+                ...versions.filter((version) =>
+                  tagsOf(version).length === 0 &&
+                  new Date(version.created_at).getTime() < untaggedCutoffMs
+                )
+              );
+            }
+
+            const uniqueRemove = Array.from(new Map(remove.map((version) => [version.id, version])).values());
+            core.info(`Keeping ${Math.min(forkBuilds.length, keepBuilds)} fork builds and ${Math.min(upstreamBuilds.length, keepBuilds)} upstream builds.`);
+            core.info(`Deleting ${uniqueRemove.length} old GHCR package versions from ${owner}/${packageName}.`);
+
+            for (const version of uniqueRemove) {
+              core.info(`Deleting package version ${version.id}: tags=${tagsOf(version).join(",") || "(untagged)"} created=${version.created_at}`);
+              await github.request(deleteRoute, {
+                ...packageParams,
+                package_version_id: version.id,
+              });
+            }
