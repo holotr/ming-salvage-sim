@@ -13,17 +13,14 @@ import os
 import queue
 import random
 import re
-import subprocess
-import sys
 import threading
-import time
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ming_sim.constants import ROOT_DIR
 from ming_sim.paths import bundled_path, user_data_path, user_data_dir
@@ -37,23 +34,17 @@ from ming_sim.llm_config import (
     save_runtime_game,
     save_runtime_llm,
 )
-from agno.agent import Agent
-
-from ming_sim.agents import _dump_llm_messages, build_simulator_context
-from ming_sim.llm_model import create_chat_model, extract_agent_text, verify_llm_available
+from ming_sim.agents import _dump_llm_messages
+from ming_sim.llm_model import extract_agent_text, verify_llm_available
 from ming_sim.llm_contract import fail_if_llm_error
 from ming_sim.issues import _format_issue_ongoing
 from ming_sim.session import GameSession
 from ming_sim.session import AUTO_SAVE_PREFIX
-from ming_sim.context import character_context_with_db, match_minister_from_text
-from ming_sim.constants import TURN_UNIT, BUILDING_CATEGORIES
-from ming_sim.flows import calc_province_fiscal, compute_budget_lines
-from ming_sim.simulation import build_simulator_payload
+from ming_sim.skills import available_skill_ids, skill_display_name, skill_source_labels
+from ming_sim.context import match_minister_from_text
+from ming_sim.flows import compute_budget_lines
 from ming_sim.exceptions import LLMContractError  # noqa: F401  (保留：供错误处理)
 from ming_sim.models import Character, LLMConfig
-from ming_sim.registry import _BASE_SKILLS
-from ming_sim.tools import build_minister_tools
-from ming_sim.token_stats import record_stream_metrics
 from ming_sim import steam_events
 
 WEB_DIST = bundled_path("web", "dist")
@@ -64,101 +55,6 @@ UPLOAD_PORTRAIT_DIR = user_data_path("uploads", "portraits")
 CUSTOM_PORTRAIT_PREFIX = "custom:"
 ALLOWED_PORTRAIT_TYPES = {"image/png", "image/jpeg", "image/webp"}
 MAX_PORTRAIT_BYTES = 8 * 1024 * 1024  # 8MB 上限
-
-_AGNO_SKILL_DESCRIPTIONS = {
-    "memory-recall": "查阅既往邸报与起居注，补足旧事来龙去脉。",
-    "decree-drafting": "把已定处置整理成圣旨草案并入档。",
-    "secret-order": "下达、催办、追问密令，并记入密档。",
-    "summon": "传召朝臣，必要时补登名册外人物。",
-    "tax-adjust": "户部调税事项，立为可追踪政务。",
-    "consort-selection": "奉旨遴选后宫人选，呈候选名单。",
-    "court-roster": "查阅在朝人物名册。",
-    "army-roster": "查阅军队名册。",
-}
-
-_TOOL_LABELS = {
-    "list_memorials": "查看在办事项",
-    "inspect_memorial": "查看事项细节",
-    "list_regions": "查看地区警讯",
-    "inspect_region": "查看地区详情",
-    "list_buildings": "查看建筑",
-    "inspect_building": "查看建筑详情",
-    "estimate_resistance": "估算阻力",
-    "read_past_report": "查阅旧邸报",
-    "search_memories": "检索起居注",
-    "inspect_treasury_ledger": "查钱库流水",
-    "propose_directive": "拟旨入档",
-    "secret_order": "密令",
-    "dismiss_minister": "退朝",
-    "summon_minister": "传召大臣",
-    "register_unlisted_person": "登记名册外人物",
-    "query_court_roster": "查询朝臣名册",
-    "query_army_roster": "查询军队名册",
-    "propose_appointment": "吏部铨选",
-    "check_treasury": "查国库",
-    "adjust_tax": "调税",
-    "present_consort_candidates": "选妃呈名单",
-}
-
-_RUNTIME_SKILL_LABELS = {
-    "memory-recall": "旧事记忆",
-    "decree-drafting": "拟旨入档",
-    "secret-order": "密令",
-    "summon": "召见传人",
-    "tax-adjust": "调税",
-    "consort-selection": "选妃",
-    "court-roster": "朝臣名册查询",
-    "army-roster": "军队名册查询",
-}
-
-_TOOL_DESCRIPTIONS = {
-    "list_memorials": "查看当前在办的所有事项。",
-    "inspect_memorial": "查看某条在办事项的细节。",
-    "list_regions": "查看两京十三省最危险地区和账面月税。",
-    "inspect_region": "查看某一地区人口、民心、动乱、天灾、人祸、田亩和税收。",
-    "list_buildings": "查看全国在册建筑的等级、完好、维护费与产出。",
-    "inspect_building": "查看某座建筑的类别、等级、完好、维护费、风险与产出。",
-    "estimate_resistance": "估算某条在办事项下旨推动时的主要阻力。",
-    "read_past_report": "查阅既往邸报，了解此前朝局走向。",
-    "search_memories": "检索起居注章节旧事。",
-    "inspect_treasury_ledger": "查国库或内库的历史流水明细。",
-    "propose_directive": "把已定处置方案拟成圣旨草稿呈阅。",
-    "secret_order": "处理密令下达、进展、结案与催办。",
-    "dismiss_minister": "结束本次召见。",
-    "summon_minister": "传召另一位大臣入殿。",
-    "register_unlisted_person": "登记名册外人物，使其进入本局可召见人物池。",
-    "query_court_roster": "查询朝臣名册。",
-    "query_army_roster": "查询军队名册。",
-    "propose_appointment": "吏部铨选拟任。",
-    "check_treasury": "查国库、内库、收支和欠账。",
-    "adjust_tax": "奏请调整税额，立为可追踪调税事项。",
-    "present_consort_candidates": "奉旨选妃，呈候选名单。",
-}
-
-_PLAYER_TEXT_REPLACEMENTS = (
-    ("Agno", ""),
-    ("agno", ""),
-    ("Tool", "工具"),
-    ("tool", "工具"),
-    ("skill", "能力"),
-    ("issue", "事项"),
-    ("slot", "事项序号"),
-    ("list_memorials", "在办事项清单"),
-    ("decree_text", "圣旨正文"),
-    ("action", "处置"),
-    ("order_id", "密令编号"),
-    ("tags_json", "关键词"),
-    ("aliases_json", "别名"),
-    ("deadline_months", "期限"),
-    ("summon_after", "随后传召"),
-)
-
-
-def _player_text(text: str) -> str:
-    out = str(text or "").strip()
-    for old, new in _PLAYER_TEXT_REPLACEMENTS:
-        out = out.replace(old, new)
-    return out.replace("（）", "").strip()
 
 # resolve/fail_condition 同时喂 extractor（需 input.factions/leverage 等技术 key）与展示给玩家。
 # 展示前把技术词替换成中文，原文不动（LLM 仍读原文判定）。按长键先替，避免子串误伤。
@@ -178,8 +74,7 @@ _CONDITION_DISPLAY_REPLACEMENTS = [
     ("hidden_land", "隐田"),
     ("tax_per_turn", "月税"),
     ("public_support", "民心"),
-    ("grain_output", "粮食年产"),
-    ("grain_stock", "存粮"),
+    ("grain_security", "粮食"),
     ("unrest", "动乱"),
     ("gentry_resistance", "士绅阻力"),
     ("military_pressure", "边防压力"),
@@ -428,21 +323,6 @@ class ChatRequest(BaseModel):
     message: str
 
 
-class CourtChatRequest(BaseModel):
-    message: str
-    ministers: List[str] = Field(default_factory=list)
-
-
-class CourtChatSummaryMessage(BaseModel):
-    role: str
-    speaker: str
-    content: str
-
-
-class CourtChatSummaryRequest(BaseModel):
-    messages: List[CourtChatSummaryMessage] = Field(default_factory=list)
-
-
 class DirectiveRequest(BaseModel):
     text: str
     notes: str = ""
@@ -493,6 +373,10 @@ class WebGame:
         advanced_thinking_level = runtime.get("advanced_thinking_level") or advanced_thinking_level
         max_tokens = int(runtime.get("max_tokens") or 8000)
         timeout_seconds = float(runtime.get("timeout_seconds") or timeout_seconds)
+        # 探针：CLI 后端（MING_SIM_LLM_BACKEND=agy|codex）脱 api key，给占位符放行。
+        from ming_sim.cli_backend import cli_backend_from_env
+        if not api_key and cli_backend_from_env() is not None:
+            api_key = "cli-backend"
         if not api_key:
             raise LLMUnavailable("未配 API key，请先到设置页填写。")
         random.seed(int(os.environ.get("MING_SIM_SEED", "7")))
@@ -727,69 +611,6 @@ class WebGame:
             character.portrait_id = portrait_id
 
     # ── 序列化 ────────────────────────────────────────────────────────────
-    def _runtime_query_flags(self) -> tuple[bool, bool]:
-        active_char_count = sum(
-            1 for ch in self.content.characters.values()
-            if ch.office_type != "后宫"
-            and getattr(ch, "power_id", "ming") == "ming"
-            and self.db.get_character_status(ch.name)[0] != "offstage"
-        )
-        army_count = self.db.conn.execute("SELECT COUNT(*) FROM armies WHERE active = 1").fetchone()[0]
-        return active_char_count > 100, army_count > 30
-
-    def _runtime_skill_payloads(self, character: Character) -> List[Dict[str, Any]]:
-        use_roster_tool, use_army_tool = self._runtime_query_flags()
-        grant = self.db.get_office_court_grant(character.office_type)
-        agno_skill_ids = list(_BASE_SKILLS)
-        for skill_id in list(grant.get("agno_skills") or []):
-            if skill_id not in agno_skill_ids:
-                agno_skill_ids.append(str(skill_id))
-        if use_roster_tool and "court-roster" not in agno_skill_ids:
-            agno_skill_ids.append("court-roster")
-        if use_army_tool and "army-roster" not in agno_skill_ids:
-            agno_skill_ids.append("army-roster")
-
-        context = self.session.registry.context
-        tools = build_minister_tools(
-            character,
-            context,
-            use_roster_tool=use_roster_tool,
-            use_army_tool=use_army_tool,
-        )
-        if "present_consort_candidates" in (grant.get("court_tools") or []):
-            def present_consort_candidates() -> str:
-                """奉旨选妃，呈候选名单。"""
-                return ""
-            tools.append(present_consort_candidates)
-
-        payloads: List[Dict[str, Any]] = []
-        for skill_id in agno_skill_ids:
-            skill_name = _RUNTIME_SKILL_LABELS.get(skill_id, "可用能力")
-            skill_description = _AGNO_SKILL_DESCRIPTIONS.get(skill_id, "")
-            payloads.append({
-                "id": skill_id,
-                "name": _player_text(skill_name),
-                "kind": "agno_skill",
-                "sources": ["运行时加载"],
-                "description": _player_text(skill_description),
-            })
-        seen_tools: set[str] = set()
-        for tool in tools:
-            tool_id = getattr(tool, "__name__", str(tool))
-            if tool_id in seen_tools:
-                continue
-            seen_tools.add(tool_id)
-            tool_name = _TOOL_LABELS.get(tool_id, "可用工具")
-            tool_description = _TOOL_DESCRIPTIONS.get(tool_id, "")
-            payloads.append({
-                "id": tool_id,
-                "name": _player_text(tool_name),
-                "kind": "tool",
-                "sources": ["运行时挂载"],
-                "description": _player_text(tool_description),
-            })
-        return payloads
-
     def public_character(self, character: Character) -> Dict[str, Any]:
         status, status_reason = self.db.get_character_status(character.name)
         status_label = _STATUS_LABEL_WEB.get(status, "在朝" if status == "active" else status)
@@ -805,27 +626,22 @@ class WebGame:
             "office": office,
             "office_type": character.office_type,
             "faction": character.faction,
-            "aliases": character.aliases,
-            "personal_skills": character.personal_skills,
-            "loyalty": character.loyalty,
-            "ability": character.ability,
-            "integrity": character.integrity,
-            "courage": character.courage,
             "style": character.style,
-            "location": character.location,
-            "birth_year": character.birth_year,
-            "historical_death_year": character.historical_death_year,
-            "historical_death_month": character.historical_death_month,
-            "debut_year": character.debut_year,
-            "debut_month": character.debut_month,
             "status": status,
             "status_reason": status_reason,
             "status_label": status_label,
             "summary": summary,
-            "description": character.summary,
             "portrait_id": character.portrait_id,
             "power_id": power_id,
-            "skills": self._runtime_skill_payloads(character),
+            "skills": [
+                {
+                    "id": skill_id,
+                    "name": skill_display_name(skill_id),
+                    "sources": skill_source_labels(character, skill_id, self.db),
+                    "description": self.content.skill_descriptions.get(skill_id, ""),
+                }
+                for skill_id in available_skill_ids(character, self.db)
+            ],
             "favorite": character.name in self.favorites,
         }
 
@@ -836,14 +652,13 @@ class WebGame:
         return (row["power_id"] if row else None) or getattr(character, "power_id", "ming") or "ming"
 
     def directive_payload(self, row) -> Dict[str, Any]:
-        skill_id = str(row["skill_id"] or "")
         return {
             "id": int(row["id"]),
             "event_id": row["event_id"] or "",
             "event_title": (row["event_title"] if "event_title" in row.keys() else "") or "",
             "actor": row["actor"] or "",
-            "skill_id": skill_id,
-            "skill_name": _TOOL_LABELS.get(skill_id) or _RUNTIME_SKILL_LABELS.get(skill_id) or skill_id,
+            "skill_id": row["skill_id"] or "",
+            "skill_name": skill_display_name(str(row["skill_id"] or "")),
             "text": row["text"],
             "source": row["source"],
             "status": row["status"],
@@ -855,27 +670,7 @@ class WebGame:
         # 颁诏候选 = draft；UI 列表含 pending
         return self.db.list_directives(self.state, statuses=("pending", "draft"))
 
-    def regions_payload(self) -> List[Dict[str, object]]:
-        regions = self.db.region_payload()
-        _, _, details = calc_province_fiscal(self.state, self.db)
-        by_region = {str(d["region_id"]): d for d in details}
-        for region in regions:
-            detail = by_region.get(str(region["id"]))
-            if not detail:
-                continue
-            region["tax_actual"] = int(detail["province_total"])
-            region["tax_per_turn"] = int(detail["田赋账面"])   # 田赋账面=官民田×亩率，覆盖库里旧列
-            region["tax_efficiency"] = float(detail["efficiency"])
-            region["tax_breakdown"] = {
-                "田赋": int(detail["田赋"]),
-                "辽饷": int(detail["辽饷"]),
-                "盐税": int(detail["盐税"]),
-                "商税": int(detail["商税"]),
-                "皇庄": int(detail["皇庄"]),
-            }
-        return regions
-
-    def map_nodes(self, regions: Optional[List[Dict[str, object]]] = None) -> List[Dict[str, Any]]:
+    def map_nodes(self) -> List[Dict[str, Any]]:
         region_positions = {
             "beizhili": (55.5, 41.2), "nanzhili": (70, 41), "shandong": (56.8, 47.9),
             "shanxi": (48.8, 45.2), "henan": (58, 46), "shaanxi": (51, 38),
@@ -896,7 +691,7 @@ class WebGame:
         }
         armies = self.db.army_payload(danger_order=True)
         nodes: List[Dict[str, Any]] = []
-        for region in regions or self.regions_payload():
+        for region in self.db.region_payload():
             x, y = region_positions.get(str(region["id"]), (50, 50))
             stationed = [a for a in armies if self._army_belongs_to_region(a, region)]
             buildings = self.db.building_payload(str(region["id"]))
@@ -982,12 +777,6 @@ class WebGame:
                 "ongoing_text": _format_issue_ongoing(str(row["ongoing_effects"] or "{}")),
                 "effect_on_resolve": dict(json.loads(str(row["effect_on_resolve"] or "{}"))),
                 "effect_on_fail": dict(json.loads(str(row["effect_on_fail"] or "{}"))),
-                "origin_kind": (row["origin_kind"] if "origin_kind" in row.keys() else "") or "",
-                "origin_ref": (row["origin_ref"] if "origin_ref" in row.keys() else "") or "",
-                "is_manual": bool(row["is_manual"]) if "is_manual" in row.keys() else False,
-                "duration_turns": int(row["duration_turns"] or 0) if "duration_turns" in row.keys() else 0,
-                "goal": (row["goal"] if "goal" in row.keys() else "") or "",
-                "origin_turn": int(row["origin_turn"] or 0),
             })
         return payloads
 
@@ -1030,67 +819,14 @@ class WebGame:
     def budget_payload(self) -> Dict[str, Any]:
         # 唯一定额源：flows.compute_budget_lines（与实际落账 / 大臣 treasury_budget_summary 三处统一）。
         budget = compute_budget_lines(self.db, self.state)
-        legacy_mods = self.db.legacy_modifiers(self.state)
-
-        def _annotate_amounts(account_name: str, items: list[Dict[str, Any]]) -> None:
-            net_pct = int(legacy_mods.get(account_name, 0) or 0)
-            for item in items:
-                base_amount = int(item["amount"])
-                item["base_amount"] = base_amount
-                if item["name"] == "建筑产出":
-                    item["amount"] = sum(
-                        self.db.apply_legacy_pct(
-                            round(int(row["output_amount"]) * max(0, min(100, int(row["condition"]))) / 100),
-                            net_pct,
-                        )
-                        for row in self.db.conn.execute(
-                            "SELECT condition, output_amount FROM buildings WHERE output_metric = ?",
-                            (account_name,),
-                        ).fetchall()
-                    )
-                else:
-                    item["amount"] = self.db.apply_legacy_pct(base_amount, net_pct)
-
         budget["国库"]["balance"] = int(self.state.metrics["国库"])
         budget["内库"]["balance"] = int(self.state.metrics["内库"])
-        for account_name, account in budget.items():
-            _annotate_amounts(str(account_name), account["income"])
-            net_pct = int(legacy_mods.get(str(account_name), 0) or 0)
-            for item in account["expense"]:
-                base_amount = int(item["amount"])
-                item["base_amount"] = base_amount
-                if item["name"] == "各军军饷":
-                    item["amount"] = sum(
-                        abs(self.db.apply_legacy_pct(-int(row["maintenance_per_turn"]), net_pct))
-                        for row in self.db.conn.execute(
-                            "SELECT maintenance_per_turn FROM armies WHERE owner_power='ming' AND maintenance_per_turn>0"
-                        ).fetchall()
-                    )
-                elif item["name"] == "建筑维护":
-                    item["amount"] = sum(
-                        abs(self.db.apply_legacy_pct(-int(row["maintenance"]), net_pct))
-                        for row in self.db.conn.execute(
-                            """
-                            SELECT maintenance FROM buildings
-                            WHERE maintenance > 0
-                              AND CASE WHEN category='内廷' THEN '内库' ELSE '国库' END = ?
-                            """,
-                            (str(account_name),),
-                        ).fetchall()
-                    )
-                else:
-                    item["amount"] = abs(self.db.apply_legacy_pct(-base_amount, net_pct))
+        for account in (budget["国库"], budget["内库"]):
             income_total = sum(int(item["amount"]) for item in account["income"])
             expense_total = sum(int(item["amount"]) for item in account["expense"])
-            base_income_total = sum(int(item["base_amount"]) for item in account["income"])
-            base_expense_total = sum(int(item["base_amount"]) for item in account["expense"])
             account["income_total"] = income_total
             account["expense_total"] = expense_total
             account["net"] = income_total - expense_total
-            account["base_income_total"] = base_income_total
-            account["base_expense_total"] = base_expense_total
-            account["base_net"] = base_income_total - base_expense_total
-            account["modifier_pct"] = int(legacy_mods.get(str(account_name), 0) or 0)
         # 本月入账（上月末结算）：上月末 LLM 推演 + 固定财政 tick 落的 ledger
         # 时序上 state.turn 在结算末尾 +1 进入新月，所以"本月可见的入账"是 cur_turn - 1 的 ledger。
         # 语义对齐玩家直觉："上月末抄家/清丈的钱，算这个月的收入"。
@@ -1145,7 +881,6 @@ class WebGame:
 
     def state_payload(self) -> Dict[str, Any]:
         directives = [self.directive_payload(row) for row in self.directive_rows()]
-        regions = self.regions_payload()
         return {
             "turn": {"year": self.state.year, "period": self.state.period,
                      "turn": self.state.turn, "phase": self.state.turn_phase},
@@ -1153,8 +888,6 @@ class WebGame:
             "previous_summary": self.previous_summary,
             "treasury": self.db.treasury_report(self.state),
             "issues": self.issue_payloads(),
-            "max_decree_issues": int(load_runtime_game().get("max_decree_issues", 10)),
-            "issue_log_limit": int(load_runtime_game().get("issue_log_limit", 6)),
             "legacies": self.legacies_payload(),
             "closed_this_turn": self.closed_this_turn_payloads(),
             "budget": self.budget_payload(),
@@ -1165,11 +898,9 @@ class WebGame:
             "victory_status": self.session.victory(),
             "ending": self.ending_payload(),
             "events": [],
-            "regions": regions,
+            "regions": self.db.region_payload(),
             "armies": self.db.army_payload(),
-            "technologies": self.db.technology_payload(),
-            "preset_trees": _preset_tree_payload(self),
-            "map_nodes": self.map_nodes(regions),
+            "map_nodes": self.map_nodes(),
             "ministers": [
                 self.public_character(c)
                 for c in self.content.characters.values()
@@ -1194,11 +925,77 @@ class WebGame:
     def _persistent_chat_minister(self, minister_name: str) -> bool:
         return minister_name not in self.session.temporary_characters
 
+    def _minister_agno_session_id(self, minister_name: str) -> str:
+        registry = self.session.registry
+        if registry is None:
+            return f"minister-{minister_name}-turn-{self.state.turn}"
+        return registry.session_ids.get(minister_name, f"minister-{minister_name}-turn-{self.state.turn}")
+
+    def can_undo_last_chat(self, minister_name: str) -> bool:
+        if not self._persistent_chat_minister(minister_name):
+            return False
+        if self.state.turn_phase not in ("summoning", "reviewing"):
+            return False
+        return self.db.can_undo_last_chat_turn(minister_name, self.state.turn)
+
+    def _start_chat_turn(self, minister_name: str) -> tuple[int, Dict[str, Any]]:
+        agno_session_id = self._minister_agno_session_id(minister_name)
+        runs_before = self.db.agno_runs_length(agno_session_id)
+        snapshot = self.db.capture_chat_rollback_snapshot()
+        chat_turn_id = self.db.create_chat_turn(
+            self.state,
+            minister_name,
+            agno_session_id,
+            runs_before,
+        )
+        return chat_turn_id, snapshot
+
+    def _record_chat_rollback_items(
+        self,
+        chat_turn_id: int,
+        before_snapshot: Dict[str, Any],
+    ) -> None:
+        if not chat_turn_id:
+            return
+        after_snapshot = self.db.capture_chat_rollback_snapshot()
+        self.db.record_chat_turn_rollback_diffs(chat_turn_id, before_snapshot, after_snapshot)
+
+    def undo_last_chat(self, minister_name: str) -> Dict[str, Any]:
+        if self.state.turn_phase not in ("summoning", "reviewing"):
+            raise HTTPException(status_code=409, detail="本回合已经进入颁诏结算，不能撤回召对。")
+        if not self._persistent_chat_minister(minister_name):
+            raise HTTPException(status_code=409, detail="临时召见人物暂不支持撤回。")
+        row = self.db.get_last_active_chat_turn(minister_name, self.state.turn)
+        if row is None:
+            raise HTTPException(status_code=404, detail="本回合没有可撤回的召对。")
+        if not self.db.is_global_last_active_chat_turn(int(row["id"])):
+            raise HTTPException(status_code=409, detail="只能撤回全局最后一轮召对。")
+        if not row.get("user_message_id") or not row.get("minister_message_id"):
+            raise HTTPException(status_code=409, detail="该召对尚未完整完成，不能撤回。")
+        try:
+            undone = self.db.undo_chat_turn(int(row["id"]))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        self.session.refresh_runtime_after_chat_rollback()
+        self.chat_history = {name: [] for name in self.session.content.characters}
+        for name, msgs in self.db.load_all_chat_history().items():
+            self.chat_history.setdefault(name, []).extend(msgs)
+        character = self.session._character(minister_name)
+        return {
+            "minister": minister_name,
+            "undone_chat_turn_id": int(undone["id"]),
+            "history": self.chat_history.get(minister_name, []),
+            "directives": [self.directive_payload(row) for row in self.directive_rows()],
+            "pending_count": self.session.pending_count(),
+            "secret_orders": self.db.list_secret_orders(),
+            "suggestions": self.suggestions_for(character),
+            "can_undo_last_chat": self.can_undo_last_chat(minister_name),
+        }
+
     def _chat_payload(
         self,
         minister_name: str,
         answer: str,
-        user_text: str = "",
         court_action: str = "",
         next_minister: str = "",
         proposed_directive: Optional[Dict[str, Any]] = None,
@@ -1206,20 +1003,14 @@ class WebGame:
         registered_minister: str = "",
         displaced_minister: str = "",
         secret_order_id: int = 0,
-        tax_issue_id: int = 0,
-        tax_adjusted: str = "",
+        chat_turn_id: int = 0,
     ) -> Dict[str, Any]:
         character = self.session._character(minister_name)
-        # 召对答完整轮一起落库（user+minister）+ 进内存缓存。中途退出走不到这里 → 不落库。
-        # chat_messages 现在只供前端展示 / 页面刷新恢复 / 撤回比对，不再喂 LLM——喂 LLM 的历史
-        # 全走 agno 每月一个 session 自管（含 tool 痕迹）。
-        if user_text:
-            self.chat_history.setdefault(minister_name, []).append({"role": "user", "content": user_text})
-        self.chat_history.setdefault(minister_name, []).append({"role": "minister", "content": answer})
+        self.chat_history[minister_name].append({"role": "minister", "content": answer})
         if minister_name not in self.session.temporary_characters:
-            if user_text:
-                self.db.append_chat_message(minister_name, self.state.turn, "user", user_text)
-            self.db.append_chat_message(minister_name, self.state.turn, "minister", answer)
+            message_id = self.db.append_chat_message(minister_name, self.state.turn, "minister", answer)
+            if chat_turn_id:
+                self.db.update_chat_turn_messages(chat_turn_id, minister_message_id=message_id)
         return {
             "minister": minister_name,
             "answer": answer,
@@ -1231,11 +1022,10 @@ class WebGame:
             "registered_minister": registered_minister,
             "displaced_minister": displaced_minister,
             "secret_order_id": secret_order_id or 0,
-            "tax_issue_id": tax_issue_id or 0,
-            "tax_adjusted": tax_adjusted or "",
             "directives": [self.directive_payload(row) for row in self.directive_rows()],
             "pending_count": self.session.pending_count(),
             "suggestions": self.suggestions_for(character),
+            "can_undo_last_chat": self.can_undo_last_chat(minister_name),
         }
 
     def chat(self, minister_name: str, message: str) -> Dict[str, Any]:
@@ -1244,22 +1034,34 @@ class WebGame:
         text = message.strip()
         if not text:
             raise HTTPException(status_code=400, detail="问话不能为空。")
-        # 召对答完才落库（user+minister 一起，见 _chat_payload）；中途退出/异常整轮不落库。
-        # 喂 LLM 的历史走 agno 每月一个 session 自管（含 tool 痕迹）；chat_messages 仅供前端展示。
-        result = self.session.chat(minister_name, text)
+        chat_turn_id = 0
+        before_snapshot: Dict[str, Any] = {}
+        if self._persistent_chat_minister(minister_name):
+            chat_turn_id, before_snapshot = self._start_chat_turn(minister_name)
+        self.chat_history.setdefault(minister_name, []).append({"role": "user", "content": text})
+        if minister_name not in self.session.temporary_characters:
+            message_id = self.db.append_chat_message(minister_name, self.state.turn, "user", text)
+            if chat_turn_id:
+                self.db.update_chat_turn_messages(chat_turn_id, user_message_id=message_id)
+        try:
+            result = self.session.chat(minister_name, text)
+            self._record_chat_rollback_items(chat_turn_id, before_snapshot)
+        except Exception:
+            if chat_turn_id:
+                self.db.mark_chat_turn_failed(chat_turn_id)
+            raise
         proposed = None
         if result.proposed_directive is not None:
             d = result.proposed_directive
             proposed = {"id": d.id, "text": d.text, "status": d.status, "notes": d.notes}
         return self._chat_payload(
-            minister_name, result.answer, user_text=text,
+            minister_name, result.answer,
             court_action=result.court_action, next_minister=result.next_minister,
             proposed_directive=proposed, appointed_minister=result.appointed_minister,
             registered_minister=result.registered_minister,
             displaced_minister=result.displaced_minister,
             secret_order_id=result.secret_order_id,
-            tax_issue_id=result.tax_issue_id,
-            tax_adjusted=result.tax_adjusted,
+            chat_turn_id=chat_turn_id,
         )
 
     def chat_stream(self, minister_name: str, message: str) -> Iterator[Dict[str, Any]]:
@@ -1270,22 +1072,21 @@ class WebGame:
         if not text:
             yield {"type": "error", "message": "问话不能为空。"}
             return
-        # 召对答完才落库（_chat_payload 整轮一起写）；流式中途退出＝前端中断，整轮不落库。
+        chat_turn_id = 0
+        before_snapshot: Dict[str, Any] = {}
+        if self._persistent_chat_minister(minister_name):
+            chat_turn_id, before_snapshot = self._start_chat_turn(minister_name)
+        self.chat_history.setdefault(minister_name, []).append({"role": "user", "content": text})
+        if minister_name not in self.session.temporary_characters:
+            message_id = self.db.append_chat_message(minister_name, self.state.turn, "user", text)
+            if chat_turn_id:
+                self.db.update_chat_turn_messages(chat_turn_id, user_message_id=message_id)
         character = self.session._character(minister_name)
         chunks: List[str] = []
         try:
             agent = self.session.registry.get(character)
-            # 喂 LLM 的历史走 agno 每月一个 session 自管（含 tool 痕迹），不再前置自管历史。
-            # 本回合已核定草案是跨 agent 信息（agno 单 session 给不了），每轮前置进 user message
-            # 头，与 GameSession.chat 保持一致，确保大臣看得到兄弟大臣最新动作。
-            run_input: Any = text
-            draft_line = self.session.registry.build_draft_line()
-            if draft_line and draft_line != "无":
-                run_input = f"【本{TURN_UNIT}已核定草案】{draft_line}\n\n{text}"
             run_output = None
-            stream = agent.run(
-                run_input, stream=True, stream_events=True, yield_run_output=True,
-            )
+            stream = agent.run(text, stream=True, stream_events=True, yield_run_output=True)
             for event in stream:
                 content = getattr(event, "content", None)
                 event_name = getattr(event, "event", "")
@@ -1312,8 +1113,6 @@ class WebGame:
             next_minister = ""
             displaced = ""
             secret_order_id = 0
-            tax_issue_id = 0
-            tax_adjusted = ""
             if run_output is not None:
                 for tool_exec in getattr(run_output, "tools", None) or []:
                     res = str(getattr(tool_exec, "result", "") or "")
@@ -1376,565 +1175,35 @@ class WebGame:
                                 args = getattr(tool_exec, "arguments", {}) or getattr(tool_exec, "tool_args", {}) or {}
                                 payload_json = json.dumps(args, ensure_ascii=False)
                             secret_order_id = self.session._apply_secret_order(payload_json, minister_name)
-                    elif tool_name == "adjust_tax" or res.startswith("__adjust_tax__"):
-                        payload_json = res.removeprefix("__adjust_tax__").strip()
-                        if not payload_json:
-                            args = getattr(tool_exec, "arguments", {}) or getattr(tool_exec, "tool_args", {}) or {}
-                            payload_json = json.dumps(args, ensure_ascii=False)
-                        tax_issue_id, tax_adjusted = self.session._apply_tax_adjust_issue(payload_json, character)
                     # 密令结案不再走大臣工具，由月末推演 + extractor 写入
+            # CLI 后端（agy/codex）：玩家用拟旨/密令按钮（消息带前缀）时，把大臣这句回话原文入档。
+            # CLI 后端会话落地走共享真源 session.apply_cli_conversation_actions(同 session.chat 非流式路径)，
+            # 杜绝 web/CLI 两边逻辑漂移（CMR F3 / codexC-1）。
+            res = self.session.apply_cli_conversation_actions(
+                character, text, answer,
+                has_directive=proposed is not None, secret_order_id=secret_order_id,
+            )
+            if proposed is None and res["directive"]:
+                proposed = res["directive"]
+            if res["secret_order_id"]:
+                secret_order_id = res["secret_order_id"]
+            self._record_chat_rollback_items(chat_turn_id, before_snapshot)
             payload = self._chat_payload(
-                minister_name, answer, user_text=text,
-                court_action=court_action, next_minister=next_minister,
+                minister_name, answer, court_action=court_action, next_minister=next_minister,
                 proposed_directive=proposed, appointed_minister=appointed,
                 registered_minister=registered,
                 displaced_minister=displaced,
                 secret_order_id=secret_order_id,
-                tax_issue_id=tax_issue_id,
-                tax_adjusted=tax_adjusted,
+                chat_turn_id=chat_turn_id,
             )
             yield {"type": "done", "payload": payload}
         except Exception as error:
+            if chat_turn_id:
+                self.db.mark_chat_turn_failed(chat_turn_id)
             if isinstance(error, LLMUnavailable):
                 yield {"type": "error", "detail": _llm_error_detail(error)}
             else:
                 yield {"type": "error", "message": str(error)}
-
-    def undo_last_chat(self, minister_name: str) -> Dict[str, Any]:
-        """撤回该大臣本回合最后一轮召对发言：删存档行 + 裁 agno 末轮 + 重载内存缓存。"""
-        if minister_name not in self.content.characters and minister_name not in self.session.temporary_characters:
-            raise HTTPException(status_code=404, detail=f"未找到大臣：{minister_name}")
-        if self.state.turn_phase not in ("summoning", "reviewing"):
-            raise HTTPException(status_code=409, detail="本回合已进入颁诏结算，不能撤回召对。")
-        if not self._persistent_chat_minister(minister_name):
-            raise HTTPException(status_code=409, detail="临时召见人物暂不支持撤回。")
-        revoked = self.session.revoke_last_chat(minister_name)
-        if not revoked:
-            raise HTTPException(status_code=404, detail="本回合没有可撤回的召对。")
-        # DB 为真相：重载内存缓存（chat_history），避免与已删的存档行不一致。
-        self.chat_history = {name: [] for name in self.session.content.characters}
-        for name, msgs in self.db.load_all_chat_history().items():
-            self.chat_history.setdefault(name, []).extend(msgs)
-        character = self.session._character(minister_name)
-        return {
-            "minister": minister_name,
-            "history": self.chat_history.get(minister_name, []),
-            "directives": [self.directive_payload(row) for row in self.directive_rows()],
-            "pending_count": self.session.pending_count(),
-            "suggestions": self.suggestions_for(character),
-        }
-
-    def court_chat_history_payload(self) -> Dict[str, Any]:
-        history = self.db.load_court_chat_history(self.state.turn)
-        return {
-            "turn": self.state.turn,
-            "year": self.state.year,
-            "period": self.state.period,
-            "history": history,
-        }
-
-    def _court_chat_agent(
-        self,
-        simulator_payload: Dict[str, object],
-        tools: Optional[List[Any]] = None,
-        tool_call_limit: int = 20,
-    ) -> Agent:
-        # Keep the first two instruction blocks byte-identical with the season simulator
-        # prefix so provider-side prefix caching can reuse the full board context.
-        simulator_context = build_simulator_context(simulator_payload)
-        return Agent(
-            name="朝会群臣",
-            id="court-chat",
-            session_id=f"court-chat-turn-{self.state.turn}",
-            db=self.session.agno_db,
-            model=create_chat_model(
-                self.session.llm_config,
-                temperature=0.65,
-                top_p=0.9,
-                max_tokens=max(1800, self.session.llm_config.max_tokens),
-            ),
-            instructions=[
-                self.content.game_world_prompt,
-                simulator_context,
-                self.content.court_chat_agent_prompt,
-            ],
-            tools=tools or [],
-            tool_call_limit=tool_call_limit,
-            # Court chat already injects monthly history explicitly in the user
-            # payload. Letting Agno add session history again makes the conclusion
-            # run resend the full debate that we also pass in debate_lines.
-            add_history_to_context=False,
-            markdown=False,
-        )
-
-    def _court_simulator_payload(self) -> Dict[str, object]:
-        return build_simulator_payload(
-            self.state,
-            self.db,
-            decree_text="",
-            previous_narrative=self.previous_summary or "",
-            relevant_memories=self.db.list_chapter_memories(upto_turn=self.state.turn, recent=6),
-            secret_orders=[
-                self.db.secret_order_sim_payload(o)
-                for o in (
-                    self.db.list_secret_orders(status="active")
-                    + self.db.list_secret_orders(status="pending_review")
-                )[:20]
-            ],
-        )
-
-    def _court_chat_payload(self, text: str, roster: List[Character], history: List[Dict[str, str]]) -> str:
-        roster_lines = [
-            "- " + character_context_with_db(c, self.db)
-            for c in roster
-        ]
-
-        def clean_history_content(value: object) -> str:
-            content = str(value or "")
-            content = re.sub(r"\s*<<<臣:([^>\n]+)>>+\s*", r"\n\1：", content)
-            return content.strip()
-
-        history_lines = [
-            f"{m.get('speaker', '')}：{clean_history_content(m.get('content', ''))}"
-            for m in history[-16:]
-        ]
-        payload = {
-            "note": "完整游戏盘面在 system 的 simulator_payload 前缀中；本 user payload 只补朝会差异信息。",
-            "court_chat_history": history_lines or ["无"],
-            "factions_brief": self.db.faction_report(),
-            "present_ministers": roster_lines,
-            "emperor_message": text,
-            "instruction": "请按系统规定的 <<<臣:大臣姓名>>> 分隔符协议，组织多位在场大臣依次奏对。",
-        }
-        return "【朝会群聊输入】\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-
-    def _parse_court_conclusion(self, raw: str) -> Dict[str, Any]:
-        decision_match = re.search(r"<<DECISION>>\s*(\{.*?\})\s*<<END>>", raw or "", re.DOTALL)
-        conclusion = re.sub(r"<<DECISION>>.*?<<END>>", "", raw or "", flags=re.DOTALL).strip()
-        option_lines: List[str] = []
-        if decision_match:
-            try:
-                decision_obj = json.loads(decision_match.group(1))
-            except json.JSONDecodeError:
-                decision_obj = None
-            if isinstance(decision_obj, dict):
-                for item in decision_obj.get("options") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    label = str(item.get("label") or "").strip()
-                    if label:
-                        option_lines.append(label)
-        return {"content": conclusion, "options": option_lines[:3]}
-
-    def _court_conclusion_prompt(
-        self,
-        debate_lines: str,
-        *,
-        configured_rounds: Optional[int] = None,
-        actual_speech_count: Optional[int] = None,
-        actual_speakers: Optional[List[str]] = None,
-        visible_only: bool = False,
-    ) -> str:
-        source_label = "玩家屏幕上已经显示出来的廷辩" if visible_only else "刚才整场廷辩"
-        guard = (
-            "严禁引用、推断或补充任何未列出的后续发言、后台历史、月度朝会历史或模型记忆；"
-            "不要让任何大臣继续奏对，不要使用 <<<臣:姓名>>> 分隔符。\n"
-            if visible_only else ""
-        )
-        body_fields = (
-            "1 已出现的主张；2 已出现的分歧；3 已出现的可行章程；4 仍需皇帝裁断之处。"
-            "若材料不足，就明确说材料尚不足，只归纳已见内容。"
-            if visible_only else
-            "1 今日主张；2 责任归属；3 阻力/风险；4 下一步可下旨的章程，"
-            "语气像司礼监/内阁把廷议结果呈给皇帝；正文不要分隔符、不要 JSON、不要旁白。"
-        )
-        option_rule = (
-            "options 给 1-2 个『继续追问/暂缓裁断/命某部补报』这类可执行方案。"
-            if visible_only else
-            "options 须 2-3 项且彼此互斥（选了一项即否定他项的路子），"
-        )
-        meta = ""
-        if configured_rounds is not None and actual_speech_count is not None and actual_speakers is not None:
-            meta = (
-                f"设置轮数：{configured_rounds}；实际发言段数：{actual_speech_count}；"
-                f"实际发言人：{'、'.join(actual_speakers)}。\n"
-            )
-        return (
-            f"【朝会结论】现在必须根据{source_label}给皇帝一个明确结论。"
-            f"{guard}"
-            f"先输出 120-220 字结论正文：须含 {body_fields}\n"
-            "正文之后，另起一行输出一个 <<DECISION>>{...}<<END>> JSON 块，"
-            "给皇帝 2-3 个可直接拍板的完整方案（不是结论摘要，也不是只言片语）：\n"
-            '{"title":"≤12字本场抉择名","context":"为何此刻必须皇帝亲断（30-60字）",'
-            '"options":[{"label":"完整可下旨的方案，须含谁来办、办什么、用什么资源/章程，能直接当圣旨正文用","hint":"此案倾向性后果，不写具体数值"}]}\n'
-            f"{option_rule}"
-            "label 必须是一句完整可执行的旨意（如「命户部即拨银十万两解陕赈灾，由毕自严督办，三月内回奏」），"
-            "不得是半句话、不得是「一、命...」这类编号片段、不得需要拼接前文才能懂。\n"
-            "若廷辩已有共识，options 给该方案及其一两个变体（轻重/缓急/经办人不同）；"
-            "若仍冲突，options 须覆盖各派真实主张，不得各打五十大板含糊带过。\n"
-            f"{meta}"
-            f"{'屏幕可见发言' if visible_only else '刚才廷辩'}：\n{debate_lines}"
-        )
-
-    def _run_court_conclusion(self, agent: Agent, prompt: str, runner: Any) -> Dict[str, Any]:
-        fallback = (
-            "本轮朝议虽未尽合，然争点已明：请陛下择一条主线定旨，并限期各部回奏。"
-            '\n<<DECISION>>{"title":"朝议未决","context":"群臣争执未休，需陛下亲断方向。",'
-            '"options":[{"label":"命内阁会同各部三日内拟出统一章程具奏，逾期问责","hint":"稳妥但费时，恐误事机"},'
-            '{"label":"陛下当殿点将拍板，责成一人专办，馀者协办","hint":"决断果敢，然恐压服不服，留下后患"}]}<<END>>'
-        )
-        conclusion_raw = runner(prompt) or fallback
-        parsed = self._parse_court_conclusion(conclusion_raw)
-        if not parsed["content"]:
-            parsed["content"] = "屏幕可见发言尚不足以形成完整朝议结论。"
-        return {
-            "type": "conclusion",
-            "role": "conclusion",
-            "speaker": "朝议结论",
-            "content": parsed["content"],
-            "options": parsed["options"],
-        }
-
-    def _active_court_ministers(self, requested: List[str]) -> List[Character]:
-        selected: List[Character] = []
-        seen: set[str] = set()
-        source_names = requested or [
-            c.name for c in self.content.characters.values()
-            if c.office_type != "后宫" and self.character_power_id(c) == "ming"
-        ]
-        for name in source_names:
-            c = self.content.characters.get(name)
-            if c is None or c.name in seen:
-                continue
-            if self.character_power_id(c) != "ming":
-                continue
-            status, _reason = self.db.get_character_status(c.name)
-            if status != "active":
-                continue
-            if not (c.office or "").strip():
-                continue
-            selected.append(c)
-            seen.add(c.name)
-        return selected
-
-    def court_chat_stream(self, message: str, ministers: List[str]) -> Iterator[Dict[str, Any]]:
-        text = message.strip()
-        if not text:
-            yield {"type": "error", "message": "朝会发言不能为空。"}
-            return
-        roster = self._active_court_ministers(ministers)
-        if not roster:
-            yield {"type": "error", "message": "朝堂当前没有可参与朝议的大臣。"}
-            return
-
-        history = self.db.load_court_chat_history(self.state.turn)
-        self.db.append_court_chat_message(self.state.turn, "emperor", "皇帝", text)
-        try:
-            simulator_payload = self._court_simulator_payload()
-            prompt = self._court_chat_payload(text, roster, history)
-            agent = self._court_chat_agent(simulator_payload)
-            allowed = {c.name for c in roster}
-            fallback_speaker = roster[0].name
-            replies: List[Dict[str, str]] = []
-            emitted_speakers: List[str] = []
-            current_role = "minister"
-            current_speaker = ""
-            current_content: List[str] = []
-            all_chunks: List[str] = []
-            delimiter_re = re.compile(r"<<<(臣|帝):([^>\n]+)>>+")
-            pending_text = ""
-            court_chat_delta_delay = max(0.0, float(os.environ.get("MING_COURT_CHAT_DELTA_DELAY", "0.09") or "0"))
-
-            def clean_court_chat_fragment(value: str) -> str:
-                text_value = re.sub(r"\s*<<<臣:[^>\n]+>>+\s*", "", str(value or ""))
-                text_value = re.sub(r"\s*<<<帝:[^>\n]+>>+\s*", "", text_value)
-                text_value = re.sub(r"^\s*>+\s*", "", text_value)
-                text_value = re.sub(r"\s*>+\s*$", "", text_value)
-                return text_value
-
-            def flush_text(text_part: str) -> Iterator[Dict[str, Any]]:
-                nonlocal current_role, current_speaker, current_content
-                text_part = clean_court_chat_fragment(text_part)
-                if not text_part:
-                    return
-                if not current_speaker:
-                    current_role = "minister"
-                    current_speaker = fallback_speaker
-                    yield {"type": "speaker", "role": current_role, "speaker": current_speaker}
-                chunk_size = 2
-                for start in range(0, len(text_part), chunk_size):
-                    chunk = text_part[start:start + chunk_size]
-                    if not chunk:
-                        continue
-                    current_content.append(chunk)
-                    yield {"type": "delta", "role": current_role, "speaker": current_speaker, "content": chunk}
-                    if court_chat_delta_delay:
-                        time.sleep(court_chat_delta_delay)
-
-            def finish_current() -> None:
-                nonlocal current_role, current_speaker, current_content
-                content = clean_court_chat_fragment("".join(current_content)).strip()
-                if current_speaker and content:
-                    replies.append({"role": current_role, "speaker": current_speaker, "content": content})
-                current_role = "minister"
-                current_speaker = ""
-                current_content = []
-
-            def emit_pending(force: bool = False) -> Iterator[Dict[str, Any]]:
-                """Parse minister delimiters incrementally without leaking delimiters as speech."""
-                nonlocal current_role, current_speaker, current_content, pending_text
-                while pending_text:
-                    match = delimiter_re.search(pending_text)
-                    if match:
-                        before = pending_text[:match.start()]
-                        if before:
-                            for item in flush_text(before):
-                                yield item
-                        finish_current()
-                        role_marker = match.group(1).strip()
-                        speaker = match.group(2).strip()
-                        current_role = "emperor" if role_marker == "帝" else "minister"
-                        current_speaker = "皇帝" if current_role == "emperor" else (speaker if speaker in allowed else fallback_speaker)
-                        current_content = []
-                        yield {"type": "speaker", "role": current_role, "speaker": current_speaker}
-                        pending_text = pending_text[match.end():]
-                        continue
-
-                    minister_marker = pending_text.find("<<<臣:")
-                    emperor_marker = pending_text.find("<<<帝:")
-                    marker_candidates = [idx for idx in (minister_marker, emperor_marker) if idx >= 0]
-                    marker_start = min(marker_candidates) if marker_candidates else -1
-                    if marker_start >= 0:
-                        if marker_start:
-                            before = pending_text[:marker_start]
-                            pending_text = pending_text[marker_start:]
-                            for item in flush_text(before):
-                                yield item
-                            continue
-                        if force:
-                            broken = pending_text
-                            pending_text = ""
-                            for item in flush_text(broken):
-                                yield item
-                        break
-
-                    keep = 5
-                    if force or len(pending_text) <= keep:
-                        if force:
-                            text_part = pending_text
-                            pending_text = ""
-                            for item in flush_text(text_part):
-                                yield item
-                        break
-                    emit_part = pending_text[:-keep]
-                    pending_text = pending_text[-keep:]
-                    for item in flush_text(emit_part):
-                        yield item
-
-            run_output = None
-            def record_court_stream_metrics(output: Any, tag: str) -> None:
-                if output is None:
-                    return
-                metrics = getattr(output, "metrics", None)
-                model_id = getattr(getattr(agent, "model", None), "id", None) or "stream"
-                record_stream_metrics(str(model_id), metrics, caller_tag=tag)
-
-            def run_court_prompt(run_prompt: str) -> Iterator[Dict[str, Any]]:
-                nonlocal pending_text, run_output
-                metrics_recorded = False
-                stream = agent.run(run_prompt, stream=True, stream_events=True, yield_run_output=True)
-                for event in stream:
-                    content = getattr(event, "content", None)
-                    event_name = getattr(event, "event", "")
-                    if event_name == "RunContent" and content:
-                        delta = str(content)
-                        all_chunks.append(delta)
-                        pending_text += delta
-                        for item in emit_pending():
-                            yield item
-                    if type(event).__name__ in ("RunOutput", "RunCompletedEvent"):
-                        run_output = event
-                        if not metrics_recorded:
-                            record_court_stream_metrics(run_output, "court-chat")
-                            metrics_recorded = True
-
-            def run_agent_text(run_prompt: str) -> str:
-                chunks: List[str] = []
-                text_run_output = None
-                metrics_recorded = False
-                stream = agent.run(run_prompt, stream=True, stream_events=True, yield_run_output=True)
-                for event in stream:
-                    content = getattr(event, "content", None)
-                    event_name = getattr(event, "event", "")
-                    if event_name == "RunContent" and content:
-                        chunks.append(str(content))
-                    if type(event).__name__ in ("RunOutput", "RunCompletedEvent"):
-                        text_run_output = event
-                        if not metrics_recorded:
-                            record_court_stream_metrics(text_run_output, "court-chat/conclusion")
-                            metrics_recorded = True
-                return "".join(chunks).strip()
-
-            def run_directed_speech(speaker: str, run_prompt: str) -> Iterator[Dict[str, Any]]:
-                nonlocal run_output
-                pieces: List[str] = []
-                metrics_recorded = False
-                emitted_speakers.append(speaker)
-                yield {"type": "speaker", "speaker": speaker}
-                stream = agent.run(run_prompt, stream=True, stream_events=True, yield_run_output=True)
-                for event in stream:
-                    content = getattr(event, "content", None)
-                    event_name = getattr(event, "event", "")
-                    if event_name == "RunContent" and content:
-                        delta = re.sub(r"\s*<<<臣:[^>\n]+>>+\s*", "", str(content))
-                        if not delta:
-                            continue
-                        pieces.append(delta)
-                        for start in range(0, len(delta), 4):
-                            yield {"type": "delta", "speaker": speaker, "content": delta[start:start + 4]}
-                    if type(event).__name__ in ("RunOutput", "RunCompletedEvent"):
-                        run_output = event
-                        if not metrics_recorded:
-                            record_court_stream_metrics(run_output, "court-chat")
-                            metrics_recorded = True
-                content = "".join(pieces).strip()
-                if not content and run_output is not None:
-                    content = re.sub(r"\s*<<<臣:[^>\n]+>>+\s*", "", extract_agent_text(run_output)).strip()
-                    if content:
-                        for start in range(0, len(content), 4):
-                            yield {"type": "delta", "speaker": speaker, "content": content[start:start + 4]}
-                if content:
-                    replies.append({"role": "minister", "speaker": speaker, "content": content})
-
-            drama_beats = [
-                {
-                    "name": "开场立场",
-                    "goal": "先亮出此人基于官署、派系和私利最自然的立场；若要得罪人，必须有职责或派系理由。",
-                    "move": "可开门见山，也可先避险再暗扣责任；不要为了热闹硬骂。",
-                },
-                {
-                    "name": "立场碰撞",
-                    "goal": "回应上一段具体话头。若对方敌派/异衙门/要自己担责，可以明驳；若同派或利益相近，就补台、转移矛头或加条件。",
-                    "move": "冲突方式按人物选择：明驳、暗讽、补台夺责、表面赞同实则设限、转锅地方/胥吏/敌派。",
-                },
-                {
-                    "name": "反咬自辩",
-                    "goal": "若本段人物被前文压责，就自辩或反咬；若未被压责，就替同派找台阶或把责任推向更安全对象。",
-                    "move": "允许承认小错换大局，或用账册、限期、具结把压力转给别人。",
-                },
-                {
-                    "name": "党争加压",
-                    "goal": "若人物所属派系与争点有关，把派系利益自然带入；不相关则不要硬扣党争帽子。",
-                    "move": "可借清查、台谏、旧案、阉党余波、东林清议、阁部争权来施压，但必须贴合人物立场。",
-                },
-                {
-                    "name": "章程逼宫",
-                    "goal": "提出或修正可执行章程，并让章程服务自己的官署/派系利益：谁出银、谁押发、谁查账、几日回奏、失败谁担责。",
-                    "move": "高能力者给细章程；低胆略者给模糊章程；低清廉者把查账范围避开自己的利益链。",
-                },
-                {
-                    "name": "最后冲突",
-                    "goal": "若仍未一致，基于本人物立场把冲突整理成皇帝可拍板的方案；若已有一致，就顺势收束但保留本派条件。",
-                    "move": "可以二择其一，也可以提出折中，但要看人物是否有能力和胆略承担。",
-                },
-            ]
-
-            game_settings = load_runtime_game()
-            configured_rounds = max(1, min(8, int(game_settings.get("court_chat_debate_rounds", 3) or 3)))
-            target_min_speeches = max(len(roster), configured_rounds * max(3, min(len(roster), 6)))
-            target_max_speeches = max(target_min_speeches + min(len(roster), 6), len(roster) + configured_rounds * 4)
-            script_prompt = (
-                "【朝会整场剧本】\n"
-                f"{prompt}\n"
-                f"本局设置为 {configured_rounds} 轮交锋，目标约 {target_min_speeches}-{target_max_speeches} 段。\n"
-                f"在场大臣：{'、'.join(c.name for c in roster)}。\n"
-                "请靠提示词范例里的默会知识排一整场廷议：谁发难、谁打断、谁回嘴、谁暗伤、谁补台、谁逼皇帝裁断，由你按人物画像和盘面决定。\n"
-                "所有被召入大臣都应参与；至少两人要二次发言形成回嘴。若皇帝发言含【皇帝插话，打断当前廷议并扭转话题】，立刻围绕新御问转向。\n"
-                "不要替皇帝写台词；不要输出分析或旁白；不要输出朝议结论。只按 <<<臣:姓名>>> 分隔符输出群臣台词。"
-            )
-
-            for item in run_court_prompt(script_prompt):
-                yield item
-            for item in emit_pending(force=True):
-                yield item
-            finish_current()
-
-            _dump_llm_messages(run_output, "朝会聊天室", agent=agent)
-            if not replies:
-                yield {"type": "error", "message": "朝会未能形成有效廷辩，请换一组大臣或重试。"}
-                return
-            missing_speakers = [c.name for c in roster if c.name not in {r["speaker"] for r in replies}]
-            if missing_speakers:
-                append_prompt = (
-                    "【朝会补场】刚才整场剧本漏掉了部分已召入朝会的大臣。"
-                    "请只让这些缺席者各补一段，接住前文火候，像临场插话，不要像独立奏疏。"
-                    "只按 <<<臣:姓名>>> 输出台词，不要结论或旁白。\n"
-                    f"缺席大臣：{'、'.join(missing_speakers)}。\n"
-                    f"近期廷辩：\n" + "\n".join(f"{r['speaker']}：{r['content']}" for r in replies[-10:])
-                )
-                pending_text = ""
-                for item in run_court_prompt(append_prompt):
-                    yield item
-                for item in emit_pending(force=True):
-                    yield item
-                finish_current()
-            for reply in replies:
-                self.db.append_court_chat_message(
-                    self.state.turn,
-                    reply["role"],
-                    reply["speaker"],
-                    reply["content"],
-                )
-                yield {"type": "reply", **reply}
-            debate_lines = "\n".join(f"{r['speaker']}：{r['content']}" for r in replies[-18:])
-            conclusion_prompt = self._court_conclusion_prompt(
-                debate_lines,
-                configured_rounds=configured_rounds,
-                actual_speech_count=len(replies),
-                actual_speakers=list(dict.fromkeys(r["speaker"] for r in replies)),
-            )
-            conclusion_item = self._run_court_conclusion(agent, conclusion_prompt, run_agent_text)
-            self.db.append_court_chat_message(self.state.turn, "conclusion", "朝议结论", conclusion_item["content"])
-            yield conclusion_item
-            yield {"type": "done", "payload": self.court_chat_history_payload()}
-            return
-        except Exception as error:
-            if isinstance(error, LLMUnavailable):
-                yield {"type": "error", "detail": _llm_error_detail(error)}
-            else:
-                yield {"type": "error", "message": str(error)}
-
-    def court_chat_summary(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        visible_lines: List[str] = []
-        for message in messages[-40:]:
-            role = str(message.get("role") or "")
-            speaker = str(message.get("speaker") or "").strip() or ("皇帝" if role == "emperor" else "未知")
-            content = str(message.get("content") or "").strip()
-            if not content:
-                continue
-            if role not in {"emperor", "minister", "conclusion"}:
-                continue
-            visible_lines.append(f"{speaker}：{content}")
-        if not visible_lines:
-            raise HTTPException(status_code=400, detail="当前屏幕没有可总结的朝会内容。")
-
-        simulator_payload = self._court_simulator_payload()
-        agent = self._court_chat_agent(simulator_payload)
-        prompt = self._court_conclusion_prompt("\n".join(visible_lines), visible_only=True)
-
-        def run_visible_summary(run_prompt: str) -> str:
-            run_output = agent.run(run_prompt)
-            _dump_llm_messages(run_output, "朝会可见总结", agent=agent)
-            return extract_agent_text(run_output).strip()
-
-        conclusion_item = self._run_court_conclusion(agent, prompt, run_visible_summary)
-        self.db.append_court_chat_message(self.state.turn, "conclusion", "朝议结论", conclusion_item["content"])
-        return {
-            "role": "conclusion",
-            "speaker": "朝议结论",
-            "content": conclusion_item["content"],
-            "options": conclusion_item["options"],
-        }
 
     def suggestions_for(self, character: Character) -> List[Dict[str, str]]:
         suggestions = [
@@ -1943,20 +1212,14 @@ class WebGame:
             {"label": "拟旨", "text": "拟旨如下：", "prefix": True},
             {"label": "下密令", "text": "密令如下：", "prefix": True},
         ]
-        extra_suggestions: List[Dict[str, str]] = []
-        runtime_ids = {item["id"] for item in self._runtime_skill_payloads(character)}
-        # office 专属快捷话术 chip 走 offices.court_grant_json(DB 唯一真相，seed 自 skills.json)，
-        # 固定开头话术硬触发对应 agno skill。加新 office chip 改 JSON 升版本，运行时改直接 UPDATE DB。
-        _grant = self.db.get_office_court_grant(character.office_type)
-        for chip in (_grant.get("chips") or []):
-            extra_suggestions.append(dict(chip))
-        if "check_treasury" in runtime_ids:
-            extra_suggestions.append({"label": "查钱粮", "text": "太仓和内库实数如何？本月哪些钱最急？"})
-        if "query_army_roster" in runtime_ids:
-            extra_suggestions.append({"label": "查驻军", "text": "查一下关宁军、京营和陕西边军的士气、欠饷与补给。"})
-        if "secret_order" in runtime_ids:
-            extra_suggestions.append({"label": "密查", "text": "哪些账册和人物最该先密查？"})
-        return suggestions + extra_suggestions
+        skill_ids = set(available_skill_ids(character, self.db))
+        if "check_treasury" in skill_ids:
+            suggestions.insert(1, {"label": "查钱粮", "text": "太仓和内库实数如何？本月哪些钱最急？"})
+        if "check_military" in skill_ids or "front_line_plan" in skill_ids or "strategic_review" in skill_ids:
+            suggestions.insert(1, {"label": "查驻军", "text": "查一下关宁军、京营和陕西边军的士气、欠饷与补给。"})
+        if "secret_investigation" in skill_ids:
+            suggestions.insert(1, {"label": "密查", "text": "哪些账册和人物最该先密查？"})
+        return suggestions[:6]
 
 
 def sse_event(event: str, data: Dict[str, Any]) -> str:
@@ -2182,54 +1445,6 @@ async def api_menu_delete_save(name: str) -> Dict[str, Any]:
     return {"saves": _scan_saves(), "campaigns": _scan_campaigns()}
 
 
-@app.get("/api/menu/debug/launcher_log")
-async def api_menu_debug_launcher_log() -> Dict[str, Any]:
-    """主菜单调试：读取 launcher.log 最近内容，便于 .app 双击模式排障。"""
-    data_dir = user_data_dir()
-    log_path = data_dir / "launcher.log"
-    if not log_path.exists():
-        return {
-            "data_dir": str(data_dir),
-            "log_path": str(log_path),
-            "exists": False,
-            "content": "",
-        }
-    max_bytes = 120_000
-    with open(log_path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        if size > max_bytes:
-            f.seek(-max_bytes, os.SEEK_END)
-            raw = f.read()
-            content = raw.decode("utf-8", errors="replace")
-            content = f"（仅显示最近 {max_bytes} 字节，完整日志见文件）\n\n{content}"
-        else:
-            f.seek(0)
-            content = f.read().decode("utf-8", errors="replace")
-    return {
-        "data_dir": str(data_dir),
-        "log_path": str(log_path),
-        "exists": True,
-        "content": content,
-    }
-
-
-@app.post("/api/menu/debug/open_data_dir")
-async def api_menu_debug_open_data_dir() -> Dict[str, Any]:
-    """用系统文件管理器打开用户数据/存档目录。"""
-    data_dir = user_data_dir()
-    try:
-        if os.name == "nt":
-            os.startfile(str(data_dir))  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(data_dir)])
-        else:
-            subprocess.Popen(["xdg-open", str(data_dir)])
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"打开目录失败：{exc}")
-    return {"ok": True, "data_dir": str(data_dir)}
-
-
 @app.post("/api/menu/exit_to_menu")
 async def api_menu_exit() -> Dict[str, Any]:
     """退回菜单：关 session 但不删 DB。"""
@@ -2359,14 +1574,8 @@ async def api_menu_save_llm(request: LlmSetupRequest) -> Dict[str, Any]:
 
 
 class GameSettingsRequest(BaseModel):
-    # HITL 每回合最多决策点数，0-5。0=关闭 HITL 注入。
+    # HITL 每回合最少决策点数，0-5。0=不强制（宁缺毋滥）。
     hitl_min_decisions: int = 1
-    # 朝会聊天室 ReAct 交锋轮数，未形成结论前继续驱动 agent；默认 3。
-    court_chat_debate_rounds: int = 3
-    # decree 来源 active 局势同时进行上限；默认 10，调高增加推演 token 消耗。
-    max_decree_issues: int = 10
-    # 每条 active 局势注入推演的最近推进日志条数。0=不带推进日志。
-    issue_log_limit: int = 6
 
 
 @app.get("/api/menu/game_settings")
@@ -2378,19 +1587,13 @@ async def api_menu_game_settings() -> Dict[str, Any]:
 @app.post("/api/menu/game_settings")
 async def api_menu_save_game_settings(request: GameSettingsRequest) -> Dict[str, Any]:
     """保存全局玩法设置（runtime_game.json）。立即对下一回合推演生效。"""
-    saved = save_runtime_game(
-        request.hitl_min_decisions,
-        request.court_chat_debate_rounds,
-        request.max_decree_issues,
-        request.issue_log_limit,
-    )
+    saved = save_runtime_game(request.hitl_min_decisions)
     return {"ok": True, "game_settings": saved}
 
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2407,282 +1610,6 @@ async def api_secret_orders(status: str = "") -> Dict[str, Any]:
     """列出密令。status 为空返回全部，否则按 active/done/failed 过滤。"""
     orders = get_game().db.list_secret_orders(status=status or None)
     return {"orders": orders}
-
-
-@app.delete("/api/secret_orders/{order_id}")
-async def api_delete_secret_order(order_id: int) -> Dict[str, Any]:
-    """删除一条密令记录（清掉重复/误下的密令）。"""
-    ok = get_game().db.delete_secret_order(order_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"未找到密令 #{order_id}")
-    print(f"[secret_order/api] 删除密令 id={order_id}")
-    return {"deleted": True, "order_id": order_id}
-
-
-class ManualIssueEntity(BaseModel):
-    """走满 100 落成的实体固定字段（玩家在前端按题材填）。kind ∈ building/department/technology。"""
-    kind: str = ""               # building / department / technology
-    name: str = ""               # 实体名（不填则用局势标题）
-    # 建筑用：
-    region_id: str = ""          # 所在省份（玩家下拉选）
-    category: str = "民生"        # 建筑类别：财政/军事/民生/科技/交通/内廷
-    maintenance: int = 1         # 月维护费（万两）
-    output_metric: str = ""      # 产出去向（可空）
-    output_amount: int = 0       # 产出量
-    # 部门用：
-    authority_scope: str = ""    # 职权范围
-    power: int = 50              # 权力值
-    # 科技用：
-    effect_summary: str = ""     # 效果摘要
-    # 预设池用：kind=department/technology 时可传 key，后端会用预设字段覆盖立项字段。
-    preset_key: str = ""
-
-
-class ManualIssueCreateRequest(BaseModel):
-    # 名称（局势标题），必填。
-    title: str = ""
-    # 持续回合数；0=无硬期限，>0 到期自动撤销（无奖励）。
-    duration_turns: int = 0
-    # 目标：皇帝给该局势定的方向意图，喂给推演逐月推进。立项后锁定不可改。
-    goal: str = ""
-    # 分类（题材），落 tags；与 ISSUE_THEMES 对齐。
-    tags: list[str] = []
-    # 走满后落成的实体固定字段（玩家填）。组装成 effect_on_resolve 立项即预埋，走满直接落地。
-    entity: Optional[ManualIssueEntity] = None
-
-
-class ManualIssueUpdateRequest(BaseModel):
-    # 注意：goal 立项后锁定，不在此可改。
-    title: Optional[str] = None
-    duration_turns: Optional[int] = None
-
-
-def _build_manual_resolve_effect(entity: "ManualIssueEntity | None", title: str) -> dict:
-    """把玩家填的实体固定字段组装成 effect_on_resolve（走满 100 时由结算链落实体）。
-    建筑→buildings、部门→departments、科技→technologies。entity 空或 kind 不识别则返回 {}。"""
-    if entity is None or not str(entity.kind or "").strip():
-        return {}
-    name = (entity.name or "").strip() or title[:60]
-    k = str(entity.kind).strip().lower()
-    if k == "building":
-        cat = entity.category if entity.category in BUILDING_CATEGORIES else "民生"
-        return {"buildings": [{
-            "action": "create", "region_id": (entity.region_id or "").strip(),
-            "name": name, "category": cat,
-            "maintenance": max(0, int(entity.maintenance or 0)),
-            "output_metric": (entity.output_metric or "").strip(),
-            "output_amount": max(0, int(entity.output_amount or 0)),
-        }]}
-    if k == "department":
-        preset_key = (entity.preset_key or "").strip()
-        if preset_key:
-            return {"departments": [{"action": "create", "key": preset_key}]}
-        return {"departments": [{
-            "action": "create", "name": name,
-            "authority_scope": (entity.authority_scope or "").strip(),
-            "power": max(0, min(100, int(entity.power or 50))),
-        }]}
-    if k == "technology":
-        preset_key = (entity.preset_key or "").strip()
-        if preset_key:
-            return {"technologies": [{"action": "create", "key": preset_key}]}
-        return {"technologies": [{
-            "action": "create", "name": name, "category": "科技",
-            "effect_summary": (entity.effect_summary or "").strip(),
-        }]}
-    return {}
-
-
-def _technology_names_by_preset_key(game: "WebGame") -> dict[str, str]:
-    return {key: preset.name for key, preset in game.content.preset_technologies.items()}
-
-
-def _unlocked_preset_technology_keys(game: "WebGame") -> set[str]:
-    names_by_key = _technology_names_by_preset_key(game)
-    rows = game.db.conn.execute("SELECT id, name FROM technologies").fetchall()
-    unlocked: set[str] = set()
-    for row in rows:
-        raw_id = str(row["id"] or "")
-        if raw_id.startswith("preset_"):
-            unlocked.add(raw_id.removeprefix("preset_"))
-        nm = str(row["name"] or "")
-        for key, name in names_by_key.items():
-            if nm == name:
-                unlocked.add(key)
-    return unlocked
-
-
-def _unlocked_preset_department_keys(game: "WebGame") -> set[str]:
-    rows = game.db.conn.execute("SELECT office_type FROM offices").fetchall()
-    office_names = {str(row["office_type"] or "") for row in rows}
-    return {
-        key
-        for key, preset in game.content.preset_departments.items()
-        if preset.name in office_names
-    }
-
-
-def _preset_tree_payload(game: "WebGame") -> dict:
-    tech_unlocked = _unlocked_preset_technology_keys(game)
-    dept_unlocked = _unlocked_preset_department_keys(game)
-
-    def tech_item(key: str, preset: Any) -> dict:
-        reqs = list(getattr(preset, "requires", []) or [])
-        return {
-            "key": key,
-            "name": preset.name,
-            "category": preset.category,
-            "effect_summary": preset.effect_summary,
-            "expected_months": preset.expected_months,
-            "bar_value": preset.bar_value,
-            "requires": reqs,
-            "unlocked": key in tech_unlocked,
-            "available": all(req in tech_unlocked for req in reqs),
-        }
-
-    def dept_item(key: str, preset: Any) -> dict:
-        reqs = list(getattr(preset, "requires", []) or [])
-        return {
-            "key": key,
-            "name": preset.name,
-            "category": preset.category,
-            "effect_summary": preset.effect_summary,
-            "authority_scope": preset.authority_scope,
-            "power": preset.power,
-            "expected_months": preset.expected_months,
-            "bar_value": preset.bar_value,
-            "requires": reqs,
-            "unlocked": key in dept_unlocked,
-            "available": all(req in dept_unlocked for req in reqs),
-        }
-
-    return {
-        "technologies": [tech_item(k, p) for k, p in game.content.preset_technologies.items()],
-        "departments": [dept_item(k, p) for k, p in game.content.preset_departments.items()],
-    }
-
-
-def _manual_preset_override(game: "WebGame", entity: "ManualIssueEntity | None") -> dict:
-    if entity is None:
-        return {}
-    kind = str(entity.kind or "").strip().lower()
-    key = str(entity.preset_key or "").strip()
-    if not key:
-        return {}
-    if kind == "technology":
-        preset = game.content.preset_technologies.get(key)
-        if preset is None:
-            raise HTTPException(status_code=400, detail=f"未知预设科技：{key}")
-        unlocked = _unlocked_preset_technology_keys(game)
-        if key in unlocked:
-            raise HTTPException(status_code=400, detail=f"科技「{preset.name}」已经研成。")
-        missing = [game.content.preset_technologies[r].name for r in preset.requires if r not in unlocked and r in game.content.preset_technologies]
-        if missing:
-            raise HTTPException(status_code=400, detail=f"前置科技未完成：{'、'.join(missing)}。")
-        return {
-            "title": preset.name,
-            "tags": [preset.theme],
-            "bar_value": preset.bar_value,
-            "stage_text": preset.stage_text,
-            "resolve_condition": preset.resolve_condition,
-            "fail_condition": preset.fail_condition,
-            "effect_on_resolve": dict(preset.effect_on_resolve),
-            "effect_on_fail": dict(preset.effect_on_fail),
-            "goal": preset.resolve_condition,
-        }
-    if kind == "department":
-        preset = game.content.preset_departments.get(key)
-        if preset is None:
-            raise HTTPException(status_code=400, detail=f"未知预设衙门：{key}")
-        unlocked = _unlocked_preset_department_keys(game)
-        if key in unlocked:
-            raise HTTPException(status_code=400, detail=f"衙门「{preset.name}」已经设立。")
-        missing = [game.content.preset_departments[r].name for r in preset.requires if r not in unlocked and r in game.content.preset_departments]
-        if missing:
-            raise HTTPException(status_code=400, detail=f"前置衙门未设立：{'、'.join(missing)}。")
-        return {
-            "title": preset.name,
-            "tags": [preset.theme],
-            "bar_value": preset.bar_value,
-            "stage_text": preset.stage_text,
-            "resolve_condition": preset.resolve_condition,
-            "fail_condition": preset.fail_condition,
-            "effect_on_resolve": dict(preset.effect_on_resolve),
-            "effect_on_fail": dict(preset.effect_on_fail),
-            "goal": preset.resolve_condition,
-        }
-    raise HTTPException(status_code=400, detail="预设 key 仅支持科技或政治衙门。")
-
-
-@app.post("/api/issues/manual")
-async def api_create_manual_issue(request: ManualIssueCreateRequest) -> Dict[str, Any]:
-    """皇帝手动新建一条 decree 局势。按题材填的实体固定字段立项即预埋进 effect_on_resolve，
-    走满 100 直接落成该实体（建筑/部门/科技），不依赖大模型现填。goal 立项后锁定不可改。"""
-    game = get_game()
-    preset_override = _manual_preset_override(game, request.entity)
-    title = str(preset_override.get("title") or request.title).strip()
-    if not title:
-        raise HTTPException(status_code=400, detail="名称（标题）不能为空")
-    max_n = int(load_runtime_game().get("max_decree_issues", 10))
-    cur = game.db.count_active_decree_issues()
-    if cur >= max_n:
-        raise HTTPException(
-            status_code=409,
-            detail=f"decree 来源局势已达上限（{max_n} 条），请先撤销部分局势，或在主菜单游戏设置调高上限。当前：{cur} 条。",
-        )
-    tags = [str(t).strip() for t in (preset_override.get("tags") or request.tags or []) if str(t).strip()]
-    resolve_effect = dict(preset_override.get("effect_on_resolve") or _build_manual_resolve_effect(request.entity, title))
-    # 建筑预埋校验省份：玩家选的 region_id 必须是大明控制的省（不能建到外部势力地盘）。
-    bld = (resolve_effect.get("buildings") or [{}])[0] if resolve_effect.get("buildings") else None
-    if bld is not None:
-        rid = str(bld.get("region_id") or "").strip()
-        row = game.db.conn.execute("SELECT controlled_by FROM regions WHERE id=?", (rid,)).fetchone() if rid else None
-        if row is None:
-            raise HTTPException(status_code=400, detail=f"请为该建筑选择一个有效省份（当前：{rid or '未选'}）。")
-        if str(row["controlled_by"]) != "ming":
-            raise HTTPException(status_code=400, detail="只能在大明控制的省份营建，不能建到外部势力地盘。")
-    issue_id = game.db.insert_issue(
-        game.session.state,
-        kind="situation",
-        title=title[:60],
-        origin_kind="decree",
-        origin_ref="manual",
-        bar_value=int(preset_override.get("bar_value") or 40),
-        stage_text=str(preset_override.get("stage_text") or title)[:160],
-        tags=tags,
-        cancellable="decree",
-        effect_on_resolve=resolve_effect,
-        effect_on_fail=dict(preset_override.get("effect_on_fail") or {}),
-        resolve_condition=str(preset_override.get("resolve_condition") or ""),
-        fail_condition=str(preset_override.get("fail_condition") or ""),
-        is_manual=True,
-        duration_turns=max(0, int(request.duration_turns or 0)),
-        goal=str(request.goal or preset_override.get("goal") or "").strip(),
-    )
-    print(f"[issue/api] 手动新建局势 id={issue_id} title={title!r} tags={tags} 预埋effect={resolve_effect}")
-    return {"id": issue_id, "title": title, "duration_turns": max(0, int(request.duration_turns or 0))}
-
-
-@app.patch("/api/issues/manual/{issue_id}")
-async def api_update_manual_issue(issue_id: int, request: ManualIssueUpdateRequest) -> Dict[str, Any]:
-    """改手动 decree 局势：名称 / 持续回合数。goal 立项后锁定，不可改。"""
-    ok = get_game().db.update_manual_issue(
-        issue_id, title=request.title, duration_turns=request.duration_turns
-    )
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"未找到可改的手动局势 #{issue_id}（仅手动新建且进行中的可改）")
-    print(f"[issue/api] 改手动局势 id={issue_id} title={request.title!r} duration={request.duration_turns}")
-    return {"updated": True, "id": issue_id}
-
-
-@app.delete("/api/issues/manual/{issue_id}")
-async def api_delete_manual_issue(issue_id: int) -> Dict[str, Any]:
-    """删除手动 decree 局势（仅手动新建的可删）。"""
-    ok = get_game().db.delete_manual_issue(issue_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"未找到可删的手动局势 #{issue_id}（仅手动新建的可删）")
-    print(f"[issue/api] 删除手动局势 id={issue_id}")
-    return {"deleted": True, "id": issue_id}
 
 
 @app.get("/api/turn_extraction")
@@ -2782,6 +1709,7 @@ async def api_chat_history(minister_name: str) -> Dict[str, Any]:
         "minister": get_game().public_character(character),
         "history": get_game().chat_history.get(minister_name, []),
         "suggestions": get_game().suggestions_for(character),
+        "can_undo_last_chat": get_game().can_undo_last_chat(minister_name),
     }
 
 
@@ -2801,10 +1729,15 @@ async def api_create_secret_order(minister_name: str, request: SecretOrderReques
     if not title or not content:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="title 和 content 不能为空")
+    # 直接下达=显式新建一道密令（create，非 upsert）：皇帝点「下密令」按钮给确切 title+content
+    # 就是要一道新令，同大臣可有多条 active；upsert 会静默覆盖最新 active 那条（codexC-2）。
+    # 「更新已有密令」走会话路径(LLM 判意图 → update_secret_order_by_id 精确改)，不在此端点。
     order_id = game.db.create_secret_order(
         game.session.state, minister_name, title, content, request.tags, deadline_months=request.deadline_months
     )
-    print(f"[secret_order/api] 直接落库 minister={minister_name} title={title!r} id={order_id}")
+    if game.session.registry is not None:
+        game.session.registry.refresh(minister_name)  # 上下文带上最新密令
+    print(f"[secret_order/api] 新建 minister={minister_name} title={title!r} id={order_id}")
     return {"order_id": order_id, "minister_name": minister_name, "title": title, "status": "active"}
 
 
@@ -2812,6 +1745,11 @@ async def api_create_secret_order(minister_name: str, request: SecretOrderReques
 async def api_chat(minister_name: str, request: ChatRequest) -> Dict[str, Any]:
     _require_active_minister(minister_name)
     return get_game().chat(minister_name, request.message)
+
+
+@app.post("/api/ministers/{minister_name}/chat/undo")
+async def api_undo_chat(minister_name: str) -> Dict[str, Any]:
+    return get_game().undo_last_chat(minister_name)
 
 
 @app.post("/api/ministers/{minister_name}/chat/stream")
@@ -2829,65 +1767,6 @@ async def api_chat_stream(minister_name: str, request: ChatRequest) -> Streaming
             await asyncio.sleep(0)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-@app.post("/api/ministers/{minister_name}/chat/undo")
-async def api_chat_undo(minister_name: str) -> Dict[str, Any]:
-    return get_game().undo_last_chat(minister_name)
-
-
-@app.get("/api/court_chat")
-async def api_court_chat_history() -> Dict[str, Any]:
-    return get_game().court_chat_history_payload()
-
-
-@app.post("/api/court_chat/stream")
-async def api_court_chat_stream(request: CourtChatRequest) -> StreamingResponse:
-    game = get_game()
-    async def generate() -> AsyncIterator[str]:
-        for item in game.court_chat_stream(request.message, request.ministers):
-            item_type = str(item.get("type", "message"))
-            if item_type == "reply":
-                yield sse_event("reply", {
-                    "role": item.get("role", "minister"),
-                    "speaker": item.get("speaker", ""),
-                    "content": item.get("content", ""),
-                })
-            elif item_type == "conclusion":
-                yield sse_event("conclusion", {
-                    "role": "conclusion",
-                    "speaker": item.get("speaker", "朝议结论"),
-                    "content": item.get("content", ""),
-                    "options": item.get("options", []),
-                })
-            elif item_type == "speaker":
-                yield sse_event("speaker", {"speaker": item.get("speaker", "")})
-            elif item_type == "delta":
-                yield sse_event("delta", {
-                    "speaker": item.get("speaker", ""),
-                    "content": item.get("content", ""),
-                })
-            elif item_type == "done":
-                yield sse_event("done", item.get("payload", {}))
-            elif item_type == "error":
-                yield sse_event("error", item.get("detail") or {"message": item.get("message", "朝会回复失败。")})
-            await asyncio.sleep(0)
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-@app.post("/api/court_chat")
-async def api_court_chat_stream_alias(request: CourtChatRequest) -> StreamingResponse:
-    return await api_court_chat_stream(request)
-
-
-@app.post("/api/court_chat/summary")
-async def api_court_chat_summary(request: CourtChatSummaryRequest) -> Dict[str, Any]:
-    messages = [
-        {"role": m.role, "speaker": m.speaker, "content": m.content}
-        for m in request.messages
-    ]
-    return get_game().court_chat_summary(messages)
 
 
 @app.post("/api/directives")
@@ -2940,15 +1819,10 @@ async def api_reject_directive(directive_id: int) -> Dict[str, Any]:
     }
 
 
-class WriteDecreeRequest(BaseModel):
-    force: bool = False
-
-
 @app.post("/api/decree/write")
-async def api_write_decree(request: WriteDecreeRequest = WriteDecreeRequest()) -> Dict[str, Any]:
+async def api_write_decree() -> Dict[str, Any]:
     try:
-        existing = (get_game().session.last_decree or "").strip()
-        decree = get_game().session.write_decree() if request.force or not existing else existing
+        decree = get_game().session.write_decree()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
     return {"decree": decree}

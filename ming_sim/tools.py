@@ -55,7 +55,7 @@ def build_minister_tools(character: Character, context: CourtContext,
         """查在朝人事名册。names 为空返回全部姓名+状态索引；传姓名列表返回指定人物详情（现职/官署/派系/状态）。"""
         db = context.db
         results = []
-        for c in _ctx().characters.values():
+        for c in _content_ctx().characters.values():
             if c.office_type == "后宫":
                 continue
             if getattr(c, "power_id", "ming") != "ming":
@@ -241,30 +241,13 @@ def build_minister_tools(character: Character, context: CourtContext,
             t = 6
         return context.db.treasury_ledger(acc, t)
 
-    def adjust_tax(tax: str, ratio: float, region: str = "", reason: str = "") -> str:
-        """户部奏请调整税额，立为一道可追踪调税事项（issue）。
-        非即时改账：事项进度推到满才落库，推演期间会被士绅抗税/有司阳奉顶回——加征越狠越难磨平。
-        tax 须为 田赋/辽饷/盐税/商税 之一；
-        ratio 为新额倍率：1.0=不变，1.3=加三成，0.7=减三成，0=罢废该税；
-        region 留空=全国一律，填省名（如「南直隶」「浙江」）=仅该省定向调，保住省间税差；
-        reason 为调税缘由。皇庄/田亩量级走后台，不在此 tool。"""
-        tx = (tax or "").strip()
-        if tx not in ("田赋", "辽饷", "盐税", "商税"):
-            return f"调税失败：税种须为 田赋/辽饷/盐税/商税 之一，收到「{tx}」。"
-        try:
-            r = float(ratio)
-        except (TypeError, ValueError):
-            return f"调税失败：倍率须为数字，收到「{ratio}」。"
-        if r < 0:
-            return "调税失败：倍率不能为负（0=罢废，1.0=不变）。"
-        import json as _json
-        payload = _json.dumps(
-            {"tax": tx, "ratio": r,
-             "region": (region or "").strip(),
-             "reason": (reason or "").strip()},
-            ensure_ascii=False,
-        )
-        return f"__adjust_tax__{payload}"
+    def audit_tax_arrears(target: str = "各省积欠") -> str:
+        """清查积欠、估算可追收入库。"""
+        return skill_template("audit_tax_arrears", target=target)
+
+    def allocate_payroll(target: str = f"本{TURN_UNIT}急需钱粮处") -> str:
+        """核算军饷调度。"""
+        return skill_template("allocate_payroll", target=target)
 
     def propose_directive(decree_text: str) -> str:
         """把已定处置方案拟成一道圣旨草稿呈给皇帝审阅。decree_text 为完整圣旨正文。"""
@@ -351,7 +334,6 @@ def build_minister_tools(character: Character, context: CourtContext,
     ) -> str:
         """密令统一入口。action 取值：
         - "issue"：下达新密令。需填 title、content；assignee 留空默认当前大臣；deadline_months=0 无硬限。
-                  限制：不得重复下同一道密令；一个承办人同一时间只能有一条进行中密令；全朝进行中密令最多 5 条。
         - "progress"：汇报进展（兼查历史）。填 order_id；progress 非空且本月未推进则落档。
         - "submit"：提交结案。填 order_id、claim（办结陈词200字内）。
         - "rush"：催办加急。填 order_id；deadline_months=1 下月核议，0=本月即核。
@@ -510,18 +492,10 @@ def build_minister_tools(character: Character, context: CourtContext,
         tools.append(query_court_roster)
     if use_army_tool:
         tools.append(query_army_roster)
-    # office 专属 court tool 授权走 skills.json office_default_skills[office].court_tools，
-    # 加新 office / 改授权只改 JSON，不改这里。present_consort_candidates 在 registry 单独挂，不在此表生效。
-    _COURT_TOOL_FUNCS = {
-        "propose_appointment": propose_appointment,
-        "check_treasury": check_treasury,
-        "adjust_tax": adjust_tax,
-    }
-    grant = context.db.get_office_court_grant(character.office_type)
-    for tool_name in (grant.get("court_tools") or []):
-        fn = _COURT_TOOL_FUNCS.get(tool_name)
-        if fn is not None:
-            tools.append(fn)
+    if character.office_type == "吏部":
+        tools.append(propose_appointment)
+    if character.office_type in ("户部", "内阁", "司礼监"):
+        tools.extend([check_treasury, allocate_payroll, audit_tax_arrears])
     unique_tools = []
     seen_tool_names: set = set()
     for tool in tools:
@@ -558,17 +532,15 @@ def build_board_query_tools(context: CourtContext):
         return context.db.region_report(limit=8)
 
     def inspect_region(region: str) -> str:
-        """查某一地区详细数值：public_support/unrest/grain_output/grain_stock/gentry_resistance/
+        """查某一地区详细数值：public_support/unrest/grain_security/gentry_resistance/
         military_pressure/corruption/population/registered_land/hidden_land/tax_per_turn/status。
         region 可传地区名（如"陕西"）或 region_id（如"shaanxi"），两者均支持。"""
         try:
             return context.db.region_detail(region)
         except ValueError:
             row = context.db.conn.execute(
-                "SELECT id,name,public_support,unrest,gentry_resistance,"
+                "SELECT id,name,public_support,unrest,grain_security,gentry_resistance,"
                 "military_pressure,json_extract(fiscal,'$.corruption') as corruption,"
-                "json_extract(fiscal,'$.grain_output') as grain_output,"
-                "json_extract(fiscal,'$.grain_stock') as grain_stock,"
                 "population,registered_land,hidden_land,tax_per_turn,status "
                 "FROM regions WHERE id=?", (region,)
             ).fetchone()
@@ -577,24 +549,19 @@ def build_board_query_tools(context: CourtContext):
             return str(dict(row))
 
     def list_armies() -> str:
-        """查看大明主要军队的驻扎、维护费、补给、士气和欠饷警讯。"""
+        """查看大明主要军队的驻扎、维护费、补给、士气、火器、随军大炮和欠饷警讯。"""
         return context.db.army_report(limit=8)
 
     def inspect_army(army: str) -> str:
-        """查某支军队详细数值：补给/士气/训练/装备/欠饷/机动/忠诚/
-        人数/维护费/驻地/统帅/主管/兵种/状态。
-        army 可传军队名（如"关宁军"）或 army_id（如"guanning"），两者均支持。"""
+        """查某支军队详细数值：supply/morale/training/equipment/firearm_equipment/cannon_equipment/
+        arrears/mobility/loyalty/manpower/maintenance_per_turn/station/commander/controller/troop_type/status。
+        army 可传军队名（如"关宁军"）或 army_id（如"guanning"），两者均支持；动态新建军同样可查。"""
+        # army_detail 已统一按 DB id/name 直查 + 静态别名兜底 + SELECT* 渲染(含火器/随军大炮)，
+        # 直接复用，不再各写一份窄 SELECT fallback（CMR codexB/C：army render 单一真源）。
         try:
             return context.db.army_detail(army)
         except ValueError:
-            row = context.db.conn.execute(
-                "SELECT id,name,station,commander,controller,troop_type,manpower,"
-                "maintenance_per_turn,supply,morale,training,equipment,arrears,mobility,loyalty,status "
-                "FROM armies WHERE id=?", (army,)
-            ).fetchone()
-            if row is None:
-                return f"未找到军队 {army!r}。可先调 list_armies 查名称/id 列表。"
-            return str(dict(row))
+            return f"未找到军队 {army!r}。可先调 list_armies 查名称/id 列表。"
 
     def list_powers() -> str:
         """查看后金、蒙古、朝鲜、日本、流寇等势力当前态势（leverage/military_strength/stance/last_action）。"""
@@ -770,14 +737,14 @@ def build_extractor_tools(context: CourtContext):
                             key="农民"(全国)或"农民@shaanxi"(省级切片)
                             value={"satisfaction":N,"leverage":N}（可只写一个）
         region_delta        地区数值变化 {region_id: {字段:增量}}
-                            合法字段：public_support/unrest/grain_output/grain_stock/gentry_resistance/
+                            合法字段：public_support/unrest/grain_security/gentry_resistance/
                             military_pressure/corruption/population/registered_land/
                             hidden_land/tax_per_turn/natural_disaster/human_disaster/status
-                            减人口写人口，禁止写军队人数
-        army_delta          军队变化 {army_id: {field:delta_or_new}}
-                            field 用短键：supply/morale/training/equipment/mobility/loyalty/
-                            manpower/maintenance_per_turn/station/commander/troop_type/status/owner_power
-                            owner_power 值可写中文势力名；禁止写 arrears/cohesion
+                            减人口写population，禁止写manpower（军队字段）
+        army_delta          军队数值变化 {army_id: {字段:增量}}
+                            合法字段：supply/morale/training/equipment/arrears/mobility/loyalty/
+                            manpower/maintenance_quarter/station/commander/controller/troop_type/status
+                            禁止写cohesion（势力字段）
         power_updates       别的势力三项简单属性 {power_id: {"威望":N,"实力":N,"经济":N}}
                             只写非大明势力；三项均为整数增量；不写立场/近动/状态
         world_advance       外交态度 KV；key 为势力名或 power_id，value 为简短态度字符串
@@ -801,12 +768,7 @@ def build_extractor_tools(context: CourtContext):
         close_issues        结案/失败 [{issue_id,reason(resolved/failed),narrative}]
                             对照resolve_condition/fail_condition判，条件命中即报
                             不可崩坏局势（天灾/大旱等effect_on_fail为空）禁止reason=failed
-        fiscal_changes      制度性财政变化 [{key,mode,value,reason}]
-                            mode枚举：set_value(设为原始值)/delta_value(增减原始值)/
-                            set_amount(月额设为)/delta_amount(月额增减)/
-                            scale_amount(月额按比例增减，value填百分比，削三成=-30)。
-                            例：宗室禄米总额减至每月30万两 → {key:"宗室禄米_base",mode:"set_amount",value:30}
-                            同段口径互相算不通（减至X、实减Y、从A到B矛盾）则留空，不猜增量。
+        fiscal_changes      制度性财政系数变化 [{key,delta,reason}]
                             key只从财政系数表选：田赋_rate/辽饷_base/辽饷_rate/盐税_base/盐税_rate/
                             商税_base/商税_rate/皇庄_base/皇庄_rate/织造_base/织造_rate/矿税_base/矿税_rate/
                             宗室禄米_base/宗室禄米_rate/官俸_base/官俸_rate/工程_base/工程_rate/
@@ -815,8 +777,8 @@ def build_extractor_tools(context: CourtContext):
         appointments        仅后宫纳妃 [{name,office,office_type:"后宫",reason,approved}]
                             decree_text明文"纳/册封/封/选 某某 为 位号"才立；朝臣一律不进此字段
         character_status_changes  大臣状态变更 [{name,status,reason}]
-                            status 直接写中文：罢黜/下狱/流放/致仕/身故/离场
-                            邸报明文写到此人此事才立；既已罢黜/身故的不重复
+                            status∈dismissed/imprisoned/exiled/retired/dead/offstage
+                            邸报明文写到此人此事才立；既已dismissed/dead的不重复
         office_changes      朝臣官职变更 [{name,new_office,reason,可选faction/new_office_type}]
                             任何人任某官（新进朝堂/调任/升迁）一律走此字段，不分新旧任
                             new_office必须是明制实官名；去职走character_status_changes
@@ -837,17 +799,17 @@ def build_extractor_tools(context: CourtContext):
           "economy_moves": [{"account":"国库","delta":-15,"category":"赈灾","reason":"陕西赈粮"}],
           "faction_delta": {"阉党": -5, "东林": 4},
           "class_delta": {"农民@shaanxi": {"satisfaction": -6, "leverage": 5}},
-          "region_delta": {"shaanxi": {"unrest": 5, "public_support": -3}},
-          "army_delta": {"guanning": {"morale": -3, "loyalty": -2}},
+          "region_delta": {"shaanxi": {"unrest": 5, "grain_security": -3}},
+          "army_delta": {"guanning": {"morale": -3, "arrears": 5}},
           "power_updates": {"houjin": {"威望": -4, "实力": -3, "经济": -2}},
           "world_advance": {"后金": "敌对", "蒙古": "摇摆", "朝鲜": "倾明"},
           "issue_advances": [{"issue_id":12,"delta_bar":15,"stage_text":"户部主事至苏州","narrative":"..."}],
           "new_issues": [{"kind":"initiative","title":"火器营试设","origin_kind":"decree","bar_value":20,"expected_months":10,"stage_text":"...","resolve_condition":"...","fail_condition":"...","ongoing_effects":{},"effect_on_resolve":{"metrics":{"皇威":3}},"effect_on_fail":{"metrics":{"皇威":-4}},"cancellable":"by_progress"}],
           "cancels": [],
           "close_issues": [{"issue_id":9,"reason":"resolved","narrative":"..."}],
-          "fiscal_changes": [{"key":"商税_base","mode":"delta_value","value":10,"reason":"加征商税"}],
+          "fiscal_changes": [],
           "appointments": [],
-          "character_status_changes": [{"name":"魏忠贤","status":"流放","reason":"发配凤阳"}],
+          "character_status_changes": [{"name":"魏忠贤","status":"exiled","reason":"发配凤阳"}],
           "office_changes": [{"name":"孙传庭","new_office":"陕西总督","new_office_type":"督抚","reason":"永城知县擢用"}]
         }
         """

@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ming_sim.agents import bind_content as _bind_agents
 from ming_sim.agents import _dump_llm_messages
@@ -33,7 +33,6 @@ from ming_sim.decree import (
 from ming_sim.issues import bind_content as _bind_issues
 from ming_sim.issues import sync_opening_legacies
 from ming_sim.llm_model import create_agno_db, extract_agent_text, verify_llm_available
-from ming_sim.matching import match_region_id_from_text
 from ming_sim.models import Character, CourtContext, GameState, LLMConfig
 from ming_sim.paths import user_data_path
 from ming_sim.registry import MinisterRegistry, bind_content as _bind_registry
@@ -118,8 +117,6 @@ class ChatTurnResult:
     displaced_minister: str = ""   # 因新任腾缺被罢黜（dismissed）的原任者姓名
     refresh_ministers: List[str] = field(default_factory=list)
     secret_order_id: int = 0       # 本轮新建密令 id（0=未下密令）
-    tax_issue_id: int = 0          # 本轮户部调税立的 issue id（0=未调税）
-    tax_adjusted: str = ""         # 本轮户部调税立项摘要（""=未调税）
 
 
 @dataclass
@@ -390,10 +387,6 @@ class GameSession:
         self.temporary_characters: Dict[str, Character] = {}
         self.last_decree = ""
         self.last_report = ""
-        self._pending_cheat = ""  # HITL 暂停期间暂存的 cheat，phase2 取回
-        # HITL 决策点 + phase1 推演上下文（进程内存，不落库；重启即丢，按重跑推演处理）
-        self._pending_decisions: List[Dict[str, object]] = []
-        self._pending_resolve_ctx: Dict[str, object] = {}
         self._begun = False
 
     # ── 回合生命周期 ──────────────────────────────────────────────────────
@@ -443,6 +436,18 @@ class GameSession:
         self.state.turn_phase = TurnPhase.SUMMONING.value
         self.db.save_state(self.state)
 
+    def refresh_runtime_after_chat_rollback(self) -> None:
+        """撤回召对副作用后，用 DB 真相刷新内存人物表和本回合 Agent registry。"""
+        self.state = self.db.load_state()
+        _sync_offices_from_db_impl(self.content, self.db)
+        if self.registry is not None:
+            context = CourtContext(
+                state=self.state,
+                db=self.db,
+                previous_summary=self.previous_summary,
+            )
+            self.registry = MinisterRegistry(self.llm_config, self.agno_db, context)
+
     # ── 召见阶段 ──────────────────────────────────────────────────────────
 
     def list_ministers(self) -> List[MinisterView]:
@@ -464,6 +469,29 @@ class GameSession:
         if name in self.temporary_characters:
             return self.temporary_characters[name]
         return character_from_name(name)
+
+    def _retrieve_memories_for_message(self, message: str) -> str:
+        """注入近几回合章节记忆，让大臣知道近来朝局大事。章节记忆是回合粒度全局摘要，
+        直接取最近 N 回合，不再按关键词检索（旧原子记忆已废）。"""
+        from ming_sim.token_stats import tlog
+        try:
+            chapters = self.db.list_chapter_memories(upto_turn=self.state.turn, recent=4)
+            if not chapters:
+                return message
+            lines = ["【近来朝局（近几月章节）】"]
+            for c in chapters:
+                body = (c.get("body") or "").strip()
+                if not body:
+                    continue
+                lines.append(f"- {c['year']}年{c['period']}月：{body}")
+            if len(lines) == 1:
+                return message
+            new_msg = "\n".join(lines) + "\n\n" + message
+            tlog(f"[chat/chapter-recall] hit={len(chapters)} ({len(new_msg)}字)")
+            return new_msg
+        except Exception as exc:
+            tlog(f"[chat/chapter-recall] 失败跳过：{exc}")
+            return message
 
     def _temporary_character(self, name: str) -> Character:
         clean_name = str(name or "").strip()
@@ -526,29 +554,19 @@ class GameSession:
         }.get(status, status)
         return (False, f"{character.name}{label}，无法召见。" + (reason or ""))
 
-    def chat(
-        self,
-        minister_name: str,
-        message: str,
-    ) -> ChatTurnResult:
+    def chat(self, minister_name: str, message: str) -> ChatTurnResult:
         """与大臣对话一轮，统一处理 court tool 截获。
         大臣 propose_directive 产生的草案以 status='pending' 入库，
-        作为 proposed_directive 返回，确认/驳回由调用方下达。
-
-        月内历史交回 agno 每月一个 session 自管（session_id=minister-{name}-turn-{turn}，
-        agent 配 add_history_to_context=True + num_history_runs）：agno run 里天然带 tool
-        调用与 result，大臣下一轮看得到自己拟过的旨真入了档，不再空转重复拟旨。跨月失忆由月末
-        LLM 压缩的「私人对话纪要」补（build_minister_recap_brief 注入 system）。"""
+        作为 proposed_directive 返回，确认/驳回由调用方下达。"""
         if self.registry is None:
             raise RuntimeError("GameSession.begin_turn() 未调用。")
         character = self._character(minister_name)
         # 控制指令（退下/换人/技能）由 CLI 层 parse_court_command 处理；
         # GameSession.chat 只负责与 agent 对话与 tool 截获。
         agent = self.registry.get(character)
+        augmented = self._retrieve_memories_for_message(message)
         # 本回合已核定草案随大臣议事滚动累加，agent system 在月初冻结拿不到——
         # 每次 chat 前置实时 draft_line 到 user message 头，确保大臣看得到兄弟大臣最新动作。
-        # 这是跨 agent 信息，agno 单 session 给不了，必须每轮注入。
-        augmented = message
         draft_line = self.registry.build_draft_line()
         if draft_line and draft_line != "无":
             augmented = f"【本{TURN_UNIT}已核定草案】{draft_line}\n\n{augmented}"
@@ -616,29 +634,108 @@ class GameSession:
                         order_id = 0
                     if order_id:
                         result.secret_order_id = order_id
-            elif tool_name == "adjust_tax" or tool_result.startswith("__adjust_tax__"):
-                payload = tool_result.removeprefix("__adjust_tax__").strip()
-                issue_id, summary = self._apply_tax_adjust_issue(payload, character)
-                if issue_id:
-                    result.tax_issue_id = issue_id
-                    result.tax_adjusted = summary
+        # CLI 后端（agy/codex）：玩家用拟旨/密令按钮（消息带前缀）时，把大臣这句回话原文入档。
+        self._cli_backend_fallback_actions(result, character, message)
         return result
 
-    def revoke_last_chat(self, minister_name: str) -> bool:
-        """撤回该大臣本回合最后一轮召对发言：删存档行 + 裁 agno 末轮 run + 重建 agent。
-        返回是否真的撤回了一轮。临时召见人物不落库，直接返回 False。"""
-        if self.registry is None:
-            raise RuntimeError("GameSession.begin_turn() 未调用。")
-        if minister_name in self.temporary_characters:
-            return False
-        session_id = self.registry.session_ids.get(minister_name, "")
-        revoked = self.db.revoke_last_chat_round(minister_name, self.state.turn, session_id)
-        if revoked:
-            # 连带删该轮可能产的 pending 拟旨（未准未驳的最后一道）。已准/已驳不动。
-            self.db.delete_latest_pending_directive_by_actor(minister_name, self.state.turn)
-            # agno 已裁，重建 agent 让其从 db 重载被裁后的对话历史（清掉内存缓存的旧 run）。
-            self.registry.refresh(minister_name)
-        return revoked
+    def apply_cli_conversation_actions(
+        self, character: Character, player_message: str, answer: str,
+        has_directive: bool, secret_order_id: Optional[int],
+    ) -> Dict[str, Any]:
+        """CLI 后端（无 function-calling）会话落地的【唯一真源】，session.chat 非流式路径与
+        web streaming 路径共用，杜绝两边逻辑漂移（CMR F3 / codexC-1）。
+
+        做三件事：① 前缀「拟旨」→ add_directive；② 前缀「密令」→ upsert + refresh；
+        ③ 无前缀时让 LLM 判会话动作（更新/催办/提交核议/记进展/调教妃嫔）并落地。
+        入参 has_directive / secret_order_id 表示 agno 工具路径是否已产出（已产则不重复）。
+        返回 {"directive": {id,text,status,notes}|None, "secret_order_id": int|None}。"""
+        from ming_sim.cli_backend import (
+            cli_backend_from_env, resolve_minister_actions, extract_minister_actions,
+        )
+        out: Dict[str, Any] = {"directive": None, "secret_order_id": secret_order_id}
+        if cli_backend_from_env() is None:
+            return out
+        minister_name = character.name
+        reply = (answer or "").strip()
+        acts = resolve_minister_actions(reply, player_message, default_assignee=minister_name)
+        if not has_directive and acts["decree_text"]:
+            text = acts["decree_text"]
+            did = self.db.add_directive(
+                self.state, None, text, "大臣拟旨",
+                actor=minister_name, notes=f"由{minister_name}拟旨入档", status="pending",
+            )
+            out["directive"] = {"id": did, "text": text, "status": "pending",
+                                "notes": f"由{minister_name}拟旨入档"}
+        if not out["secret_order_id"] and acts["secret_order"]:
+            so = acts["secret_order"]
+            assignee = so.get("assignee") or minister_name
+            oid, _ = self.db.upsert_secret_order(
+                self.state, assignee, so["title"], so["content"],
+                so.get("tags") or [], deadline_months=so.get("deadline_months", 0),
+            )
+            if oid:
+                out["secret_order_id"] = oid
+                if self.registry is not None:
+                    self.registry.refresh(assignee)
+        # 会话动作：本轮未经前缀落密令时，LLM 判皇帝对密令/妃嫔的意图再落地。
+        if not out["secret_order_id"]:
+            is_consort = getattr(character, "office_type", "") == "后宫"
+            active = self.db.get_active_secret_orders_for_minister(minister_name)
+            if active or is_consort:
+                act = extract_minister_actions(player_message, reply, active, is_consort)
+                sa = act["secret_action"]
+                target = None
+                if act["order_id"]:
+                    target = next((o for o in active if int(o["id"]) == act["order_id"]), None)
+                if target is None and len(active) == 1:
+                    target = active[0]
+                if target is not None and sa and sa != "无":
+                    oid = int(target["id"])
+                    # target 可能是 pending_review：催办对非 active 抛错、提交核议返 False，按状态分流（CMR F1）。
+                    target_active = str(target.get("status") or "active") == "active"
+                    if sa == "更新":
+                        if self.db.update_secret_order_by_id(
+                            self.state, oid,
+                            act["new_title"] or str(target.get("title") or ""),
+                            act["new_content"] or str(target.get("content") or ""),
+                            tags=None, deadline_months=act["deadline_months"]):
+                            out["secret_order_id"] = oid
+                    elif sa == "催办" and target_active:
+                        self.db.rush_secret_order(oid, self.state, deadline_months=1, reason=player_message[:80])
+                        out["secret_order_id"] = oid
+                    elif sa == "提交核议":
+                        if self.db.submit_secret_order_for_review(
+                                oid, reply[:200], self.state.year, self.state.period):
+                            out["secret_order_id"] = oid
+                    elif sa == "记进展" and int(target.get("turn_issued") or 0) != int(self.state.turn):
+                        self.db.update_secret_order_progress(oid, reply[:200], self.state.year, self.state.period)
+                        out["secret_order_id"] = oid
+                    if out["secret_order_id"] and self.registry is not None:
+                        self.registry.refresh(minister_name)
+                if is_consort and (act["cultivate_skill"] or act["cultivate_trait"]):
+                    self.db.cultivate_consort(
+                        character.name, self.state.turn, act["cultivate_skill"], act["cultivate_trait"])
+                    if self.registry is not None:
+                        self.registry.refresh(character.name)
+        return out
+
+    def _cli_backend_fallback_actions(
+        self, result: "ChatTurnResult", character: Character, player_message: str = "",
+    ) -> None:
+        """session.chat 非流式路径：调共享会话落地，映射回 ChatTurnResult（agno 工具不触发时）。"""
+        res = self.apply_cli_conversation_actions(
+            character, player_message, result.answer or "",
+            has_directive=result.proposed_directive is not None,
+            secret_order_id=result.secret_order_id,
+        )
+        if result.proposed_directive is None and res["directive"]:
+            d = res["directive"]
+            result.proposed_directive = DirectiveView(
+                id=d["id"], text=d["text"], status=d["status"],
+                source="大臣拟旨", notes=d["notes"],
+            )
+        if res["secret_order_id"]:
+            result.secret_order_id = res["secret_order_id"]
 
     def _apply_appointment(self, payload: str, appointer: Character) -> Tuple[str, str]:
         """吏部 propose_appointment 落地：建档入库 + 注册 Agent，本回合即可召见。
@@ -650,60 +747,6 @@ class GameSession:
         except (ValueError, TypeError):
             return ("", "")
         return apply_appointment(self.db, self.state, self.content, self.registry, data)
-
-    def _apply_tax_adjust_issue(self, payload: str, proposer: Character) -> Tuple[int, str]:
-        """户部 adjust_tax 落地：立一道调税 issue（不即时改账）。
-        调税参数装进 issue.effect_on_resolve.fiscal，issue bar 推到 100 结案时由
-        issues._apply_issue_fiscal 真改 region.fiscal——成功才落库，推演期间可被士绅阻力顶回。
-        返回 (issue_id, 摘要)；非法/无命中返回 (0, "")。"""
-        import json as _json
-        try:
-            data = _json.loads(payload) if payload else {}
-        except (ValueError, TypeError):
-            return (0, "")
-        tax = str(data.get("tax") or "")
-        if tax not in ("田赋", "辽饷", "盐税", "商税"):
-            return (0, "")
-        try:
-            ratio = float(data.get("ratio"))
-        except (TypeError, ValueError):
-            return (0, "")
-        if ratio < 0:
-            return (0, "")
-        region_raw = str(data.get("region") or "").strip()
-        reason = str(data.get("reason") or "").strip()
-
-        region_id = ""
-        region_name = "全国"
-        if region_raw:
-            region_id = match_region_id_from_text(region_raw, self.content.regions) or ""
-            if not region_id:
-                return (0, "")
-            region_name = self.content.regions[region_id].name
-
-        pct = round(ratio * 100)
-        verb = "罢废" if ratio == 0 else (f"加征至原额{pct}%" if ratio > 1 else f"减征至原额{pct}%")
-        title = f"{region_name}{tax}{verb}"[:40]
-        fiscal_op = {"tax": tax, "ratio": ratio, "region_id": region_id, "region_name": region_name}
-
-        issue_id = self.db.insert_issue(
-            self.state,
-            kind="initiative",
-            title=title,
-            origin_kind="department",            # 户部主导，非诏书强推
-            origin_ref=f"tax:{tax}:{region_id or 'all'}",
-            bar_value=30,                          # 起步 30：需推演把士绅/征收阻力磨到 100 才落
-            bar_good_meaning=f"{tax}新额征齐落库",
-            bar_bad_meaning="士绅抗税/有司阳奉，调税搁浅",
-            stage_text=f"{proposer.name}奏请{title}",
-            severity=55,
-            region_hint=region_id,
-            tags=["户部", "财税", tax],
-            effect_on_resolve={"fiscal": [fiscal_op], "reason": reason or title},
-            resolve_condition=f"{region_name}有司照新额征齐{tax}入库",
-            fail_condition=f"{tax}抗征不前，调税名存实亡",
-        )
-        return (issue_id, f"{title}（已立项 #{issue_id}，待结算推进）")
 
     def _apply_unlisted_person_registration(self, payload: str) -> Tuple[str, bool]:
         """登记史实未预设/用户确认背景的人物，进入本局正式可召见人物池。"""
@@ -871,15 +914,14 @@ class GameSession:
         return self.last_decree
 
     def resolve_turn(self, decree: str = "", on_event=None, cheat_directive: str = "") -> ResolveResult:
-        """颁诏并推演本回合（两步法）：simulator agent 先写**一整篇**月末邸报，
-        extractor agent 再从邸报抽结构化增量落库（resolve_directives）。
-        要求无 pending 残留、≥1 条 draft。
+        """颁诏并推演本回合（phase1）。要求无 pending 残留、≥1 条 draft。
 
         on_event(kind, data): 推演过程实时回调，透传给 resolve_directives。
-        cheat_directive: 作弊控制台强制结算项，拼到邸报最前喂 extractor 当既成事实。
+        cheat_directive: 作弊控制台强制结算项，一次性透传给 resolve_directives。
 
-        simulator 邸报含 <<DECISION>> 决策点 → awaiting=True，回合未推进，存 awaiting
-        态等皇帝亲裁，待 submit_decisions 续跑 phase2；无决策点 → 直接结算推进、置 issued。
+        返回 ResolveResult：含决策点 → awaiting=True，置 awaiting_decision 态，回合未推进，
+        调用方据 result.decisions 弹窗，皇帝裁完调 submit_decisions。无决策点 → awaiting=False，
+        回合已结算推进，置 issued 态。
         """
         if self.pending_count() > 0:
             raise ValueError(f"尚有 {self.pending_count()} 道大臣拟旨待陛下核定（准/驳），不能颁诏。")
@@ -902,12 +944,6 @@ class GameSession:
         )
         if result.awaiting:
             # 决策点暂停：回合未推进，存 awaiting 态供刷新恢复；待 submit_decisions 续跑。
-            # 决策点 + 推演上下文 + cheat 全暂存进程内存（不落库）。phase2 调用方未重传
-            # cheat 时取回——否则强制结算项会在决策暂停后丢失（extractor 收不到既成事实）。
-            # 刷新/重启丢推演上下文是既定行为，重启后按重跑推演处理。
-            self._pending_cheat = cheat_directive
-            self._pending_decisions = result.decisions
-            self._pending_resolve_ctx = result.resolve_ctx
             self.state.turn_phase = TurnPhase.AWAITING_DECISION.value
             self.db.save_state(self.state)
             return result
@@ -918,9 +954,8 @@ class GameSession:
         return result
 
     def pending_decisions(self) -> List[Dict[str, object]]:
-        """本回合待裁/已裁决策点（awaiting_decision 态下供前端弹窗/刷新恢复）。
-        进程内存持有；进程重启后为空（重启即丢，按重跑推演处理）。"""
-        return getattr(self, "_pending_decisions", [])
+        """本回合待裁/已裁决策点（awaiting_decision 态下供前端弹窗/刷新恢复）。"""
+        return self.db.list_pending_decisions(self.state.turn)
 
     def submit_decisions(
         self, choices: List[Dict[str, object]], on_event=None, cheat_directive: str = ""
@@ -930,28 +965,24 @@ class GameSession:
         要求当前处于 awaiting_decision 态。返回完整结算报告，置 issued。"""
         if self.current_phase() != TurnPhase.AWAITING_DECISION:
             raise ValueError("当前不在待裁决策阶段，无法提交亲裁。")
-        # 回写选择到进程内存的决策点（不落库）。phase1 重启后内存空，此时无可裁项。
-        stored = getattr(self, "_pending_decisions", [])
-        if not stored:
-            raise ValueError("无待裁决策点（进程重启已丢，请重跑推演）。")
+        # 回写选择
+        stored = self.db.list_pending_decisions(self.state.turn)
+        import json as _json
         for d in stored:
             idx = int(d["idx"])
             choice = choices[idx] if idx < len(choices) else None
-            d["choice"] = choice if isinstance(choice, dict) else {}
-            d["status"] = "decided"
-        # caller 未重传 cheat 时，取回 phase1 暂存的（同进程内存）；用完即清。
-        effective_cheat = cheat_directive or getattr(self, "_pending_cheat", "")
+            if not isinstance(choice, dict):
+                choice = {}
+            self.db.conn.execute(
+                "UPDATE pending_decisions SET choice_json=?, status='decided' WHERE turn=? AND idx=?",
+                (_json.dumps(choice, ensure_ascii=False), self.state.turn, idx),
+            )
+        self.db.conn.commit()
         report = resolve_decisions_phase2(
             self.state, self.db, self.agno_db, self.llm_config,
-            resolve_ctx=getattr(self, "_pending_resolve_ctx", {}),
-            decisions=stored,
             on_event=on_event, content=self.content, registry=self.registry,
-            cheat_directive=effective_cheat,
+            cheat_directive=cheat_directive,
         )
-        # 结算完清进程内存暂存。
-        self._pending_cheat = ""
-        self._pending_decisions = []
-        self._pending_resolve_ctx = {}
         self.last_report = report
         self.state.turn_phase = TurnPhase.ISSUED.value
         self.db.save_state(self.state)
