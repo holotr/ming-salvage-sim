@@ -149,8 +149,8 @@ class _SeedMixin:
                 INSERT OR IGNORE INTO regions
                 (id, name, kind, population, public_support, unrest, natural_disaster, human_disaster,
                  registered_land, hidden_land, tax_per_turn, gentry_resistance,
-                 military_pressure, status, controlled_by, fiscal)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 military_pressure, status, controlled_by, city_level, cannon, fiscal)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     region.id,
@@ -168,6 +168,8 @@ class _SeedMixin:
                     region.military_pressure,
                     region.status,
                     region.controlled_by,
+                    region.city_level,
+                    region.cannon,
                     json.dumps(region.fiscal, ensure_ascii=False),
                 ),
             )
@@ -179,8 +181,8 @@ class _SeedMixin:
                     INSERT INTO armies
                     (id, name, station, theater, commander, controller, troop_type, manpower,
                      maintenance_per_turn, supply, morale, training, equipment, arrears,
-                     mobility, loyalty, status, owner_power)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mobility, loyalty, firearm_equipment, cannon_equipment, status, owner_power)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         army.id,
@@ -199,6 +201,8 @@ class _SeedMixin:
                         army.arrears,
                         army.mobility,
                         army.loyalty,
+                        army.firearm_equipment,
+                        army.cannon_equipment,
                         army.status,
                         army.owner_power,
                     ),

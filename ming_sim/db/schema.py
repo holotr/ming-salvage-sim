@@ -161,6 +161,8 @@ class _SchemaMixin:
                 military_pressure INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 controlled_by TEXT NOT NULL DEFAULT 'ming',
+                city_level INTEGER NOT NULL DEFAULT 0,
+                cannon INTEGER NOT NULL DEFAULT 0,
                 fiscal TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(controlled_by) REFERENCES powers(id)
@@ -201,6 +203,8 @@ class _SchemaMixin:
                 arrears INTEGER NOT NULL,
                 mobility INTEGER NOT NULL,
                 loyalty INTEGER NOT NULL,
+                firearm_equipment INTEGER NOT NULL DEFAULT 30,
+                cannon_equipment INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 owner_power TEXT NOT NULL DEFAULT 'ming',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
