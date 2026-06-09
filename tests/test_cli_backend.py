@@ -199,6 +199,27 @@ def test_clichat_low_level_stream_not_implemented():
         cc.ainvoke_stream()
 
 
+def test_clichat_agent_stream_delegates_to_non_stream(monkeypatch):
+    from agno.agent import Agent
+
+    from ming_sim.agents import run_agent_stream_text
+
+    calls = {"response_stream": 0}
+    orig_response_stream = cb.CliChat.response_stream
+
+    def tracked_response_stream(self, *args, **kwargs):
+        calls["response_stream"] += 1
+        yield from orig_response_stream(self, *args, **kwargs)
+
+    monkeypatch.setattr(cb, "_run_agy", lambda prompt: ("臣领旨。", 1))
+    monkeypatch.setattr(cb, "_trace", lambda rec: None)
+    monkeypatch.setattr(cb.CliChat, "response_stream", tracked_response_stream)
+    agent = Agent(model=cb.CliChat(id="m", backend="agy"), instructions=["只输出正文。"], markdown=False)
+
+    assert run_agent_stream_text(agent, "拟诏", tag="cli-stream-smoke") == "臣领旨。"
+    assert calls["response_stream"] == 1
+
+
 # ── codex 后端工程修复（实测撞出来的坑）──
 
 def test_run_codex_flags_and_stdout(monkeypatch):
