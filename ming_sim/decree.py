@@ -14,7 +14,6 @@ from typing import Callable, Dict, List, Optional
 from agno.db.sqlite import SqliteDb
 
 from ming_sim.agents import (
-    _dump_llm_messages,
     create_chapter_memory_agent,
     create_decree_writer_agent,
     create_ending_summary_agent,
@@ -31,7 +30,7 @@ from ming_sim.db import GameDB
 from ming_sim.exceptions import LLMContractError, LLMUnavailable
 from ming_sim.flows import apply_fixed_period_flows
 from ming_sim.issues import apply_issue_inertia_and_ongoing, apply_score_extraction, auto_trigger_seed_issues, clear_gated_legacies
-from ming_sim.llm_model import extract_agent_text, llm_unavailable_from_error
+from ming_sim.llm_model import llm_unavailable_from_error
 from ming_sim.models import GameState, LLMConfig
 from ming_sim.memories import build_timeline, record_chapter_memory, record_minister_recaps
 from ming_sim.simulation import (
@@ -166,9 +165,11 @@ def write_decree_with_agno(
     }
     try:
         agent = create_decree_writer_agent(llm_config, agno_db)
-        run_output = agent.run(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        _dump_llm_messages(run_output, "拟诏", agent=agent)
-        text = extract_agent_text(run_output)
+        text = run_agent_stream_text(
+            agent,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            tag="拟诏",
+        )
     except LLMUnavailable:
         raise
     except Exception as error:
