@@ -25,7 +25,6 @@ COPY content ./content
 COPY ming_sim ./ming_sim
 COPY .agno_skills ./.agno_skills
 COPY web_app.py ./
-COPY docker-entrypoint.py ./
 COPY --from=web-build /app/web/dist ./web/dist
 
 RUN mkdir -p /app/data \
@@ -33,5 +32,4 @@ RUN mkdir -p /app/data \
 
 EXPOSE 8010
 
-ENTRYPOINT ["python", "/app/docker-entrypoint.py"]
 CMD ["python", "-m", "uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8010"]
