@@ -256,8 +256,8 @@ class _TurnsMixin:
             (turn, year, period, event_id, actor, skill_id, text, source, status, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (state.turn, state.year, state.period, event.id if event else "",
-             actor, skill_id, text, source, status, notes),
+            (state.turn, state.year, state.period, event.id if event else None,
+             actor or None, skill_id, text, source, status, notes),
         )
         self.conn.commit()
         return int(cursor.lastrowid)
