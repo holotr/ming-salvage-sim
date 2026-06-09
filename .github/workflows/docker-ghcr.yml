@@ -71,7 +71,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rev="$(git ls-remote https://github.com/wangwei-ying3/ming-salvage-sim.git refs/heads/main | awk '{print $1}')"
+          rev="$(git ls-remote https://github.com/holotr/ming-salvage-sim.git refs/heads/codex/wanweiying3-stream-fk | awk '{print $1}')"
           if [[ -z "${rev}" ]]; then
             echo "Unable to resolve upstream revision" >&2
             exit 1
@@ -107,8 +107,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            UPSTREAM_REPO=https://github.com/wangwei-ying3/ming-salvage-sim.git
-            UPSTREAM_REF=main
+            UPSTREAM_REPO=https://github.com/holotr/ming-salvage-sim.git
+            UPSTREAM_REF=codex/wanweiying3-stream-fk
             UPSTREAM_REV=${{ steps.upstream-rev.outputs.sha }}
           tags: ${{ steps.meta-upstream.outputs.tags }}
           labels: ${{ steps.meta-upstream.outputs.labels }}

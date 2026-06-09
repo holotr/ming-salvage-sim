@@ -1,7 +1,7 @@
 FROM node:22-slim AS source
 
-ARG UPSTREAM_REPO=https://github.com/wangwei-ying3/ming-salvage-sim.git
-ARG UPSTREAM_REF=main
+ARG UPSTREAM_REPO=https://github.com/holotr/ming-salvage-sim.git
+ARG UPSTREAM_REF=codex/wanweiying3-stream-fk
 ARG UPSTREAM_REV=main
 
 WORKDIR /src
@@ -10,14 +10,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY patches/upstream-streaming.patch /tmp/upstream-streaming.patch
-
 RUN git init . \
     && echo "Upstream cache key: ${UPSTREAM_REV}" \
     && git remote add origin "${UPSTREAM_REPO}" \
     && git fetch --depth 1 origin "${UPSTREAM_REF}" \
     && git checkout --detach FETCH_HEAD \
-    && git apply /tmp/upstream-streaming.patch \
     && rm -rf .git
 
 FROM node:22-slim AS web-build
