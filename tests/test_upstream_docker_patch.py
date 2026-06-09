@@ -19,7 +19,7 @@ class UpstreamDockerPatchTests(unittest.TestCase):
             "ARG UPSTREAM_REPO=https://github.com/holotr/ming-salvage-sim.git",
             dockerfile,
         )
-        self.assertIn("ARG UPSTREAM_REF=codex/wanweiying3-stream-fk", dockerfile)
+        self.assertIn("ARG UPSTREAM_REF=upstream-patch", dockerfile)
         self.assertNotIn("upstream-streaming.patch", dockerfile)
         self.assertNotIn("git apply", dockerfile)
 

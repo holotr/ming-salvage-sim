@@ -1,7 +1,7 @@
 FROM node:22-slim AS source
 
 ARG UPSTREAM_REPO=https://github.com/holotr/ming-salvage-sim.git
-ARG UPSTREAM_REF=codex/wanweiying3-stream-fk
+ARG UPSTREAM_REF=upstream-patch
 ARG UPSTREAM_REV=main
 
 WORKDIR /src
