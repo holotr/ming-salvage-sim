@@ -24,7 +24,9 @@ class LLMConfig:
     base_url: str
     model: str
     max_tokens: int = 8000
-    timeout_seconds: float = 180.0
+    timeout_seconds: float = 180.0  # 总超时（整次请求上限）
+    connect_timeout_seconds: float = 60.0  # 建连超时
+    read_timeout_seconds: float = 120.0  # 流式下两次 socket 读之间的最大间隔（chunk 间隔超此判卡死）
     thinking_level: str = ""  # 空=沿用旧逻辑；否则原样传给 reasoning_effort
     advanced_model: str = ""  # 空=fallback model；非空=推演/打分专用更强模型（如 deepseek-reasoner / gpt-5）
     advanced_base_url: str = ""  # 空=复用主 base_url；非空=advanced 角色专用网关

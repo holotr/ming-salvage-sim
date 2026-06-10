@@ -91,10 +91,15 @@ def create_chat_model(
         "base_url": llm_config.base_url,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        # read=20：流式下「两次 socket 读之间」最多 20s，即 chunk 间隔超 20s 判卡死，
+        # read_timeout_seconds：流式下「两次 socket 读之间」的最大间隔，即 chunk 间隔超此判卡死，
         # 抛 httpx.ReadTimeout → openai APITimeoutError → 上层包成 LLMUnavailable 提示用户。
         # 持续吐字不误伤；总超时仍用 timeout_seconds 兜底。标量 timeout 对流式几乎不触发，故必须分项。
-        "timeout": httpx.Timeout(llm_config.timeout_seconds, connect=10.0, read=20.0),
+        # 三者均可在 runtime_llm.json / 系统配置里调（默认 180/10/20）。
+        "timeout": httpx.Timeout(
+            llm_config.timeout_seconds,
+            connect=llm_config.connect_timeout_seconds,
+            read=llm_config.read_timeout_seconds,
+        ),
         # 0：超时立即冒泡，不静默重试（重试会让「卡住」再多等一整轮才报错）。
         "max_retries": 0,
         "role_map": {"system": "system", "user": "user", "assistant": "assistant", "tool": "tool"},

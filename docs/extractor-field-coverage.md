@@ -1,41 +1,41 @@
 # Extractor 全字段覆盖测试报告
 
-- 跑 case：**115**　PASS **108** / FAIL **7** / ERROR **0**
+- 跑 case：**115**　PASS **48** / FAIL **67** / ERROR **0**
 - 顶层字段总数：**22**
-- 耗时：4993s
+- 耗时：30314s
 
 ## 一、字段遗漏校验
 
 ✅ 全部顶层字段都有 case 覆盖（每个字段至少被一个 case 的 expect_fields 引用）。
 
-❌ **有 case 期望但实测从未抽到的字段（1）**：密令进度　← 需排查 prompt 或 case
+❌ **有 case 期望但实测从未抽到的字段（2）**：密令结案、崇祯结局　← 需排查 prompt 或 case
 
 ## 二、字段覆盖矩阵
 
 | 顶层字段 | 期望次数 | 实测命中次数 | 命中 case |
 |---|---|---|---|
-| ✅ 国势变化 | 5 | 57 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c006_jiazheng_shangshui、c007_jianshui_tianfu… |
-| ✅ 钱粮收支 | 13 | 22 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c005_lianglib_huboge、c017_diqu_tianzai… |
-| ✅ 财政制度变化 | 8 | 7 | c066_zhidu_shewei、c066b_zhidu_zengjian_yuan、c066c_zhidu_yuee_shewei、c066d_zhidu_yuee_zengjian、c066e_zhidu_yuee_bili、c066f_zhidu_zhizao_zeng… |
-| ✅ 新立月度收支 | 6 | 10 | c006_jiazheng_shangshui、c008_xinli_guanshui、c009_xinli_yuefeng、c022_xinli_bumen、c057_combo_xinli_keji_bumen、c067_xinli_qishui… |
-| ✅ 裁撤月度收支 | 3 | 6 | c010_caiche_kuangshui、c011_caiche_liaoxiang、c054_combo_gongcheng_xinli_caiche、c068c_caiche_zhizao、c069_caiche_yanke、c085_chexiao_2 |
-| ✅ 派系变化 | 3 | 61 | c001_chaojia_neiku、c002_chaojia_guoku、c004_bushang_guanning、c006_jiazheng_shangshui、c007_jianshui_tianfu、c010_caiche_kuangshui… |
-| ✅ 阶级变化 | 6 | 73 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c006_jiazheng_shangshui、c007_jianshui_tianfu… |
-| ✅ 地区变化 | 19 | 43 | c003_zhenzai_chuzhang、c006_jiazheng_shangshui、c007_jianshui_tianfu、c008_xinli_guanshui、c011_caiche_liaoxiang、c012_minxin_huangwei… |
-| ✅ 局势推进 | 2 | 115 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c005_lianglib_huboge、c006_jiazheng_shangshui… |
-| ✅ 新立局势 | 10 | 24 | c015_jieji_shenshen、c017_diqu_tianzai、c018_diqu_kongzhi_xianluo、c019_xinli_juchu_gongcheng、c020_xinli_juchu_qingzhang、c021_xinli_xiaogongcheng… |
-| ✅ 撤销局势 | 2 | 2 | c026_chexiao、c085_chexiao_2 |
-| ✅ 结案局势 | 4 | 3 | c025_jiean_resolved、c058_combo_jiean_diguoxiuzheng、c084_jiean_diguo |
-| ✅ 军队变化 | 9 | 33 | c004_bushang_guanning、c014_jieji_nongmin、c016_diqu_diaoliang、c017_diqu_tianzai、c018_diqu_kongzhi_xianluo、c027_jundui_kuobian… |
-| ✅ 新建军队 | 6 | 10 | c030_jundui_toudi、c031_xinjianjun_guanbing、c032_xinjianjun_panjun、c051_combo_zhenzai_jieji、c053_combo_xinjun_renshi、c083_jiean_failed… |
-| ✅ 军备变化 | 4 | 6 | c024_tuijin_zhuankuan、c092a_junbei_ganzhi、c092b_junbei_huojiao、c092c_junbei_aomen、c099_jieju_suicide、c107_combo_xinjun_junbei |
-| ✅ 势力变化 | 3 | 26 | c013_paixi_yandang、c014_jieji_nongmin、c016_diqu_diaoliang、c017_diqu_tianzai、c018_diqu_kongzhi_xianluo、c030_jundui_toudi… |
-| ✅ 四方动向 | 5 | 36 | c004_bushang_guanning、c013_paixi_yandang、c014_jieji_nongmin、c016_diqu_diaoliang、c017_diqu_tianzai、c018_diqu_kongzhi_xianluo… |
-| ✅ 人物变化 | 15 | 23 | c013_paixi_yandang、c019_xinli_juchu_gongcheng、c029_jundui_gaizhushuai、c030_jundui_toudi、c031_xinjianjun_guanbing、c032_xinjianjun_panjun… |
-| ✅ 后宫册封 | 4 | 4 | c040_hougong_cefeng、c041_hougong_feizhi、c059_combo_hougong_renshi、c097_hougong_feijun |
-| ⚠️ 密令进度 | 2 | 0 |  |
-| ✅ 密令结案 | 2 | 2 | c043_miling_jiean、c105_miling_jiean2 |
-| ✅ 崇祯结局 | 2 | 2 | c099_jieju_suicide、c100_jieju_abdicate |
+| ✅ 国势变化 | 5 | 27 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c006_jiazheng_shangshui、c007_jianshui_tianfu… |
+| ✅ 钱粮收支 | 13 | 10 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c005_lianglib_huboge、c014_jieji_nongmin… |
+| ✅ 财政制度变化 | 7 | 2 | c007_jianshui_tianfu、c012_minxin_huangwei |
+| ✅ 新立月度收支 | 6 | 3 | c008_xinli_guanshui、c009_xinli_yuefeng、c022_xinli_bumen |
+| ✅ 裁撤月度收支 | 3 | 1 | c010_caiche_kuangshui |
+| ✅ 派系变化 | 3 | 25 | c001_chaojia_neiku、c002_chaojia_guoku、c004_bushang_guanning、c006_jiazheng_shangshui、c007_jianshui_tianfu、c008_xinli_guanshui… |
+| ✅ 阶级变化 | 6 | 28 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c006_jiazheng_shangshui、c007_jianshui_tianfu… |
+| ✅ 地区变化 | 19 | 20 | c003_zhenzai_chuzhang、c006_jiazheng_shangshui、c007_jianshui_tianfu、c008_xinli_guanshui、c011_caiche_liaoxiang、c012_minxin_huangwei… |
+| ✅ 局势推进 | 2 | 41 | c001_chaojia_neiku、c002_chaojia_guoku、c003_zhenzai_chuzhang、c004_bushang_guanning、c005_lianglib_huboge、c006_jiazheng_shangshui… |
+| ✅ 新立局势 | 10 | 9 | c009_xinli_yuefeng、c017_diqu_tianzai、c018_diqu_kongzhi_xianluo、c019_xinli_juchu_gongcheng、c020_xinli_juchu_qingzhang、c021_xinli_xiaogongcheng… |
+| ✅ 撤销局势 | 2 | 1 | c026_chexiao |
+| ✅ 结案局势 | 4 | 1 | c025_jiean_resolved |
+| ✅ 军队变化 | 9 | 14 | c004_bushang_guanning、c007_jianshui_tianfu、c013_paixi_yandang、c014_jieji_nongmin、c016_diqu_diaoliang、c017_diqu_tianzai… |
+| ✅ 新建军队 | 6 | 4 | c007_jianshui_tianfu、c030_jundui_toudi、c031_xinjianjun_guanbing、c039_yizhu_guizheng |
+| ✅ 军备变化 | 4 | 1 | c024_tuijin_zhuankuan |
+| ✅ 势力变化 | 3 | 10 | c007_jianshui_tianfu、c013_paixi_yandang、c014_jieji_nongmin、c016_diqu_diaoliang、c017_diqu_tianzai、c018_diqu_kongzhi_xianluo… |
+| ✅ 四方动向 | 5 | 12 | c004_bushang_guanning、c007_jianshui_tianfu、c013_paixi_yandang、c014_jieji_nongmin、c016_diqu_diaoliang、c017_diqu_tianzai… |
+| ✅ 人物变化 | 15 | 12 | c013_paixi_yandang、c019_xinli_juchu_gongcheng、c023_xinli_keji、c029_jundui_gaizhushuai、c030_jundui_toudi、c031_xinjianjun_guanbing… |
+| ✅ 后宫册封 | 4 | 2 | c040_hougong_cefeng、c041_hougong_feizhi |
+| ✅ 密令进度 | 2 | 1 | c042_miling_fuzuoyong |
+| ⚠️ 密令结案 | 2 | 0 |  |
+| ⚠️ 崇祯结局 | 2 | 0 |  |
 
 ## 三、逐 case 明细
 
@@ -46,113 +46,113 @@
 | c003_zhenzai_chuzhang | ✅ | 钱粮收支、地区变化 | 国势变化、地区变化、局势推进、钱粮收支、阶级变化 | — | 国势变化、局势推进、阶级变化 | 国库出账赈灾：负数-15 |
 | c004_bushang_guanning | ✅ | 钱粮收支 | 军队变化、四方动向、国势变化、局势推进、派系变化、钱粮收支、阶级变化 | — | 军队变化、四方动向、国势变化、局势推进、派系变化、阶级变化 | 内库直发军补饷：负数,用途补饷,目标编号=军id |
 | c005_lianglib_huboge | ✅ | 钱粮收支 | 局势推进、钱粮收支 | — | 局势推进 |  |
-| c006_jiazheng_shangshui | ✅ | 地区变化 | 国势变化、地区变化、局势推进、新立月度收支、派系变化、阶级变化 | — | 国势变化、局势推进、新立月度收支、派系变化、阶级变化 |  |
-| c007_jianshui_tianfu | ✅ | 地区变化 | 国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 |  |
-| c008_xinli_guanshui | ✅ | 新立月度收支 | 地区变化、局势推进、新立月度收支、阶级变化 | — | 地区变化、局势推进、阶级变化 | 固定月额新收税：账户/方向(落英文income)/初值20 |
-| c009_xinli_yuefeng | ✅ | 新立月度收支 | 局势推进、新立月度收支 | — | 局势推进 | 固定月额新支：方向(落英文expense),初值3 |
+| c006_jiazheng_shangshui | ✅ | 地区变化 | 国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 |  |
+| c007_jianshui_tianfu | ✅ | 地区变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、派系变化、财政制度变化、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、新建军队、派系变化、财政制度变化、阶级变化 |  |
+| c008_xinli_guanshui | ✅ | 新立月度收支 | 国势变化、地区变化、局势推进、新立月度收支、派系变化、阶级变化 | — | 国势变化、地区变化、局势推进、派系变化、阶级变化 | 固定月额新收税：账户/方向(落英文income)/初值20 |
+| c009_xinli_yuefeng | ✅ | 新立月度收支 | 局势推进、新立局势、新立月度收支 | — | 局势推进、新立局势 | 固定月额新支：方向(落英文expense),初值3 |
 | c010_caiche_kuangshui | ✅ | 裁撤月度收支 | 国势变化、局势推进、派系变化、裁撤月度收支、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 |  |
-| c011_caiche_liaoxiang | ✅ | 地区变化 | 国势变化、地区变化、局势推进、派系变化、裁撤月度收支、阶级变化 | — | 国势变化、局势推进、派系变化、裁撤月度收支、阶级变化 |  |
-| c012_minxin_huangwei | ✅ | 国势变化 | 国势变化、地区变化、局势推进、阶级变化 | — | 地区变化、局势推进、阶级变化 |  |
-| c013_paixi_yandang | ✅ | 派系变化、人物变化 | 人物变化、势力变化、四方动向、国势变化、局势推进、派系变化、阶级变化 | — | 势力变化、四方动向、国势变化、局势推进、阶级变化 |  |
-| c014_jieji_nongmin | ✅ | 阶级变化、地区变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进 |  |
-| c015_jieji_shenshen | ✅ | 阶级变化、地区变化、士绅阻力 | 地区变化、局势推进、新立局势、阶级变化 | — | 局势推进、新立局势 |  |
+| c011_caiche_liaoxiang | ✅ | 地区变化 | 国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 |  |
+| c012_minxin_huangwei | ✅ | 国势变化 | 国势变化、地区变化、局势推进、派系变化、财政制度变化、阶级变化 | — | 地区变化、局势推进、派系变化、财政制度变化、阶级变化 |  |
+| c013_paixi_yandang | ✅ | 派系变化、人物变化 | 人物变化、军队变化、势力变化、四方动向、国势变化、局势推进、派系变化、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、阶级变化 |  |
+| c014_jieji_nongmin | ✅ | 阶级变化、地区变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、派系变化、钱粮收支、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、派系变化、钱粮收支 |  |
+| c015_jieji_shenshen | ✅ | 阶级变化、地区变化、士绅阻力 | 国势变化、地区变化、局势推进、阶级变化 | — | 国势变化、局势推进 |  |
 | c016_diqu_diaoliang | ✅ | 地区变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、阶级变化 |  |
 | c017_diqu_tianzai | ✅ | 地区变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、钱粮收支、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、新立局势、钱粮收支、阶级变化 |  |
 | c018_diqu_kongzhi_xianluo | ✅ | 地区变化、军事压力 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、派系变化、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、新立局势、派系变化、阶级变化 |  |
 | c019_xinli_juchu_gongcheng | ✅ | 新立局势 | 人物变化、局势推进、新立局势、派系变化、钱粮收支 | — | 人物变化、局势推进、派系变化、钱粮收支 |  |
 | c020_xinli_juchu_qingzhang | ✅ | 新立局势 | 局势推进、新立局势、派系变化、阶级变化 | — | 局势推进、派系变化、阶级变化 |  |
 | c021_xinli_xiaogongcheng | ✅ | 新立局势 | 地区变化、局势推进、新立局势 | — | 地区变化、局势推进 |  |
-| c022_xinli_bumen | ✅ | 新立局势 | 局势推进、新立局势、新立月度收支、派系变化 | — | 局势推进、新立月度收支、派系变化 |  |
-| c023_xinli_keji | ✅ | 新立局势 | 局势推进、新立局势、派系变化 | — | 局势推进、派系变化 |  |
+| c022_xinli_bumen | ✅ | 新立局势 | 国势变化、局势推进、新立局势、新立月度收支、派系变化 | — | 国势变化、局势推进、新立月度收支、派系变化 |  |
+| c023_xinli_keji | ✅ | 新立局势 | 人物变化、国势变化、局势推进、新立局势、派系变化 | — | 人物变化、国势变化、局势推进、派系变化 |  |
 | c024_tuijin_zhuankuan | ✅ | 局势推进 | 军备变化、局势推进、钱粮收支 | — | 军备变化、钱粮收支 | 需盘面已有在办 issue 方能命中；无则跳过判定 |
 | c025_jiean_resolved | ✅ | 结案局势 | 局势推进、结案局势 | — | 局势推进 |  |
 | c026_chexiao | ✅ | 撤销局势 | 局势推进、撤销局势、派系变化、阶级变化 | — | 局势推进、派系变化、阶级变化 |  |
 | c027_jundui_kuobian | ✅ | 军队变化 | 军队变化、局势推进、阶级变化 | — | 局势推进、阶级变化 |  |
-| c028_jundui_diaodu | ✅ | 军队变化 | 军队变化、四方动向、地区变化、局势推进 | — | 四方动向、地区变化、局势推进 |  |
-| c029_jundui_gaizhushuai | ✅ | 军队变化 | 人物变化、军队变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 人物变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 |  |
-| c030_jundui_toudi | ✅ | 军队变化、人物变化 | 人物变化、军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、派系变化、阶级变化 | — | 势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、派系变化、阶级变化 |  |
+| c028_jundui_diaodu | ✅ | 军队变化 | 军队变化、地区变化、局势推进 | — | 地区变化、局势推进 |  |
+| c029_jundui_gaizhushuai | ✅ | 军队变化 | 人物变化、军队变化、国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 人物变化、国势变化、地区变化、局势推进、派系变化、阶级变化 |  |
+| c030_jundui_toudi | ✅ | 军队变化、人物变化 | 人物变化、军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、新立局势、派系变化、阶级变化 | — | 势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、新立局势、派系变化、阶级变化 |  |
 | c031_xinjianjun_guanbing | ✅ | 新建军队 | 人物变化、地区变化、局势推进、新建军队、阶级变化 | — | 人物变化、地区变化、局势推进、阶级变化 |  |
-| c032_xinjianjun_panjun | ✅ | 新建军队 | 人物变化、军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、新立局势、钱粮收支、阶级变化 | — | 人物变化、军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、钱粮收支、阶级变化 |  |
-| c033_shili_bianhua | ✅ | 势力变化、四方动向 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 军队变化、国势变化、地区变化、局势推进、派系变化、阶级变化 |  |
-| c034_sifang_dongxiang | ✅ | 四方动向 | 势力变化、四方动向、局势推进、新立局势 | — | 势力变化、局势推进、新立局势 |  |
-| c035_renshi_renguan | ✅ | 人物变化 | 人物变化、地区变化、局势推进、派系变化、阶级变化 | — | 地区变化、局势推进、派系变化、阶级变化 |  |
+| c032_xinjianjun_panjun | ❌ | 新建军队 | 人物变化、国势变化、地区变化、阶级变化 | 新建军队 | 人物变化、国势变化、地区变化、阶级变化 |  |
+| c033_shili_bianhua | ✅ | 势力变化、四方动向 | 军队变化、势力变化、四方动向、局势推进 | — | 军队变化、局势推进 |  |
+| c034_sifang_dongxiang | ✅ | 四方动向 | 势力变化、四方动向、局势推进、派系变化 | — | 势力变化、局势推进、派系变化 |  |
+| c035_renshi_renguan | ✅ | 人物变化 | 人物变化、军队变化、国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 军队变化、国势变化、地区变化、局势推进、派系变化、阶级变化 |  |
 | c036_renshi_ruge | ✅ | 人物变化 | 人物变化、国势变化、局势推进、派系变化 | — | 国势变化、局势推进、派系变化 |  |
-| c037_zhuangtai_bachu | ✅ | 人物变化 | 人物变化、军队变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 军队变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 |  |
-| c038_zhuangtai_liufang | ✅ | 人物变化 | 人物变化、国势变化、局势推进、派系变化 | — | 国势变化、局势推进、派系变化 |  |
-| c039_yizhu_guizheng | ❌ | 人物变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、派系变化、阶级变化 | 人物变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、派系变化、阶级变化 |  |
-| c040_hougong_cefeng | ✅ | 后宫册封 | 后宫册封、国势变化、局势推进、派系变化 | — | 国势变化、局势推进、派系变化 |  |
-| c041_hougong_feizhi | ✅ | 后宫册封 | 后宫册封、局势推进 | — | 局势推进 |  |
-| c042_miling_fuzuoyong | ❌ | 密令进度 | 密令副作用、局势推进、新立局势、派系变化、阶级变化 | 密令进度 | 密令副作用、局势推进、新立局势、派系变化、阶级变化 |  |
-| c043_miling_jiean | ✅ | 密令结案 | 密令结案、局势推进、新立局势、派系变化、阶级变化 | — | 局势推进、新立局势、派系变化、阶级变化 |  |
-| c050_combo_chaojia_bushang | ✅ | 钱粮收支、军队变化 | 军队变化、势力变化、四方动向、国势变化、局势推进、新立局势、派系变化、钱粮收支、阶级变化 | — | 势力变化、四方动向、国势变化、局势推进、新立局势、派系变化、阶级变化 |  |
-| c051_combo_zhenzai_jieji | ✅ | 钱粮收支、地区变化、阶级变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、钱粮收支、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、新建军队 |  |
-| c052_combo_qingdang | ✅ | 钱粮收支、人物变化、派系变化 | 人物变化、军队变化、势力变化、四方动向、国势变化、局势推进、派系变化、钱粮收支、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、阶级变化 |  |
-| c053_combo_xinjun_renshi | ✅ | 人物变化、新建军队 | 人物变化、地区变化、局势推进、新建军队、阶级变化 | — | 地区变化、局势推进、阶级变化 |  |
-| c054_combo_gongcheng_xinli_caiche | ✅ | 新立局势、裁撤月度收支 | 国势变化、局势推进、新立局势、派系变化、裁撤月度收支 | — | 国势变化、局势推进、派系变化 |  |
-| c055_combo_xianluo_jundui | ✅ | 地区变化、军队变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、派系变化、阶级变化 | — | 势力变化、四方动向、国势变化、局势推进、新立局势、派系变化、阶级变化 |  |
-| c056_combo_shili_sifang | ✅ | 势力变化、四方动向、国势变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 军队变化、地区变化、局势推进、派系变化、阶级变化 |  |
-| c057_combo_xinli_keji_bumen | ✅ | 新立局势 | 局势推进、新立局势、新立月度收支、派系变化、阶级变化 | — | 局势推进、新立月度收支、派系变化、阶级变化 |  |
-| c058_combo_jiean_diguoxiuzheng | ✅ | 结案局势 | 人物变化、势力变化、四方动向、国势变化、地区变化、局势推进、派系变化、结案局势、钱粮收支、阶级变化 | — | 人物变化、势力变化、四方动向、国势变化、地区变化、局势推进、派系变化、钱粮收支、阶级变化 |  |
-| c059_combo_hougong_renshi | ✅ | 后宫册封、人物变化 | 人物变化、后宫册封、局势推进 | — | 局势推进 |  |
-| c060_combo_caiche_jiazheng | ✅ | 地区变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、派系变化、阶级变化 |  |
-| c061_chaojia_huanguan | ✅ | 钱粮收支 | 人物变化、国势变化、局势推进、派系变化、钱粮收支 | — | 人物变化、国势变化、局势推进、派系变化 |  |
-| c062_bushang_xuanda | ✅ | 钱粮收支 | 军队变化、局势推进、新立局势、钱粮收支 | — | 军队变化、局势推进、新立局势 |  |
-| c063_bushang_jizhen | ✅ | 钱粮收支 | 军队变化、四方动向、局势推进、钱粮收支 | — | 军队变化、四方动向、局势推进 |  |
-| c064_jinwei_xiaoe | ✅ | 钱粮收支 | 局势推进、钱粮收支、阶级变化 | — | 局势推进、阶级变化 | 小额换算：四千六百两=0.46万两 |
-| c065_jiazheng_yanshui | ✅ | 地区变化 | 地区变化、局势推进 | — | 局势推进 |  |
-| c066_zhidu_shewei | ✅ | 财政制度变化 | 局势推进、派系变化、财政制度变化、阶级变化 | — | 局势推进、派系变化、阶级变化 | 口径=设为原始值：数值即新值 |
-| c066b_zhidu_zengjian_yuan | ✅ | 财政制度变化 | 局势推进、派系变化、财政制度变化、阶级变化 | — | 局势推进、派系变化、阶级变化 | 口径=增减原始值：数值为增量 |
-| c066c_zhidu_yuee_shewei | ✅ | 财政制度变化 | 国势变化、局势推进、新立局势、派系变化、财政制度变化、阶级变化 | — | 国势变化、局势推进、新立局势、派系变化、阶级变化 | 口径=月额设为：数值=新总额万两 |
-| c066d_zhidu_yuee_zengjian | ✅ | 财政制度变化 | 局势推进、派系变化、财政制度变化、阶级变化 | — | 局势推进、派系变化、阶级变化 | 口径=月额增减：数值为月额增量带符号 |
-| c066e_zhidu_yuee_bili | ✅ | 财政制度变化 | 局势推进、派系变化、财政制度变化、阶级变化 | — | 局势推进、派系变化、阶级变化 | 口径=月额按比例增减：数值=百分比，削为负 |
-| c066f_zhidu_zhizao_zeng | ✅ | 财政制度变化 | 局势推进、财政制度变化 | — | 局势推进 | 增额方向：月额增减正数 |
-| c066g_neg_koujing_maodun | ✅ | — | 局势推进、派系变化、阶级变化 | — | 局势推进、派系变化、阶级变化 | 口径矛盾陷阱（prompt 6.2 末）：同段并出『总额压至30万』『实减2万』『率100→55』三种互斥口径，算不出唯 |
-| c067_xinli_qishui | ✅ | 新立月度收支 | 局势推进、新立月度收支、阶级变化 | — | 局势推进、阶级变化 |  |
-| c068_xinli_jintie | ✅ | 新立月度收支 | 军队变化、势力变化、四方动向、局势推进、新立月度收支 | — | 军队变化、势力变化、四方动向、局势推进 |  |
-| c068a_xinli_dingfu | ✅ | 新立月度收支 | 国势变化、局势推进、新立月度收支、派系变化、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 | 动态人头税：formula=per_basis,basis=population（键由LLM自拟dingfu_base不 |
-| c068b_xinli_mushui | ✅ | 新立月度收支 | 四方动向、国势变化、局势推进、新立月度收支、派系变化、阶级变化 | — | 四方动向、国势变化、局势推进、派系变化、阶级变化 | 动态田亩税：basis=registered_land（落英文） |
-| c068c_caiche_zhizao | ✅ | 裁撤月度收支 | 国势变化、局势推进、派系变化、裁撤月度收支、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 | 裁撤的是支出/收入固定科目，与c010矿税(收入)互补，此为内库收入项永罢 |
-| c069_caiche_yanke | ✅ | 地区变化 | 国势变化、地区变化、局势推进、派系变化、裁撤月度收支、阶级变化 | — | 国势变化、局势推进、派系变化、裁撤月度收支、阶级变化 |  |
-| c070_minxin_zheng | ✅ | 国势变化、地区变化 | 国势变化、地区变化、局势推进、派系变化、钱粮收支、阶级变化 | — | 局势推进、派系变化、钱粮收支、阶级变化 |  |
-| c071_minxin_fu | ✅ | 国势变化 | 军队变化、势力变化、四方动向、国势变化、局势推进、阶级变化 | — | 军队变化、势力变化、四方动向、局势推进、阶级变化 |  |
-| c072_paixi_donglin | ✅ | 派系变化、人物变化 | 人物变化、国势变化、局势推进、派系变化、阶级变化 | — | 国势变化、局势推进、阶级变化 |  |
-| c073_jieji_junhu | ✅ | 阶级变化 | 军队变化、四方动向、国势变化、地区变化、局势推进、派系变化、钱粮收支、阶级变化 | — | 军队变化、四方动向、国势变化、地区变化、局势推进、派系变化、钱粮收支 |  |
-| c074_jieji_shangren | ✅ | 阶级变化 | 局势推进、阶级变化 | — | 局势推进 |  |
-| c075_diqu_fengshou | ✅ | 地区变化 | 地区变化、局势推进、阶级变化 | — | 局势推进、阶级变化 |  |
-| c076_diqu_shoufu | ✅ | 地区变化 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、派系变化 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、派系变化 |  |
-| c077_diqu_fubai | ✅ | 地区变化 | 国势变化、地区变化、局势推进、派系变化、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 |  |
-| c078_xinli_zhaofu | ✅ | 新立局势 | 人物变化、局势推进、新立局势 | — | 人物变化、局势推进 |  |
-| c079_xinli_an | ✅ | 新立局势 | 人物变化、国势变化、局势推进、新立局势、派系变化 | — | 人物变化、国势变化、局势推进、派系变化 |  |
-| c080_xinli_bingzhi | ❌ | 新立局势 | 国势变化、局势推进、派系变化、阶级变化 | 新立局势 | 国势变化、局势推进、派系变化、阶级变化 |  |
-| c081_tuijin_zhonggongcheng | ✅ | 局势推进 | 局势推进、阶级变化 | — | 阶级变化 |  |
-| c082_tuijin_wuxiao | ✅ | — | 局势推进 | — | 局势推进 |  |
-| c083_jiean_failed | ❌ | 结案局势 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、阶级变化 | 结案局势 | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新建军队、阶级变化 |  |
-| c084_jiean_diguo | ✅ | 结案局势 | 国势变化、局势推进、派系变化、结案局势、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 |  |
-| c085_chexiao_2 | ✅ | 撤销局势 | 局势推进、撤销局势、裁撤月度收支 | — | 局势推进、裁撤月度收支 |  |
-| c086_jundui_gaibianzhi | ✅ | 军队变化 | 军队变化、四方动向、局势推进、派系变化、阶级变化 | — | 四方动向、局势推进、派系变化、阶级变化 |  |
-| c087_jundui_caiche | ✅ | 军队变化 | 军队变化、局势推进、阶级变化 | — | 局势推进、阶级变化 |  |
-| c088_jundui_chexiao | ✅ | 军队变化 | 军队变化、局势推进 | — | 局势推进 |  |
-| c089_xinjianjun_houjin | ✅ | 新建军队 | 局势推进、新建军队 | — | 局势推进 |  |
-| c090_xinjianjun_menggu | ✅ | 新建军队 | 四方动向、局势推进、新建军队 | — | 四方动向、局势推进 |  |
-| c091_shili_zhuangda | ✅ | 势力变化、四方动向 | 势力变化、四方动向、国势变化、地区变化、局势推进、阶级变化 | — | 国势变化、地区变化、局势推进、阶级变化 |  |
-| c092_sifang_chaoxian | ✅ | 四方动向 | 四方动向、国势变化、局势推进、钱粮收支 | — | 国势变化、局势推进、钱粮收支 |  |
-| c092a_junbei_ganzhi | ✅ | 军备变化 | 军备变化、局势推进 | — | 局势推进 |  |
-| c092b_junbei_huojiao | ✅ | 军备变化 | 军备变化、局势推进、阶级变化 | — | 局势推进、阶级变化 |  |
-| c092c_junbei_aomen | ✅ | 军备变化 | 军备变化、局势推进 | — | 局势推进 |  |
-| c093_renshi_diaoren | ✅ | 人物变化 | 人物变化、军队变化、局势推进 | — | 军队变化、局势推进 |  |
-| c094_zhuangtai_zhishi | ✅ | 人物变化 | 人物变化、局势推进、派系变化 | — | 局势推进、派系变化 |  |
-| c095_zhuangtai_shengu | ✅ | 人物变化 | 人物变化、军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、派系变化、阶级变化 | — | 军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、新立局势、派系变化、阶级变化 |  |
-| c096_yizhu_jiangdi | ✅ | 人物变化 | 人物变化、军队变化、势力变化、四方动向、国势变化、局势推进、新建军队 | — | 军队变化、势力变化、四方动向、国势变化、局势推进、新建军队 |  |
-| c097_hougong_feijun | ✅ | 后宫册封 | 后宫册封、局势推进 | — | 局势推进 |  |
-| c098_jieju_null | ✅ | — | 国势变化、地区变化、局势推进、新立局势、阶级变化 | — | 国势变化、地区变化、局势推进、新立局势、阶级变化 |  |
-| c099_jieju_suicide | ✅ | 崇祯结局 | 军备变化、军队变化、势力变化、四方动向、国势变化、地区变化、局势推进、崇祯结局 | — | 军备变化、军队变化、势力变化、四方动向、国势变化、地区变化、局势推进 |  |
-| c100_jieju_abdicate | ✅ | 崇祯结局 | 势力变化、四方动向、国势变化、地区变化、局势推进、崇祯结局、派系变化、阶级变化 | — | 势力变化、四方动向、国势变化、地区变化、局势推进、派系变化、阶级变化 |  |
-| c101_neg_jiuanchongti | ✅ | — | 局势推进、派系变化 | — | 局势推进、派系变化 | 【已知无效负样本，不计入有效结果】directive 把『魏忠贤已下狱』明写进文本，extractor 据文本抽人物状态 |
-| c102_neg_taolun | ❌ | — | 国势变化、地区变化、局势推进、钱粮收支、阶级变化 | — | 国势变化、地区变化、局势推进、钱粮收支、阶级变化 | 【已知无效负样本，不计入有效结果】directive 写了具体赈银数目，extractor 易据此抽钱粮收支；『讨论未决 |
-| c103_neg_qianxiang_weidao | ✅ | — | 局势推进 | — | 局势推进 | 欠额存在但无收支，不应写补饷（负样本不给cheat） |
-| c103b_neg_guding_chongchou | ✅ | — | 局势推进 | — | 局势推进 | 重抽固定项陷阱（prompt 5.2 第7条）：宗室禄米/官俸/金花银/织造是 fiscal_config 固定月度收支 |
-| c103c_neg_zhidu_vs_xianjin | ✅ | 财政制度变化 | 局势推进、派系变化、财政制度变化、阶级变化 | — | 局势推进、派系变化、阶级变化 | 区分『改月度额度』(财政制度变化)与『一次性现金』(钱粮收支)：削禄米是改额度，不产生本月现金流，钱粮收支不得抽 |
-| c104_miling_fuzuoyong2 | ❌ | 密令进度 | 国势变化、密令副作用、局势推进、新立局势、派系变化、阶级变化 | 密令进度 | 国势变化、密令副作用、局势推进、新立局势、派系变化、阶级变化 |  |
-| c105_miling_jiean2 | ✅ | 密令结案 | 密令结案、局势推进、派系变化 | — | 局势推进、派系变化 |  |
-| c106_combo_full_neizheng | ❌ | 钱粮收支、财政制度变化、地区变化、阶级变化、国势变化 | 国势变化、地区变化、局势推进、新立月度收支、派系变化、钱粮收支、阶级变化 | 财政制度变化 | 局势推进、新立月度收支、派系变化 |  |
-| c107_combo_xinjun_junbei | ✅ | 新建军队、军备变化 | 人物变化、军备变化、地区变化、局势推进、新建军队、阶级变化 | — | 人物变化、地区变化、局势推进、阶级变化 |  |
+| c037_zhuangtai_bachu | ✅ | 人物变化 | 人物变化、军队变化、四方动向、国势变化、地区变化、局势推进、派系变化、钱粮收支、阶级变化 | — | 军队变化、四方动向、国势变化、地区变化、局势推进、派系变化、钱粮收支、阶级变化 |  |
+| c038_zhuangtai_liufang | ✅ | 人物变化 | 人物变化、国势变化、局势推进、派系变化、阶级变化 | — | 国势变化、局势推进、派系变化、阶级变化 |  |
+| c039_yizhu_guizheng | ✅ | 人物变化 | 人物变化、势力变化、四方动向、地区变化、局势推进、新建军队、阶级变化 | — | 势力变化、四方动向、地区变化、局势推进、新建军队、阶级变化 | 归正必抽 new_power=ming；原『某某』占位违反姓名原文命中铁律故改真名 |
+| c040_hougong_cefeng | ✅ | 后宫册封 | 后宫册封、国势变化、局势推进 | — | 国势变化、局势推进 |  |
+| c041_hougong_feizhi | ✅ | 后宫册封 | 后宫册封、国势变化、局势推进 | — | 国势变化、局势推进 |  |
+| c042_miling_fuzuoyong | ✅ | 密令进度 | 密令进度、局势推进、派系变化、阶级变化 | — | 局势推进、派系变化、阶级变化 |  |
+| c043_miling_jiean | ❌ | 密令结案 | — | 密令结案 | — |  |
+| c050_combo_chaojia_bushang | ❌ | 钱粮收支、军队变化 | — | 军队变化、钱粮收支 | — |  |
+| c051_combo_zhenzai_jieji | ❌ | 钱粮收支、地区变化、阶级变化 | — | 地区变化、钱粮收支、阶级变化 | — |  |
+| c052_combo_qingdang | ❌ | 钱粮收支、人物变化、派系变化 | — | 人物变化、派系变化、钱粮收支 | — |  |
+| c053_combo_xinjun_renshi | ❌ | 人物变化、新建军队 | — | 人物变化、新建军队 | — |  |
+| c054_combo_gongcheng_xinli_caiche | ❌ | 新立局势、裁撤月度收支 | — | 新立局势、裁撤月度收支 | — |  |
+| c055_combo_xianluo_jundui | ❌ | 地区变化、军队变化 | — | 军队变化、地区变化 | — |  |
+| c056_combo_shili_sifang | ❌ | 势力变化、四方动向、国势变化 | — | 势力变化、四方动向、国势变化 | — |  |
+| c057_combo_xinli_keji_bumen | ❌ | 新立局势 | — | 新立局势 | — |  |
+| c058_combo_jiean_diguoxiuzheng | ❌ | 结案局势 | — | 结案局势 | — |  |
+| c059_combo_hougong_renshi | ❌ | 后宫册封、人物变化 | — | 人物变化、后宫册封 | — |  |
+| c060_combo_caiche_jiazheng | ❌ | 地区变化 | — | 地区变化 | — |  |
+| c061_chaojia_huanguan | ❌ | 钱粮收支 | — | 钱粮收支 | — |  |
+| c062_bushang_xuanda | ❌ | 钱粮收支 | — | 钱粮收支 | — |  |
+| c063_bushang_jizhen | ❌ | 钱粮收支 | — | 钱粮收支 | — |  |
+| c064_jinwei_xiaoe | ❌ | 钱粮收支 | — | 钱粮收支 | — | 小额换算：四千六百两=0.46万两 |
+| c065_jiazheng_yanshui | ❌ | 地区变化 | — | 地区变化 | — |  |
+| c066_zhidu_shewei | ❌ | 财政制度变化 | — | 财政制度变化 | — | 口径=设为原始值：数值即新值 |
+| c066b_zhidu_zengjian_yuan | ❌ | 财政制度变化 | — | 财政制度变化 | — | 口径=增减原始值：数值为增量 |
+| c066c_zhidu_yuee_shewei | ❌ | 财政制度变化 | — | 财政制度变化 | — | 口径=月额设为：数值=新总额万两 |
+| c066d_zhidu_yuee_zengjian | ❌ | 财政制度变化 | — | 财政制度变化 | — | 口径=月额增减：数值为月额增量带符号 |
+| c066e_zhidu_yuee_bili | ❌ | 财政制度变化 | — | 财政制度变化 | — | 口径=月额按比例增减：数值=百分比，削为负 |
+| c066f_zhidu_zhizao_zeng | ❌ | 财政制度变化 | — | 财政制度变化 | — | 增额方向：月额增减正数 |
+| c066g_neg_koujing_maodun | ✅ | — | — | — | — | 口径矛盾陷阱（prompt 6.2 末）：同段并出『总额压至30万』『实减2万』『率100→55』三种互斥口径，算不出唯 |
+| c067_xinli_qishui | ❌ | 新立月度收支 | — | 新立月度收支 | — |  |
+| c068_xinli_jintie | ❌ | 新立月度收支 | — | 新立月度收支 | — |  |
+| c068a_xinli_dingfu | ❌ | 新立月度收支 | — | 新立月度收支 | — | 动态人头税：formula=per_basis,basis=population（键由LLM自拟dingfu_base不 |
+| c068b_xinli_mushui | ❌ | 新立月度收支 | — | 新立月度收支 | — | 动态田亩税：basis=registered_land（落英文） |
+| c068c_caiche_zhizao | ❌ | 裁撤月度收支 | — | 裁撤月度收支 | — | 裁撤的是支出/收入固定科目，与c010矿税(收入)互补，此为内库收入项永罢 |
+| c069_caiche_yanke | ❌ | 地区变化 | — | 地区变化 | — |  |
+| c070_minxin_zheng | ❌ | 国势变化、地区变化 | — | 国势变化、地区变化 | — |  |
+| c071_minxin_fu | ❌ | 国势变化 | — | 国势变化 | — |  |
+| c072_paixi_donglin | ❌ | 派系变化、人物变化 | — | 人物变化、派系变化 | — |  |
+| c073_jieji_junhu | ❌ | 阶级变化 | — | 阶级变化 | — |  |
+| c074_jieji_shangren | ❌ | 阶级变化 | — | 阶级变化 | — |  |
+| c075_diqu_fengshou | ❌ | 地区变化 | — | 地区变化 | — |  |
+| c076_diqu_shoufu | ❌ | 地区变化 | — | 地区变化 | — |  |
+| c077_diqu_fubai | ❌ | 地区变化 | — | 地区变化 | — |  |
+| c078_xinli_zhaofu | ❌ | 新立局势 | — | 新立局势 | — |  |
+| c079_xinli_an | ❌ | 新立局势 | — | 新立局势 | — |  |
+| c080_xinli_bingzhi | ❌ | 新立局势 | — | 新立局势 | — | 军务章程类改革(非军队实体变化)走新立局势；原 cheat 未明示立issue致LLM当一锤子事 FAIL |
+| c081_tuijin_zhonggongcheng | ❌ | 局势推进 | — | 局势推进 | — |  |
+| c082_tuijin_wuxiao | ✅ | — | — | — | — |  |
+| c083_jiean_failed | ❌ | 结案局势 | — | 结案局势 | — | 失败结案：须预置 active issue 方有编号可结案；原缺 sql 致无 issue 可结故 FAIL |
+| c084_jiean_diguo | ❌ | 结案局势 | — | 结案局势 | — |  |
+| c085_chexiao_2 | ❌ | 撤销局势 | — | 撤销局势 | — |  |
+| c086_jundui_gaibianzhi | ❌ | 军队变化 | — | 军队变化 | — |  |
+| c087_jundui_caiche | ❌ | 军队变化 | — | 军队变化 | — |  |
+| c088_jundui_chexiao | ❌ | 军队变化 | — | 军队变化 | — |  |
+| c089_xinjianjun_houjin | ❌ | 新建军队 | — | 新建军队 | — |  |
+| c090_xinjianjun_menggu | ❌ | 新建军队 | — | 新建军队 | — |  |
+| c091_shili_zhuangda | ❌ | 势力变化、四方动向 | — | 势力变化、四方动向 | — |  |
+| c092_sifang_chaoxian | ❌ | 四方动向 | — | 四方动向 | — |  |
+| c092a_junbei_ganzhi | ❌ | 军备变化 | — | 军备变化 | — |  |
+| c092b_junbei_huojiao | ❌ | 军备变化 | — | 军备变化 | — |  |
+| c092c_junbei_aomen | ❌ | 军备变化 | — | 军备变化 | — |  |
+| c093_renshi_diaoren | ❌ | 人物变化 | — | 人物变化 | — |  |
+| c094_zhuangtai_zhishi | ❌ | 人物变化 | — | 人物变化 | — |  |
+| c095_zhuangtai_shengu | ❌ | 人物变化 | — | 人物变化 | — |  |
+| c096_yizhu_jiangdi | ❌ | 人物变化 | — | 人物变化 | — |  |
+| c097_hougong_feijun | ❌ | 后宫册封 | — | 后宫册封 | — |  |
+| c098_jieju_null | ✅ | — | — | — | — |  |
+| c099_jieju_suicide | ❌ | 崇祯结局 | — | 崇祯结局 | — | emperor_fate=None 期望 'suicide' |
+| c100_jieju_abdicate | ❌ | 崇祯结局 | — | 崇祯结局 | — | emperor_fate=None 期望 'abdicate' |
+| c101_neg_jiuanchongti | ✅ | — | — | — | — | 【已知无效负样本，不计入有效结果】directive 把『魏忠贤已下狱』明写进文本，extractor 据文本抽人物状态 |
+| c102_neg_taolun | ✅ | — | — | — | — | 【已知无效负样本，不计入有效结果】directive 写了具体赈银数目，extractor 易据此抽钱粮收支；『讨论未决 |
+| c103_neg_qianxiang_weidao | ✅ | — | — | — | — | 欠额存在但无收支，不应写补饷（负样本不给cheat） |
+| c103b_neg_guding_chongchou | ✅ | — | — | — | — | 重抽固定项陷阱（prompt 5.2 第7条）：宗室禄米/官俸/金花银/织造是 fiscal_config 固定月度收支 |
+| c103c_neg_zhidu_vs_xianjin | ❌ | 财政制度变化 | — | 财政制度变化 | — | 区分『改月度额度』(财政制度变化)与『一次性现金』(钱粮收支)：削禄米是改额度，不产生本月现金流，钱粮收支不得抽 |
+| c104_miling_fuzuoyong2 | ❌ | 密令进度 | — | 密令进度 | — |  |
+| c105_miling_jiean2 | ❌ | 密令结案 | — | 密令结案 | — |  |
+| c106_combo_full_neizheng | ❌ | 钱粮收支、地区变化、阶级变化、国势变化 | — | 国势变化、地区变化、钱粮收支、阶级变化 | — | 全国不分省加征商税→地区变化『全国』key 摊派；禁止再建新立科目(双账)或写财政制度变化 |
+| c107_combo_xinjun_junbei | ❌ | 新建军队、军备变化 | — | 军备变化、新建军队 | — |  |

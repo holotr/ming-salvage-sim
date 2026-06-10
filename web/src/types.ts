@@ -458,6 +458,8 @@ export type LLMConfigInfo = {
   model: string;
   max_tokens: number;
   timeout_seconds: number;
+  connect_timeout_seconds: number;
+  read_timeout_seconds: number;
   thinking_level: string;
   advanced_model: string;
   advanced_base_url: string;
@@ -470,6 +472,8 @@ export type LLMConfigInfo = {
     has_api_key: boolean;
     max_tokens: number;
     timeout_seconds: number;
+    connect_timeout_seconds: number;
+    read_timeout_seconds: number;
     thinking_level: string;
     advanced_model: string;
     advanced_base_url: string;
@@ -570,6 +574,8 @@ export type MenuStatus = {
     has_api_key: boolean;
     max_tokens: number;
     timeout_seconds: number;
+    connect_timeout_seconds: number;
+    read_timeout_seconds: number;
     thinking_level: string;
     advanced_model: string;
     advanced_base_url: string;
