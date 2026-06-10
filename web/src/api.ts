@@ -1,6 +1,15 @@
 import React from "react";
 import { forwardSteamEvents } from "./steamEvents";
-import type { ApiErrorDetail, ChatResponse, CourtChatMessage, CourtChatResponse } from "./types";
+import type {
+  ApiErrorDetail,
+  ChatResponse,
+  CourtChatMessage,
+  CourtChatResponse,
+  ScenarioChatResult,
+  ScenarioFull,
+  ScenarioGenerateResult,
+  ScenarioManifest,
+} from "./types";
 
 declare global {
   interface Window {
@@ -199,4 +208,94 @@ export const summarizeCourtChat = async (messages: CourtChatMessage[]): Promise<
       })),
     }),
   });
+};
+
+// ---- 自定义剧本 ----
+
+export const listScenarios = () =>
+  api<{ scenarios: ScenarioManifest[]; active_id: string }>("/api/scenarios");
+
+export const getScenario = (id: string) =>
+  api<ScenarioFull>(`/api/scenarios/${encodeURIComponent(id)}`);
+
+// copyFrom: ""=空白；"__default__"=复制默认（崇祯元年）；其余=复制该剧本 id。
+export const createScenario = (name: string, description: string, copyFrom = "") =>
+  api<{ manifest: ScenarioManifest; active_id: string }>("/api/scenarios", {
+    method: "POST",
+    body: JSON.stringify({ name, description, copy_from: copyFrom }),
+  });
+
+export const updateScenarioFile = (id: string, file: "characters" | "events" | "seed_events", content: unknown) =>
+  api<{ manifest: ScenarioManifest }>(`/api/scenarios/${encodeURIComponent(id)}/${file}`, {
+    method: "PUT",
+    body: JSON.stringify({ content }),
+  });
+
+export const updateScenarioManifest = (id: string, patch: { name?: string; description?: string }) =>
+  api<{ manifest: ScenarioManifest }>(`/api/scenarios/${encodeURIComponent(id)}/manifest`, {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+
+export const deleteScenario = (id: string) =>
+  api<{ scenarios: ScenarioManifest[]; active_id: string }>(`/api/scenarios/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+
+export const activateScenario = (id: string) =>
+  api<{ active_id: string; scenarios: ScenarioManifest[] }>(`/api/scenarios/${encodeURIComponent(id)}/activate`, {
+    method: "POST",
+  });
+
+export const deactivateScenario = () =>
+  api<{ active_id: string; scenarios: ScenarioManifest[] }>("/api/scenarios/deactivate", {
+    method: "POST",
+  });
+
+export const generateScenario = (req: { prompt: string; name?: string; description?: string; files?: string[] }) =>
+  api<ScenarioGenerateResult>("/api/scenarios/generate", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+
+export const streamScenarioChat = async (
+  scenarioId: string,
+  message: string,
+  onDelta: (delta: string) => void,
+): Promise<ScenarioChatResult> => {
+  const response = await fetch(apiUrl(`/api/scenarios/${encodeURIComponent(scenarioId)}/chat/stream`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new ApiRequestError(normalizeApiError(error, response.statusText), response.statusText);
+  }
+  if (!response.body) {
+    throw new Error("浏览器不支持流式回复。");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const messages = buffer.split("\n\n");
+    buffer = messages.pop() || "";
+    for (const messageBlock of messages) {
+      const parsed = parseSseMessage(messageBlock);
+      if (!parsed) continue;
+      const payload = JSON.parse(parsed.data);
+      if (parsed.event === "delta") {
+        onDelta(String(payload.content || ""));
+      } else if (parsed.event === "done") {
+        return payload as ScenarioChatResult;
+      } else if (parsed.event === "error") {
+        throw new ApiRequestError(normalizeApiError(payload, "对话失败。"), "对话失败。");
+      }
+    }
+    if (done) break;
+  }
+  throw new Error("对话中断，未收到完成事件。");
 };

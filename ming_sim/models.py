@@ -6,7 +6,7 @@ CourtContext 的 state/db 注解用字符串前向引用，避免 import db.py�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from ming_sim.constants import ECONOMY_ACCOUNTS
 
@@ -46,6 +46,11 @@ class Character:
     courage: int
     style: str
     power_id: str
+    diplomacy: int = 50  # 外交
+    martial: int = 50  # 军事
+    stewardship: int = 50  # 管理
+    intrigue: int = 50  # 谋略
+    learning: int = 50  # 学识
     location: str = ""
     birth_year: int = 0  # 历史生年（公历，0=未填）
     historical_death_year: int = 0  # 历史卒年（公历，0=未填）
@@ -72,9 +77,11 @@ class Event:
     fail_condition: str = ""
     trigger_year: int = 0   # 历史锚定触发年（公历，0=非历史锚定，靠 trigger_gate）
     trigger_month: int = 0  # 1-12，0=年内任意月
+    is_historical: Optional[bool] = None  # 是否史实锚定情势，喂 simulator 决定浮现策略；JSON 不填则缺省=trigger_year>0
     trigger_end_year: int = 0   # 候选窗口结束年（0=不设上限）
     trigger_end_month: int = 0  # 候选窗口结束月（0=年内任意月）
-    precondition: str = ""  # 触发前提+改写口子人话说明，喂 simulator 由 LLM 据盘面判断是否改写/跳过（见 season_simulator.md 候选情势触发判定）
+    precondition: str = ""  # 触发前提的人话说明，喂 simulator 由 LLM 判定（叙事背景+结果烈度/走向，可列结果分档）；不走程序求值（触发与否的程序闸看 require/trigger_gate）
+    require: Dict[str, object] = field(default_factory=dict)  # 结构化触发前提（布尔树/扁平 dict，见 gating.evaluate_gate）；空=无可证伪前提（历史既定型）。require 不过则 node 不进候选/不触发
     event_type: str = "situation"  # situation=转 bar issue；node=只播报不转 issue；ending=交结局判定
     trigger_gate: Dict[str, str] = field(default_factory=dict)  # seed 候选门槛：{metric: 比较式}，全满足才进候选
     auto_trigger: bool = False  # True=gate 达标即由程序硬立项，绕过 LLM 因果判定（不进候选池等 extractor 决定）
@@ -137,7 +144,7 @@ class Region:
     # huang_tian    皇庄（万亩），产出→内库，仅北直隶有
     # wang_tian     藩王庄田（万亩），免税，禄米→国库支出
     # guan_min_tian 官民田（万亩），田赋→国库
-    # liao_xiang    辽饷月摊派额（万两）
+    # liao_xiang_li 辽饷亩率（毫/亩/年），按官民田摊派
     # salt_tax      盐税月基数（万两），产盐省才>0
     # commerce_tax  商税月基数（万两）
     # corruption    腐败度 0-100，影响解运比
@@ -153,6 +160,7 @@ class Army:
     commander: str
     controller: str
     troop_type: str
+    troop_composition: dict
     manpower: int
     maintenance_per_turn: int
     supply: int
@@ -164,6 +172,7 @@ class Army:
     loyalty: int
     status: str
     owner_power: str
+    arms: list = field(default_factory=list)  # 开局持械 [{troop_type, weapon, qty}]，seed 写 army_arms
 
 
 @dataclass
@@ -207,7 +216,7 @@ class OpeningLegacy:
     name: str
     modifiers: Dict[str, object]
     narrative_hint: str
-    clear_gate: Dict[str, str]
+    clear_gate: Dict[str, object]  # gate DSL：布尔树 / 扁平 dict，见 gating.evaluate_gate
     clear_narrative: str = ""
 
 
@@ -255,7 +264,7 @@ class PresetTechnology:
     fail_condition: str
     effect_on_resolve: Dict[str, object]
     effect_on_fail: Dict[str, object]
-    requires: List[str] = field(default_factory=list)  # 前置科技 key；空=根节点
+    requires: List[str] = field(default_factory=list)  # 前置科技 key；空=根节点。立项时强制校验前置全研成（_unmet_tech_prereqs）
     default_unlocked: bool = False                     # 新档开局即已研成并 seed 入 technologies
 
 

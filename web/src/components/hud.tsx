@@ -597,15 +597,26 @@ export function BudgetList({ title, items, expense = false }: { title: string; i
   return (
     <span className="budget-list">
       <span className="budget-list-title">{title}</span>
-      {items.map((item) => (
-        <span className="budget-row" key={`${title}-${item.name}`}>
-          <span>
-            <b>{item.name}</b>
-            <small>{item.formula ? `${item.formula_kind === "per_basis" ? "税基" : "基准"} ${item.formula} = ${formatMoney(item.amount)} · ${item.note}` : item.note}</small>
+      {items.map((item) => {
+        const shortPay = item.paid_estimate !== undefined && item.paid_estimate < item.amount;
+        return (
+          <span className="budget-row" key={`${title}-${item.name}`}>
+            <span>
+              <b>{item.name}</b>
+              <small>
+                {item.formula
+                  ? `${item.formula_kind === "per_basis" ? "税基" : "基准"} ${item.formula} = ${formatMoney(item.amount)} · ${item.note}`
+                  : item.note}
+                {shortPay ? `（国库不足，实发 ${formatMoney(item.paid_estimate!)}，差额转欠饷）` : ""}
+              </small>
+            </span>
+            <strong className={expense ? "expense" : "income"}>
+              {expense ? "-" : "+"}{formatMoney(item.amount)}
+              {shortPay ? <small className="budget-paid-estimate">实发 {formatMoney(item.paid_estimate!)}</small> : null}
+            </strong>
           </span>
-          <strong className={expense ? "expense" : "income"}>{expense ? "-" : "+"}{formatMoney(item.amount)}</strong>
-        </span>
-      ))}
+        );
+      })}
     </span>
   );
 }

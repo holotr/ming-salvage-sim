@@ -67,8 +67,30 @@ DECISION_NARRATIVE_PREFIX = (
 )
 
 # 决策块边界标记。simulator 在邸报末尾按规范输出，本回合解析后从 narrative 剥离。
-_DECISION_RE = re.compile(r"<<DECISION>>\s*(\{.*?\})\s*<<END>>", re.DOTALL)
+# group(1) 抓 <<DECISION>> 与 <<END>> 之间的全部内容（含带嵌套 options 的多层 JSON）——
+# 不能用 \{.*?\} 抠 JSON：options:[{...},{...}] 有嵌套 }，非贪婪会在第一个 } 截断、
+# 导致整块匹配失败、决策块剥不掉而原文泄露到前端。JSON 边界交给 json.loads 判。
+_DECISION_RE = re.compile(r"<<DECISION>>\s*(.*?)\s*<<END>>", re.DOTALL)
 MAX_DECISIONS_PER_TURN = 5
+
+# 「陛下未知者」详细暗线：simulator 用 <secret>…</secret> 包住只供留痕/结算、不给玩家看的
+# 详细内幕（具体人名、数目、密报原话）；标签外的粗略梗概句留给玩家。落库时 turn_report
+# 剥掉 secret 段只存粗略版，turn_extraction 存含 secret 的原文供 extractor 与事后追溯。
+_SECRET_DETAIL_RE = re.compile(r"<secret>\s*(.*?)\s*</secret>", re.DOTALL)
+
+
+def strip_secret_detail(narrative: str) -> str:
+    """剥掉 <secret>…</secret> 详细暗线段（连同标签），得到给玩家看的粗略版邸报。
+    标签成对缺失/残缺也安全：仅删成对匹配段，多余裸标签一并清掉防泄漏。"""
+    if not narrative:
+        return narrative
+    clean = _SECRET_DETAIL_RE.sub("", narrative)
+    # 兜底：模型偶尔漏闭合标签，裸 <secret>/</secret> 一律删掉，绝不让标签字面泄露给玩家。
+    clean = clean.replace("<secret>", "").replace("</secret>", "")
+    # 删 secret 段后可能留下多余空行/行尾空格，收一下。
+    clean = re.sub(r"[ \t]+\n", "\n", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean.strip()
 
 
 def parse_decision_blocks(narrative: str) -> tuple[str, List[Dict[str, object]]]:
@@ -200,6 +222,7 @@ def resolve_directives(
     content=None,
     registry=None,
     cheat_directive: str = "",
+    structured_directives: Optional[List[Dict[str, object]]] = None,
 ) -> ResolveResult:
     """两段式结算 phase1（GameSession.resolve_turn 的主链）：跑固定财政 tick →
     simulator 写**一整篇**月末邸报 → 解析 HITL 决策点。数值抽取在
@@ -219,10 +242,6 @@ def resolve_directives(
     def _emit(kind: str, data: str) -> None:
         if on_event:
             on_event(kind, data)
-
-    if not directives:
-        advance_without_edict(state, db)
-        return ResolveResult(awaiting=False, report=f"本{TURN_UNIT}未颁正式诏书。")
 
     before_turn = state.turn
 
@@ -283,6 +302,7 @@ def resolve_directives(
         debuts_this_turn=debuts_this_turn,
         relevant_memories=relevant_memories,
         secret_orders=secret_orders_for_sim,
+        structured_directives=structured_directives or [],
     )
     simulator = create_season_simulator_agent(
         llm_config, agno_db, state=state, db=db, simulator_payload=simulator_payload
@@ -294,10 +314,16 @@ def resolve_directives(
             debuts_this_turn=debuts_this_turn,
             relevant_memories=relevant_memories,
             secret_orders=secret_orders_for_sim,
+            structured_directives=structured_directives or [],
             simulator_payload=simulator_payload,
             on_thinking=lambda c: _emit("thinking", c),
             on_text=lambda c: _emit("text", c),
         )
+    except LLMUnavailable:
+        # 超时（chunk 间隔超 20s）/ 连通失败等 LLM 不可用：不静默兜底推进回合，
+        # 直接冒泡到 worker → SSE error，提示用户「异常了」，由用户自行读档重来。
+        # 此时回合未 next_period（preresolve 自动存档即结算前状态），读档干净回滚。
+        raise
     except Exception as exc:
         print(f"[WARN] 推演 agent 失败：{exc}；本{TURN_UNIT}用简化邸报兜底，跳过 LLM 结算。")
         narrative = (
@@ -427,13 +453,14 @@ def _settle_after_narrative(
         llm_config=llm_config, agno_db=agno_db,
     )
 
-    # 4) 月末邸报落库（下月作前文）
-    db.save_turn_report(state, narrative)
-    # 推演链原始输入/输出留痕，事后可追「该立的 issue 为何没立」。
+    # 4) 月末邸报落库（下月作前文）。turn_report 给玩家看：剥掉「陛下未知者」<secret> 详细暗线，
+    #    只留粗略梗概；详细版只进 extraction 留痕 + 已喂过 extractor。
+    db.save_turn_report(state, strip_secret_detail(narrative))
+    # 推演链原始输入/输出留痕，事后可追「该立的 issue 为何没立」。含 secret 详细暗线。
     db.save_turn_extraction(
         state,
         decree_text=decree_text,
-        narrative=effective_narrative,  # 留痕含作弊段，便于事后追「为何这么落库」
+        narrative=effective_narrative,  # 留痕含作弊段 + secret 详细，便于事后追「为何这么落库」
         extractor_input=extractor_input,
         extractor_output=extractor_output,
     )
@@ -501,7 +528,10 @@ def _settle_after_narrative(
         ending = f"\n\n【结局·{label}】{outcome.get('summary', '')}"
         if ending_text:
             ending += "\n\n" + ending_text
-    full_report = f"\n本{TURN_UNIT}颁布诏书：\n" + decree_text + "\n\n" + narrative + ending
+    if decree_text.strip().startswith(f"本{TURN_UNIT}无新诏"):
+        full_report = f"\n本{TURN_UNIT}无新诏，承办推进：\n" + decree_text + "\n\n" + narrative + ending
+    else:
+        full_report = f"\n本{TURN_UNIT}颁布诏书：\n" + decree_text + "\n\n" + narrative + ending
     return full_report
 
 

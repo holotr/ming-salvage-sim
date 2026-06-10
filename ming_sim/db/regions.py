@@ -159,7 +159,26 @@ class _RegionsMixin:
         region_deltas: Dict[str, Dict[str, object]],
     ) -> List[Dict[str, object]]:
         changes: List[Dict[str, object]] = []
+        # 特殊 key「全国/__all__」：玩家不分省的商税/盐税加征减征，按各省现有占比摊到每省 fiscal。
+        _NATIONWIDE_KEYS = {"全国", "__all__", "all", "nationwide"}
+        _NATIONWIDE_FIELD_STEM = {"commerce_tax": "商税", "salt_tax": "盐税",
+                                  "商税基数": "商税", "盐税基数": "盐税"}
         for region_id, raw_changes in region_deltas.items():
+            if str(region_id).strip() in _NATIONWIDE_KEYS:
+                reason = str(raw_changes.get("reason") or raw_changes.get("原因") or event.title).strip()[:80]
+                for raw_field, value in raw_changes.items():
+                    stem = _NATIONWIDE_FIELD_STEM.get(str(raw_field).strip())
+                    if stem is None:
+                        continue  # 全国 key 只摊商税/盐税绝对额；其余字段需具体省份，忽略
+                    try:
+                        delta = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    touched = self.apply_dynamic_fiscal_delta(stem, delta)
+                    if touched:
+                        changes.append({"region_id": "全国", "field": stem,
+                                        "delta": delta, "touched": touched, "reason": reason})
+                continue
             row = self.conn.execute("SELECT * FROM regions WHERE id = ?", (region_id,)).fetchone()
             if row is None:
                 print(f"[WARN] region_delta 引用未入库地区 '{region_id}' → 跳过")
@@ -179,7 +198,10 @@ class _RegionsMixin:
 
                 # ── fiscal JSON 子字段（corruption 等）────────────────────────
                 if field in FISCAL_SCORE_FIELDS or field in FISCAL_QUANTITY_FIELDS:
-                    fiscal: dict = json.loads(str(row["fiscal"] or "{}"))
+                    current_row = self.conn.execute(
+                        "SELECT fiscal FROM regions WHERE id = ?", (region_id,)
+                    ).fetchone()
+                    fiscal: dict = json.loads(str((current_row or row)["fiscal"] or "{}"))
                     old_value = fiscal.get(field, 50 if field in FISCAL_SCORE_FIELDS else 0)
                     delta = int(value)
                     if field in FISCAL_SCORE_FIELDS:
@@ -242,6 +264,9 @@ class _RegionsMixin:
                     log_delta = actual_delta
                 else:  # REGION_TEXT_FIELDS
                     text_value = str(value).strip()[:160]
+                    if field == "controlled_by":
+                        # 先归一化（中文名/别名/大小写 → 标准 power id），与 armies.py 同。
+                        text_value = _normalize_power_id(self.conn, text_value) or text_value
                     if not text_value or text_value in ("None", "null") or text_value == str(old_value):
                         continue
                     if field == "controlled_by":

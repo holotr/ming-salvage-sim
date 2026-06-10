@@ -1,11 +1,12 @@
 import React from "react";
 import { createPortal } from "react-dom";
-import { Check, Crown, Info, Landmark, MapPinned, MessageSquareText, ScrollText, Star, Swords, X } from "lucide-react";
+import { Check, Crown, Info, Landmark, MapPinned, MessageSquareText, RotateCcw, ScrollText, Star, Swords, X } from "lucide-react";
 import { MinisterPortrait, PortraitUploadButton, RightDrawer, cacheBust, courtSlots, loadCourtPos, saveCourtPos, snapToSlot } from "./hud";
 import { formatMoney, formatSignedMoney, regionMonthlyTax } from "../format";
-import type { Army, Building, CourtChatMessage, GameState, Issue, MapNode, Minister, Region, Technology } from "../types";
+import type { Army, ArmsStockItem, Building, CourtChatMessage, Department, GameState, Issue, MapNode, Minister, Region, Technology } from "../types";
 
 const canAttendCourtChat = (minister: Minister) => {
+  if (minister.archived) return false;
   const office = (minister.office || "").trim();
   if (minister.status !== "active" || !office) return false;
   return !/(已故|罢居|罢闲|赋闲|致仕|养病|丁忧|归籍|在野)/.test(office);
@@ -43,6 +44,7 @@ export function MinisterCardList({
   selectedMinister,
   emptyNote,
   onOpenChat,
+  onRestoreMinister,
   onUploadPortrait,
   courtMode = false,
   courtBubbles = {},
@@ -58,6 +60,7 @@ export function MinisterCardList({
   selectedMinister: string;
   emptyNote: string;
   onOpenChat: (minister: Minister) => void;
+  onRestoreMinister?: (minister: Minister) => void;
   onUploadPortrait?: (ministerName: string, file: File) => Promise<void>;
   courtMode?: boolean;
   courtBubbles?: Record<string, string>;
@@ -71,9 +74,10 @@ export function MinisterCardList({
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [positions, setPositions] = React.useState<Record<string, { px: number; py: number }>>({});
   const savedPosRef = React.useRef<Record<string, { px: number; py: number }> | null>(null);
-  const dragging = React.useRef<{ name: string; startMX: number; startMY: number; startPX: number; startPY: number } | null>(null);
+  const dragging = React.useRef<{ name: string; pointerId: number; startMX: number; startMY: number; startPX: number; startPY: number } | null>(null);
   const orderDragging = React.useRef<string | null>(null);
   const didDrag = React.useRef(false);
+  const suppressNextClick = React.useRef(false);
 
   // 固定职位 → 固定槽位（由 office 文字推导：office 逗号分项里命中即占该槽）
   const FIXED_SLOTS: { role: string; side: "left" | "right"; slot: number }[] = [
@@ -161,55 +165,79 @@ export function MinisterCardList({
     return () => { cancelled = true; };
   }, [listKey]);
 
-  const onMouseDown = (e: React.MouseEvent, name: string) => {
-    if ((e.target as HTMLElement).closest(".portrait-upload-btn")) return;
-    e.preventDefault();
-    const pos = positions[name] || { px: 0.5, py: 0.8 };
-    dragging.current = { name, startMX: e.clientX, startMY: e.clientY, startPX: pos.px, startPY: pos.py };
-    didDrag.current = false;
-
-    const onMove = (ev: MouseEvent) => {
-      if (!dragging.current) return;
-      const dx = ev.clientX - dragging.current.startMX;
-      const dy = ev.clientY - dragging.current.startMY;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag.current = true;
-      const el = containerRef.current;
-      if (!el) return;
-      const { width, height } = el.getBoundingClientRect();
-      // 拖动增量转百分比
-      const npx = Math.max(0, Math.min(1, dragging.current.startPX + dx / width));
-      const npy = Math.max(0, Math.min(1, dragging.current.startPY + dy / height));
+  const finishCourtDrag = React.useCallback((shouldSnap: boolean) => {
+    const dragName = dragging.current?.name;
+    if (dragName && shouldSnap) {
       setPositions((prev) => {
-        const next = { ...prev, [dragging.current!.name]: { px: npx, py: npy } };
+        const cur = prev[dragName];
+        if (!cur) return prev;
+        const occupied = new Set<string>();
+        const snapped = snapToSlot(cur.px, cur.py, occupied, "");
+        const next = { ...prev, [dragName]: snapped };
         savedPosRef.current = next;
         saveCourtPos(next);
         return next;
       });
-    };
-    const onUp = () => {
-      if (dragging.current && didDrag.current) {
-        // 松手时吸附到最近槽位
-        const dragName = dragging.current.name;
-        setPositions((prev) => {
-          const cur = prev[dragName];
-          if (!cur) return prev;
-          // 已占槽位（其他大臣）
-          const occupied = new Set<string>();
-          // 找吸附目标
-          const snapped = snapToSlot(cur.px, cur.py, occupied, "");
-          const next = { ...prev, [dragName]: snapped };
-          savedPosRef.current = next;
-          saveCourtPos(next);
-          return next;
-        });
-      }
-      dragging.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    } else if (savedPosRef.current) {
+      saveCourtPos(savedPosRef.current);
+    }
+    dragging.current = null;
+    if (shouldSnap) {
+      suppressNextClick.current = true;
+      window.setTimeout(() => {
+        suppressNextClick.current = false;
+        didDrag.current = false;
+      }, 0);
+    } else {
+      didDrag.current = false;
+    }
+  }, []);
+
+  const onCourtPointerDown = (e: React.PointerEvent<HTMLButtonElement>, name: string) => {
+    if ((e.target as HTMLElement).closest(".portrait-upload-btn")) return;
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const pos = positions[name] || { px: 0.5, py: 0.8 };
+    dragging.current = { name, pointerId: e.pointerId, startMX: e.clientX, startMY: e.clientY, startPX: pos.px, startPY: pos.py };
+    didDrag.current = false;
+    e.currentTarget.setPointerCapture(e.pointerId);
   };
+
+  const onCourtPointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragging.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    const dx = e.clientX - drag.startMX;
+    const dy = e.clientY - drag.startMY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag.current = true;
+    const el = containerRef.current;
+    if (!el) return;
+    const { width, height } = el.getBoundingClientRect();
+    if (!width || !height) return;
+    const npx = Math.max(0, Math.min(1, drag.startPX + dx / width));
+    const npy = Math.max(0, Math.min(1, drag.startPY + dy / height));
+    setPositions((prev) => {
+      const next = { ...prev, [drag.name]: { px: npx, py: npy } };
+      savedPosRef.current = next;
+      return next;
+    });
+  };
+
+  const onCourtPointerEnd = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragging.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    finishCourtDrag(didDrag.current);
+  };
+
+  React.useEffect(() => {
+    const cancelDrag = () => finishCourtDrag(false);
+    window.addEventListener("blur", cancelDrag);
+    window.addEventListener("contextmenu", cancelDrag);
+    return () => {
+      window.removeEventListener("blur", cancelDrag);
+      window.removeEventListener("contextmenu", cancelDrag);
+    };
+  }, [finishCourtDrag]);
 
   if (!list.length) return <div className={courtMode ? "minister-list minister-list-court" : "minister-list"}><div className="empty-note">{emptyNote}</div></div>;
 
@@ -259,6 +287,7 @@ export function MinisterCardList({
                   if (selectable) onToggleSelect?.(minister);
                   return;
                 }
+                if (minister.archived) return;
                 onOpenChat(minister);
               }}>
               <div className="minister-card-portrait-wrap">
@@ -279,6 +308,26 @@ export function MinisterCardList({
                 <span className="minister-bio">{minister.summary}</span>
               </div>
               {minister.favorite && <Star className="favorite-mark" size={13} />}
+              {minister.archived && onRestoreMinister && (
+                <span
+                  className="minister-restore-action"
+                  role="button"
+                  tabIndex={0}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRestoreMinister(minister);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key !== "Enter" && e.key !== " ") return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onRestoreMinister(minister);
+                  }}
+                >
+                  <RotateCcw size={13} />
+                  恢复
+                </span>
+              )}
             </button>
           );
         })}
@@ -316,9 +365,15 @@ export function MinisterCardList({
               transformOrigin: "bottom center",
               zIndex: Math.round(pct.py * 1000),
             } : { visibility: "hidden" }}
-            onMouseDown={(e) => onMouseDown(e, minister.name)}
+            onPointerDown={(e) => onCourtPointerDown(e, minister.name)}
+            onPointerMove={onCourtPointerMove}
+            onPointerUp={onCourtPointerEnd}
+            onPointerCancel={onCourtPointerEnd}
+            onLostPointerCapture={() => {
+              if (dragging.current) finishCourtDrag(didDrag.current);
+            }}
             onClick={(e) => {
-              if (didDrag.current) {
+              if (suppressNextClick.current || didDrag.current) {
                 e.preventDefault();
                 return;
               }
@@ -326,6 +381,7 @@ export function MinisterCardList({
                 if (selectable) onToggleSelect?.(minister);
                 return;
               }
+              if (minister.archived) return;
               onOpenChat(minister);
             }}
           >
@@ -349,6 +405,26 @@ export function MinisterCardList({
               <span className="minister-bio">{minister.summary}</span>
             </div>
             {minister.favorite && <Star className="favorite-mark" size={13} />}
+            {minister.archived && onRestoreMinister && (
+              <span
+                className="minister-restore-action"
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRestoreMinister(minister);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter" && e.key !== " ") return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onRestoreMinister(minister);
+                }}
+              >
+                <RotateCcw size={13} />
+                恢复
+              </span>
+            )}
             {courtBubbles[minister.name] ? (
               <div className="court-speech-bubble" role="status">
                 <b>{minister.name}</b>
@@ -365,12 +441,16 @@ export function MinisterCardList({
 
 export function ArmyDrawer({
   armies,
+  armsStock,
+  troopRates,
   open,
   selectedArmyId,
   onSelectArmy,
   onClose,
 }: {
   armies: Army[];
+  armsStock?: ArmsStockItem[];
+  troopRates?: Record<string, number>;
   open: boolean;
   selectedArmyId: string;
   onSelectArmy: (id: string) => void;
@@ -380,6 +460,30 @@ export function ArmyDrawer({
   const mingArmies = armies.filter((a) => (a.owner_power || "ming") === "ming");
   const filtered = q ? mingArmies.filter((a) => a.name.includes(q) || a.station.includes(q) || a.commander.includes(q)) : mingArmies;
   const selected = mingArmies.find((a) => a.id === selectedArmyId) || null;
+  const visibleStock = (armsStock || []).filter((w) => w.unlocked && w.qty > 0);
+  const troopEntries = (army: Army) => Object.entries(army.troop_composition || {}).filter(([, amount]) => Number(amount) > 0);
+  const troopCompositionText = (army: Army) => {
+    const comp = army.troop_composition || {};
+    const parts = Object.entries(comp).filter(([, amount]) => Number(amount) > 0);
+    if (!parts.length) return army.troop_type || "—";
+    return parts.map(([name, amount]) => `${name}${amount}`).join("、");
+  };
+  // 兵种单价来自后端 troop_rates（源自 troop_cost.json，单一来源；不再前端硬编码）。
+  const troopRate = (name: string) => (troopRates && troopRates[name]) ?? 0.08;
+  const troopMonthlyPay = (name: string, amount: number) => troopRate(name) * amount / 1000;
+  const formatWan = (value: number) => {
+    return value.toFixed(2);
+  };
+  const troopPayTotal = (army: Army) => {
+    const entries = troopEntries(army);
+    if (!entries.length) return 0;
+    return entries.reduce((sum, [name, amount]) => sum + troopMonthlyPay(String(name), Number(amount)), 0);
+  };
+  // 某兵种持有的军械实物件数（军→兵种→装备：升级须有对应实物装备，按持械量定升级人数）。
+  const troopArmsText = (army: Army, troopName: string) => {
+    const held = (army.arms || []).filter((w) => w.troop_type === troopName && w.qty > 0);
+    return held.length > 0 ? held.map((w) => `${w.name}×${w.qty}`).join("、") : "暂无";
+  };
   const arrearsTone = (army: Army) => {
     const maint = army.maintenance_per_turn || 1;
     const months = army.arrears / maint;
@@ -391,6 +495,15 @@ export function ArmyDrawer({
     <RightDrawer open={open} onClose={onClose} title="军队" icon={<Swords size={17} />} extraClass="right-drawer-army">
       <div className="right-drawer-search">
         <input className="right-drawer-search-input" placeholder="搜索番号/驻地/统帅…" value={q} onChange={(e) => setQ(e.target.value)} />
+      </div>
+      <div className="arms-stock-tags" aria-label="兵部军备库存标签">
+        {visibleStock.length ? visibleStock.map((w) => (
+          <span key={w.id} className="arms-stock-tag" title={`${w.tier} · 库存 ${w.qty}`}>
+            {w.name}<b>{w.qty}</b>
+          </span>
+        )) : (
+          <span className="arms-stock-tag empty">军备总库空</span>
+        )}
       </div>
       <div className="right-drawer-list">
         {filtered.map((army) => (
@@ -407,29 +520,56 @@ export function ArmyDrawer({
         ))}
         {!filtered.length && <div className="empty-note">{q ? "无匹配结果。" : "暂无大明军队记录。"}</div>}
       </div>
-      {selected && (
-        <div className="right-drawer-detail">
-          <div className="right-drawer-detail-title">
-            {selected.name}
-            <button className="right-drawer-detail-close" onClick={() => onSelectArmy("")} aria-label="关闭详情"><X size={14} /></button>
+      {selected && createPortal(
+        <section className="army-detail-modal-layer" role="dialog" aria-modal="true" aria-label={`${selected.name}军队详情`}>
+          <div className="army-detail-modal-scrim" onClick={() => onSelectArmy("")} />
+          <div className="army-detail-modal">
+            <header className="army-detail-modal-header">
+              <div>
+                <h2>{selected.name}</h2>
+                <span>{selected.station} · {selected.theater}</span>
+              </div>
+              <button className="region-modal-close" onClick={() => onSelectArmy("")} aria-label="关闭详情"><X size={18} /></button>
+            </header>
+            <div className="army-detail-modal-body">
+              <table className="intel-table army-detail-table">
+                <tbody>
+                  <tr><th>统帅</th><td>{selected.commander || "—"}</td><th>主管</th><td>{selected.controller || "—"}</td></tr>
+                  <tr><th>兵种</th><td colSpan={3}>{selected.troop_type}</td></tr>
+                  <tr><th>编制</th><td colSpan={3}>{troopCompositionText(selected)}</td></tr>
+                  <tr><th>兵力</th><td>{selected.manpower}</td><th>月饷</th><td>{selected.maintenance_per_turn}万两（分项{formatWan(troopPayTotal(selected))}）</td></tr>
+                  <tr><th>补给</th><td>{selected.supply}</td><th>士气</th><td>{selected.morale}</td></tr>
+                  <tr><th>操练</th><td>{selected.training}</td><th>机动</th><td>{selected.mobility}</td></tr>
+                  <tr><th>忠诚</th><td colSpan={3}>{selected.loyalty}</td></tr>
+                  <tr><th>欠饷</th><td colSpan={3}>{selected.arrears > 0 ? `${selected.arrears}万两（≈${(selected.arrears / (selected.maintenance_per_turn || 1)).toFixed(1)}月）` : "无欠饷"}</td></tr>
+                  <tr><th>状态</th><td colSpan={3}>{selected.status}</td></tr>
+                </tbody>
+              </table>
+              <table className="intel-table army-troop-table">
+                <thead>
+                  <tr><th>兵种</th><th>人数</th><th>单价</th><th>月饷</th><th>装备</th></tr>
+                </thead>
+                <tbody>
+                  {(troopEntries(selected).length ? troopEntries(selected) : [[selected.troop_type || "未分兵种", selected.manpower]]).map(([name, amount]) => {
+                    const troopName = String(name);
+                    const rate = troopRate(troopName);
+                    const monthlyPay = troopMonthlyPay(troopName, Number(amount));
+                    return (
+                      <tr key={troopName}>
+                        <td>{name}</td>
+                        <td>{Number(amount)}</td>
+                        <td>{rate.toFixed(2)}万/千人</td>
+                        <td>{formatWan(monthlyPay)}万两</td>
+                        <td>{troopArmsText(selected, troopName)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
-          <table className="intel-table">
-            <tbody>
-              <tr><th>驻地</th><td>{selected.station}</td><th>战区</th><td>{selected.theater}</td></tr>
-              <tr><th>统帅</th><td>{selected.commander || "—"}</td><th>兵种</th><td>{selected.troop_type}</td></tr>
-              <tr><th>兵力</th><td>{selected.manpower}</td><th>月饷</th><td>{selected.maintenance_per_turn}万</td></tr>
-              <tr><th>士气</th><td>{selected.morale}</td><th>操练</th><td>{selected.training}</td></tr>
-              <tr><th>军械</th><td>{selected.equipment}</td><th>补给</th><td>{selected.supply}</td></tr>
-              <tr><th>机动</th><td>{selected.mobility}</td><th>忠诚</th><td>{selected.loyalty}</td></tr>
-              <tr><th>欠饷</th><td colSpan={3}>
-                {selected.arrears > 0
-                  ? `${selected.arrears}万两（≈${(selected.arrears / (selected.maintenance_per_turn || 1)).toFixed(1)}月）`
-                  : "无欠饷"}
-              </td></tr>
-              <tr><th>状态</th><td colSpan={3}>{selected.status}</td></tr>
-            </tbody>
-          </table>
-        </div>
+        </section>,
+        document.body
       )}
     </RightDrawer>
   );
@@ -694,11 +834,13 @@ export function EconomyDrawer({
 
 export function AppointmentDrawer({
   ministers,
+  departments = [],
   open,
   onOpenChat,
   onClose,
 }: {
   ministers: Minister[];
+  departments?: Department[];
   open: boolean;
   onOpenChat: (minister: Minister) => void;
   onClose: () => void;
@@ -706,12 +848,15 @@ export function AppointmentDrawer({
   const [q, setQ] = React.useState("");
   const [detailMinister, setDetailMinister] = React.useState<Minister | null>(null);
   const BASE_OFFICES = ["内阁", "吏部", "户部", "礼部", "兵部", "刑部", "工部"];
-  // 新设衙门（军机处/财政部等）：从在职大臣的 office_type 动态收集，排在基础六部之后、「其他」之前。
+  const departmentNames = new Set(departments.map((d) => (d.name || "").trim()).filter(Boolean));
+  // 新设衙门（军机处/情报司等）以 DB 部门表为准；兼容旧存档里只有在职大臣 office_type 的动态部门。
   const extraOffices = [...new Set(
-    ministers
-      .filter((m) => (m.power_id || "ming") === "ming" && m.status === "active")
-      .map((m) => (m.office_type || "").trim())
-      .filter((t) => t && t !== "后宫" && !BASE_OFFICES.includes(t))
+    [
+      ...departments.map((d) => (d.name || "").trim()),
+      ...ministers
+        .filter((m) => (m.power_id || "ming") === "ming" && m.status === "active")
+        .map((m) => (m.office_type || "").trim()),
+    ].filter((t) => t && t !== "后宫" && !BASE_OFFICES.includes(t))
   )];
   const offices = [...BASE_OFFICES, ...extraOffices];
   const byOffice = new Map<string, Minister[]>();
@@ -735,11 +880,11 @@ export function AppointmentDrawer({
       <div className="right-drawer-list">
         {[...offices, "其他"].map((office) => {
           const group = byOffice.get(office) || [];
-          if (!group.length) return null;
+          if (!group.length && (office === "其他" || !departmentNames.has(office))) return null;
           return (
             <div key={office}>
               <div className="right-drawer-section-title">{office}</div>
-              {group.map((m) => (
+              {group.length ? group.map((m) => (
                 <button
                   key={m.name}
                   className="right-drawer-row right-drawer-row-minister"
@@ -764,7 +909,7 @@ export function AppointmentDrawer({
                     <span className="right-drawer-minister-office">{m.office || m.office_type}</span>
                   </div>
                 </button>
-              ))}
+              )) : <div className="empty-note">暂无在职官员。</div>}
             </div>
           );
         })}
@@ -825,10 +970,17 @@ export function MinisterDetailDialog({
       .filter(([, value]) => value !== undefined && value !== null && value !== "")
       .map(([key, value]) => [key, formatFieldValue(key, value)])
     : [];
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
   const dialog = (
     <div className="minister-detail-layer" role="dialog" aria-modal="true" aria-label={`人物详情：${minister.name}`}>
       <div className="minister-detail-scrim" onClick={onClose} />
-      <section className="minister-detail-dialog">
+      <section className="minister-detail-dialog" onClick={(event) => event.stopPropagation()}>
         <header className="minister-detail-header">
           <div>
             <span className={`minister-status status-${minister.status}`}>{minister.status_label || minister.status}</span>
@@ -854,6 +1006,9 @@ export function MinisterDetailDialog({
                 <tr><th>生卒</th><td>{lifeText}</td><th>登场</th><td>{debutText}</td></tr>
                 <tr><th>忠诚</th><td>{minister.loyalty ?? "未载"}</td><th>才干</th><td>{minister.ability ?? "未载"}</td></tr>
                 <tr><th>操守</th><td>{minister.integrity ?? "未载"}</td><th>胆略</th><td>{minister.courage ?? "未载"}</td></tr>
+                <tr><th>外交</th><td>{minister.diplomacy ?? "未载"}</td><th>军事</th><td>{minister.martial ?? "未载"}</td></tr>
+                <tr><th>管理</th><td>{minister.stewardship ?? "未载"}</td><th>谋略</th><td>{minister.intrigue ?? "未载"}</td></tr>
+                <tr><th>学识</th><td>{minister.learning ?? "未载"}</td><th></th><td></td></tr>
                 <tr><th className="intel-section-th" colSpan={4}>人物简介</th></tr>
                 <tr><td colSpan={4}>{minister.description || minister.summary || "未载。"}</td></tr>
                 <tr><th>别名</th><td colSpan={3}>{minister.aliases?.length ? minister.aliases.join("、") : "无"}</td></tr>
@@ -896,6 +1051,7 @@ export function CourtDrawer({
   onGroupChange,
   onClose,
   onOpenChat,
+  onRestoreMinister,
   onUploadPortrait,
   courtChatHistory,
   courtChatInput,
@@ -906,8 +1062,10 @@ export function CourtDrawer({
   courtChatLiveMessages,
   courtChatDecision,
   courtChatSelectedMinisters,
+  courtChatStreamSpeed,
   onCourtChatSelectedMinistersChange,
   onCourtChatInputChange,
+  onCourtChatStreamSpeedChange,
   onSendCourtChat,
   onStopCourtChat,
   onSummarizeCourtChat,
@@ -923,6 +1081,7 @@ export function CourtDrawer({
   onGroupChange: (group: string) => void;
   onClose: () => void;
   onOpenChat: (minister: Minister) => void;
+  onRestoreMinister?: (minister: Minister) => void;
   onUploadPortrait: (ministerName: string, file: File) => Promise<void>;
   courtChatHistory: CourtChatMessage[];
   courtChatInput: string;
@@ -933,8 +1092,10 @@ export function CourtDrawer({
   courtChatLiveMessages: CourtChatMessage[];
   courtChatDecision: CourtChatMessage | null;
   courtChatSelectedMinisters: string[];
+  courtChatStreamSpeed: number;
   onCourtChatSelectedMinistersChange: React.Dispatch<React.SetStateAction<string[]>>;
   onCourtChatInputChange: (value: string) => void;
+  onCourtChatStreamSpeedChange: (value: number) => void;
   onSendCourtChat: (ministers: Minister[], overrideMessage?: string) => void;
   onStopCourtChat: () => void;
   onSummarizeCourtChat: (ministers: Minister[]) => void;
@@ -1061,7 +1222,7 @@ export function CourtDrawer({
           <button className="icon-button" aria-label="收起" onClick={onClose}><X size={16} /></button>
         </div>
         <div className="segmented">
-          {["内阁+六部", "收藏", "在职", "全部"].map((group) => (
+          {["内阁+六部", "收藏", "在职", "全部", "已归档"].map((group) => (
             <button
               className={ministerGroup === group ? "active" : ""}
               key={group}
@@ -1109,6 +1270,7 @@ export function CourtDrawer({
           selectedMinister={selectedMinister}
           emptyNote={q ? "无匹配大臣。" : "此栏暂无可召见大臣。"}
           onOpenChat={onOpenChat}
+          onRestoreMinister={onRestoreMinister}
           courtMode={ministerGroup === "内阁+六部" || ministerGroup === "收藏"}
           onUploadPortrait={onUploadPortrait}
           courtBubbles={courtChatPanelOpen ? {} : courtChatBubbles}
@@ -1162,6 +1324,19 @@ export function CourtDrawer({
                 ) : null}
               </div>
               <footer className="court-chat-panel-composer">
+                <div className="court-chat-speed-control" title="调整朝会流式输出速度">
+                  <span>奏对速度</span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={5}
+                    step={1}
+                    value={courtChatStreamSpeed}
+                    onChange={(e) => onCourtChatStreamSpeedChange(Number(e.target.value))}
+                    aria-label="朝会流式输出速度"
+                  />
+                  <b>{courtChatStreamSpeed}</b>
+                </div>
                 <button className="court-chat-history-btn" onClick={() => setShowHistory((v) => !v)} title="查看本月朝会聊天历史">
                   <MessageSquareText size={16} />
                   <span>{courtChatHistory.length}</span>

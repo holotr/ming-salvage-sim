@@ -6,6 +6,7 @@ _TOKEN_PATCH_INSTALLED 守卫保证补丁只打一次。
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from typing import Dict
 
@@ -13,6 +14,26 @@ from ming_sim.llm_config import is_dashscope_base_url
 
 TOKEN_STATS: Dict[str, Dict[str, int]] = {}
 _TOKEN_PATCH_INSTALLED = False
+
+# 非流式 agent（extractor/sanitizer/decree-writer）跑完会从 agno RunMetrics 自记 token（含
+# cache_read/write，dashscope 原生 usage 不报这俩）。置位时让 monkeypatch 跳过原生 _record_usage，
+# 避免同一次调用被 agno metrics + 原生 usage 双重记账。thread-local：并行 extractor 各线程独立。
+_prefer_agno_metrics = threading.local()
+
+
+def prefer_agno_metrics_enabled() -> bool:
+    return getattr(_prefer_agno_metrics, "on", False)
+
+
+class use_agno_metrics:
+    """with 块内：本线程的 openai .create 不走原生 usage 记账，改由调用方用 agno metrics 记。"""
+    def __enter__(self):
+        self._prev = getattr(_prefer_agno_metrics, "on", False)
+        _prefer_agno_metrics.on = True
+        return self
+    def __exit__(self, *exc):
+        _prefer_agno_metrics.on = self._prev
+        return False
 
 
 def ts() -> str:
@@ -132,9 +153,47 @@ def _get_client_base_url(self_client_holder: object) -> str:
         return ""
 
 
+_DASHSCOPE_STATIC_CACHE_MIN_CHARS = 800
+
+# DashScope 显式缓存会缓存「messages 开头 → cache_control 所在 block 末尾」。
+# 这些锚点之后都是月度盘面 / 推演 payload / extractor 补充上下文等高频变化内容，
+# 不能放进显式缓存，否则每轮反复 cache_creation、很少命中。
+_DASHSCOPE_DYNAMIC_SYSTEM_MARKERS = (
+    "【本回合年月】",
+    "【本回合推演输入 simulator_payload】",
+    "【结算补充上下文 extractor_context】",
+    "当前为 ",
+    "本回合朝会盘面：",
+    "本月朝会盘面：",
+    "本旬朝会盘面：",
+    "【上回合邸报全文",
+    "【上月邸报全文",
+    "【近来朝局",
+    "【私人对话纪要",
+    "【你身上还在办的密令】",
+)
+
+def _dashscope_static_prefix_end(content: str) -> int:
+    """返回 system 中适合显式缓存的静态前缀长度。"""
+    dynamic_starts = [
+        idx for marker in _DASHSCOPE_DYNAMIC_SYSTEM_MARKERS
+        if (idx := content.find(marker)) >= 0
+    ]
+    return min(dynamic_starts) if dynamic_starts else len(content)
+
+
+def _text_block(text: str, cache: bool = False) -> Dict[str, object]:
+    block: Dict[str, object] = {"type": "text", "text": text}
+    if cache:
+        block["cache_control"] = {"type": "ephemeral"}
+    return block
+
+
 def _inject_dashscope_cache_mark(kwargs: Dict[str, object]) -> None:
-    """对 dashscope 请求,把 system message content 改成带 cache_control 的列表形式。
-    只标 system,不动 user/assistant(多轮对话差异在尾部,前缀缓存自动覆盖)。
+    """对 DashScope 请求只标静态 system 前缀。
+
+    cache_control 不能落在月度盘面/历史/密令/推演 payload 后面；那些内容每轮会变，
+    标进去会导致反复创建主动缓存而不命中。
     """
     messages = kwargs.get("messages")
     if not isinstance(messages, list):
@@ -145,18 +204,33 @@ def _inject_dashscope_cache_mark(kwargs: Dict[str, object]) -> None:
         if msg.get("role") != "system":
             continue
         content = msg.get("content")
-        if isinstance(content, str) and len(content) >= 800:
-            # 改写成结构化 list + cache_control
-            msg["content"] = [{
-                "type": "text",
-                "text": content,
-                "cache_control": {"type": "ephemeral"},
-            }]
+        if isinstance(content, str):
+            static_end = _dashscope_static_prefix_end(content)
+            static_text = content[:static_end]
+            if len(static_text) >= _DASHSCOPE_STATIC_CACHE_MIN_CHARS:
+                blocks = [_text_block(static_text, cache=True)]
+                dynamic_text = content[static_end:]
+                if dynamic_text:
+                    blocks.append(_text_block(dynamic_text))
+                msg["content"] = blocks
         elif isinstance(content, list) and content:
-            # 已是 list,给最后一块加 mark(若没有)
-            last = content[-1]
-            if isinstance(last, dict) and "cache_control" not in last:
-                last["cache_control"] = {"type": "ephemeral"}
+            # 兼容上游已拆 block 的情况：重组文本后按同一规则切分，避免给最后一块
+            # （通常是动态上下文）打 cache_control。
+            text = "".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type", "text") == "text"
+            )
+            if not text:
+                break
+            static_end = _dashscope_static_prefix_end(text)
+            static_text = text[:static_end]
+            if len(static_text) >= _DASHSCOPE_STATIC_CACHE_MIN_CHARS:
+                blocks = [_text_block(static_text, cache=True)]
+                dynamic_text = text[static_end:]
+                if dynamic_text:
+                    blocks.append(_text_block(dynamic_text))
+                msg["content"] = blocks
         break  # 只标第一条 system,够前缀缓存命中
 
 
@@ -181,8 +255,9 @@ def install_token_stats_patch() -> None:
             _inject_dashscope_cache_mark(kwargs)
         resp = orig_create(self, *args, **kwargs)
         try:
-            model_id = getattr(resp, "model", kwargs.get("model", "unknown"))
-            _record_usage(model_id, getattr(resp, "usage", None), caller_tag)
+            if not prefer_agno_metrics_enabled():  # 调用方将用 agno metrics 记账，跳过避免双计
+                model_id = getattr(resp, "model", kwargs.get("model", "unknown"))
+                _record_usage(model_id, getattr(resp, "usage", None), caller_tag)
         except Exception:
             pass
         return resp
@@ -194,8 +269,9 @@ def install_token_stats_patch() -> None:
             _inject_dashscope_cache_mark(kwargs)
         resp = await orig_acreate(self, *args, **kwargs)
         try:
-            model_id = getattr(resp, "model", kwargs.get("model", "unknown"))
-            _record_usage(model_id, getattr(resp, "usage", None), caller_tag)
+            if not prefer_agno_metrics_enabled():
+                model_id = getattr(resp, "model", kwargs.get("model", "unknown"))
+                _record_usage(model_id, getattr(resp, "usage", None), caller_tag)
         except Exception:
             pass
         return resp

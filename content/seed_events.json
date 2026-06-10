@@ -57,13 +57,14 @@
           "reason": "财政整顿成形"
         }
       ]
-    }
+    },
+    "is_historical": false
   },
   {
     "id": "liaodong",
-    "title": "辽东索饷",
+    "title": "宁锦防线整饬",
     "kind": "军事",
-    "summary": "辽东将臣上奏，宁锦防线缺饷缺粮，士卒已有怨言。",
+    "summary": "辽东将臣上奏，宁锦防线缺饷缺粮，军心、补给与城防皆待整饬。",
     "urgency": 76,
     "severity": 82,
     "credibility": 66,
@@ -122,7 +123,8 @@
           "reason": "哗变之后补饷+招抚+缉拿"
         }
       ]
-    }
+    },
+    "is_historical": false
   },
   {
     "id": "grain",
@@ -149,7 +151,8 @@
     "trigger_gate": {
       "民心": "<=44"
     },
-    "auto_trigger": true
+    "auto_trigger": true,
+    "is_historical": false
   },
   {
     "id": "shaanxi",
@@ -202,7 +205,8 @@
       "metrics": {
         "民心": 8
       }
-    }
+    },
+    "is_historical": false
   },
   {
     "id": "korea_envoy",
@@ -212,6 +216,7 @@
     "summary": "朝鲜仁祖遣密使至登州，言丁卯乱后愿暗助皮岛，以海产米豆济辽东。后金尚不知。",
     "trigger_year": 1627,
     "trigger_month": 10,
+    "is_historical": true,
     "trigger_end_year": 1628,
     "trigger_end_month": 12,
     "urgency": 32,
@@ -243,6 +248,7 @@
     "summary": "湖广雨水均调，秋禾大熟，米价较去岁回落三成，漕粮可补京畿。",
     "trigger_year": 1628,
     "trigger_month": 8,
+    "is_historical": true,
     "trigger_end_year": 1628,
     "trigger_end_month": 11,
     "urgency": 22,
@@ -289,7 +295,8 @@
     "trigger_gate": {
       "power.houjin.cohesion": "<=55"
     },
-    "auto_trigger": true
+    "auto_trigger": true,
+    "is_historical": false
   },
   {
     "id": "north_three_uprising",
@@ -314,10 +321,12 @@
     ],
     "resolve_condition": "三省 unrest 至少有两省回落至 60 以下；招抚或剿灭李自成/张献忠主力之一；调拨百万级赈粮入境",
     "fail_condition": "三省全境失守，洛阳、开封、太原任一被破，宗藩被掳，朝廷失去北方腹地",
+    "effect_on_fail": { "metrics": { "民心": -10, "皇威": -5 } },
     "trigger_gate": {
       "region.shaanxi|shanxi|henan.unrest.min": ">=65"
     },
-    "auto_trigger": true
+    "auto_trigger": true,
+    "is_historical": false
   },
   {
     "id": "treasury_overdraft",
@@ -377,7 +386,8 @@
         "皇威": -6,
         "民心": -2
       }
-    }
+    },
+    "is_historical": false
   },
   {
     "id": "treasury_debt_spiral",
@@ -447,7 +457,8 @@
           "reason": "折价借银与追索旧欠形成额外亏空"
         }
       ]
-    }
+    },
+    "is_historical": false
   },
   {
     "id": "treasury_credit_collapse",
@@ -519,7 +530,8 @@
           "reason": "太仓信用破产后的强制善后与补偿"
         }
       ]
-    }
+    },
+    "is_historical": false
   },
   {
     "id": "jiangnan_gentry_revolt",
@@ -542,9 +554,11 @@
     ],
     "resolve_condition": "罢清丈或减额加征，或拿江南数家大户立威迫其余就范，南方钱粮恢复输京",
     "fail_condition": "南方拒缴钱粮过两季，京中军饷断流，东林朝官集体辞官护乡",
+    "effect_on_fail": { "metrics": { "皇威": -6, "民心": -3 }, "economy": [{ "account": "国库", "delta": -30, "category": "钱粮断流", "reason": "江南拒缴、漕粮军饷断流" }] },
     "trigger_gate": {
       "class.士绅@nanzhili|zhejiang|fujian.satisfaction.max": "<=30"
     },
-    "auto_trigger": true
+    "auto_trigger": true,
+    "is_historical": false
   }
 ]

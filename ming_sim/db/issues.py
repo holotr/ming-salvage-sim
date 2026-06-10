@@ -122,6 +122,7 @@ class _IssuesMixin:
         is_manual: bool = False,
         duration_turns: int = 0,
         goal: str = "",
+        assignee: str = "",
     ) -> int:
         if kind not in ("situation", "initiative"):
             raise ValueError(f"issue kind 非法：{kind}")
@@ -137,8 +138,8 @@ class _IssuesMixin:
                 phase, stage_text, status, severity, region_hint, faction_hint,
                 tags, ongoing_effects, cancellable, cancel_cost,
                 effect_on_resolve, effect_on_fail, resolve_condition, fail_condition,
-                last_advance_turn, is_manual, duration_turns, goal
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                assignee, last_advance_turn, is_manual, duration_turns, goal
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 kind, title, origin_kind, origin_ref, state.turn,
@@ -151,6 +152,7 @@ class _IssuesMixin:
                 json.dumps(effect_on_resolve or {}, ensure_ascii=False),
                 json.dumps(effect_on_fail or {}, ensure_ascii=False),
                 resolve_condition, fail_condition,
+                (assignee or "").strip(),
                 state.turn,
                 1 if is_manual else 0,
                 max(0, int(duration_turns or 0)),
@@ -188,6 +190,7 @@ class _IssuesMixin:
         title: str | None = None,
         duration_turns: int | None = None,
         goal: str | None = None,
+        assignee: str | None = None,
     ) -> bool:
         """改手动局势：名称(title) / 持续回合数(duration_turns) / 目标(goal)。
         仅 is_manual=1 且 active 可改。返回是否实际更新。"""
@@ -206,6 +209,9 @@ class _IssuesMixin:
         if goal is not None:
             sets.append("goal=?")
             params.append(goal.strip())
+        if assignee is not None:
+            sets.append("assignee=?")
+            params.append(assignee.strip())
         if not sets:
             return False
         sets.append("updated_at=CURRENT_TIMESTAMP")
@@ -230,6 +236,86 @@ class _IssuesMixin:
         )
         self.conn.commit()
         return True
+
+    def update_issue_assignee(self, issue_id: int, assignee: str) -> bool:
+        """改任意 active 局势的承办人。空字符串表示未指定。"""
+        row = self.conn.execute(
+            "SELECT id, status FROM issues WHERE id=?", (int(issue_id),)
+        ).fetchone()
+        if row is None or row["status"] != "active":
+            return False
+        self.conn.execute(
+            "UPDATE issues SET assignee=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            ((assignee or "").strip(), int(issue_id)),
+        )
+        self.conn.commit()
+        return True
+
+    def set_issue_authorization(
+        self,
+        issue_id: int,
+        budget_add: float,
+        budget_source: str,
+        death_authority: bool,
+    ) -> Optional[Dict[str, object]]:
+        """给 active 局势的承办人设授权：追加专款（累加进 budget_pool）、定出库、开/关生杀权。
+        budget_add 是本次追加额（万两，可为 0 表示只改出库/生杀权）。空 budget_source 不动原出库。
+        返回 {budget_pool, budget_source, death_authority}；issue 非 active 返回 None。"""
+        row = self.conn.execute(
+            "SELECT id, status, budget_pool, budget_source FROM issues WHERE id=?",
+            (int(issue_id),),
+        ).fetchone()
+        if row is None or row["status"] != "active":
+            return None
+        new_pool = max(0.0, float(row["budget_pool"] or 0) + float(budget_add or 0))
+        src = (budget_source or "").strip()
+        new_src = src if src in ("国库", "内库") else (str(row["budget_source"] or "") if not src else "")
+        self.conn.execute(
+            "UPDATE issues SET budget_pool=?, budget_source=?, death_authority=?, "
+            "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (round(new_pool, 4), new_src, 1 if death_authority else 0, int(issue_id)),
+        )
+        self.conn.commit()
+        return {
+            "budget_pool": round(new_pool, 1),
+            "budget_source": new_src,
+            "death_authority": bool(death_authority),
+        }
+
+    def spend_issue_budget(self, state, issue_id: int, amount: float) -> float:
+        """承办人本月从该 issue 专款支取：从其 budget_source 指定库扣 amount（走 economy_ledger），
+        库不足按实扣（同军饷「有多少扣多少」），并把实扣额从 budget_pool 减去。
+        返回实扣万两（>=0）。无专款/无出库/amount<=0 返回 0。"""
+        amount = float(amount or 0)
+        if amount <= 0:
+            return 0.0
+        row = self.conn.execute(
+            "SELECT id, status, budget_pool, budget_source FROM issues WHERE id=?",
+            (int(issue_id),),
+        ).fetchone()
+        if row is None or row["status"] != "active":
+            return 0.0
+        pool = float(row["budget_pool"] or 0)
+        account = str(row["budget_source"] or "")
+        if pool <= 0 or account not in ("国库", "内库"):
+            return 0.0
+        # 按库余额 clamp（同军饷：record_issue_economy_move 不 clamp，会把库扣成负，故调用前夹）。
+        available = max(0.0, float(state.metrics.get(account, 0)))
+        want = min(amount, pool, available)
+        if want <= 0:
+            return 0.0
+        actual = abs(self.record_issue_economy_move(
+            state, account, -want, "局势专款支取", f"局势#{int(issue_id)}承办人本月支取",
+        ))
+        if actual <= 0:
+            return 0.0
+        new_pool = max(0.0, pool - actual)
+        self.conn.execute(
+            "UPDATE issues SET budget_pool=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (round(new_pool, 4), int(issue_id)),
+        )
+        self.conn.commit()
+        return actual
 
     def delete_manual_issue(self, issue_id: int) -> bool:
         """彻底删除一条手动局势（连带其 issue_advances）。仅 is_manual=1 可删。"""
@@ -325,13 +411,13 @@ class _IssuesMixin:
         self.conn.execute(
             """
             INSERT INTO issue_advances (
-                issue_id, turn, trigger_kind, trigger_ref,
+                issue_id, turn, year, period, trigger_kind, trigger_ref,
                 delta_bar, from_value, to_value,
                 from_stage_text, to_stage_text, narrative, metric_delta
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                issue_id, state.turn, trigger_kind, trigger_ref,
+                issue_id, state.turn, state.year, state.period, trigger_kind, trigger_ref,
                 actual_delta, from_value, to_value,
                 from_stage_text, to_stage_text, narrative,
                 json.dumps(metric_delta or {}, ensure_ascii=False),
@@ -380,13 +466,13 @@ class _IssuesMixin:
         self.conn.execute(
             """
             INSERT INTO issue_advances (
-                issue_id, turn, trigger_kind, trigger_ref,
+                issue_id, turn, year, period, trigger_kind, trigger_ref,
                 delta_bar, from_value, to_value,
                 from_stage_text, to_stage_text, narrative, metric_delta
-            ) VALUES (?, ?, 'close', ?, ?, ?, ?, ?, ?, ?, '{}')
+            ) VALUES (?, ?, ?, ?, 'close', ?, ?, ?, ?, ?, ?, ?, '{}')
             """,
             (
-                issue_id, state.turn, reason,
+                issue_id, state.turn, state.year, state.period, reason,
                 actual_delta, from_value, to_value,
                 from_stage_text, to_stage_text, narrative,
             ),
@@ -415,12 +501,12 @@ class _IssuesMixin:
         self.conn.execute(
             """
             INSERT INTO issue_advances (
-                issue_id, turn, trigger_kind, delta_bar,
+                issue_id, turn, year, period, trigger_kind, delta_bar,
                 from_value, to_value, narrative, metric_delta
-            ) VALUES (?, ?, 'cancel', 0, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'cancel', 0, ?, ?, ?, ?)
             """,
             (
-                issue_id, state.turn,
+                issue_id, state.turn, state.year, state.period,
                 int(row["bar_value"]), int(row["bar_value"]),
                 narrative,
                 json.dumps(applied_cost or {}, ensure_ascii=False),
@@ -438,7 +524,7 @@ class _IssuesMixin:
     def list_issue_advances(self, issue_id: int) -> List[sqlite3.Row]:
         """取某事项全部推进日志，按发生顺序返回，供月末推演回看完整脉络。"""
         return self.conn.execute(
-            "SELECT * FROM issue_advances WHERE issue_id=? ORDER BY turn ASC, id ASC",
+            "SELECT * FROM issue_advances WHERE issue_id=? ORDER BY turn ASC, year ASC, period ASC, id ASC",
             (issue_id,),
         ).fetchall()
 
@@ -500,7 +586,7 @@ class _IssuesMixin:
         legacy_key: str = "",
     ) -> int:
         """结案产生持续修正符。start_month=当前绝对月，duration_months=-1 为永久。
-        clear_gate 非空时：靠程序按 _gate_passed 判定消除（见 issues.clear_gated_legacies），与时长无关。"""
+        clear_gate 非空时：靠程序按 gating.evaluate_gate 判定消除（见 issues.clear_gated_legacies），与时长无关。"""
         start_month = int(state.year) * 12 + int(state.period)
         cur = self.conn.execute(
             """INSERT INTO legacies

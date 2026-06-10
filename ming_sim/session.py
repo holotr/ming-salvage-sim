@@ -30,10 +30,11 @@ from ming_sim.decree import (
     resolve_directives,
     write_decree_with_agno,
 )
+from ming_sim.directives import compile_structured_directive
 from ming_sim.issues import bind_content as _bind_issues
 from ming_sim.issues import sync_opening_legacies
 from ming_sim.llm_model import create_agno_db, extract_agent_text, verify_llm_available
-from ming_sim.matching import match_region_id_from_text
+from ming_sim.matching import match_army_id_from_text, match_region_id_from_text
 from ming_sim.models import Character, CourtContext, GameState, LLMConfig
 from ming_sim.paths import user_data_path
 from ming_sim.registry import MinisterRegistry, bind_content as _bind_registry
@@ -42,6 +43,11 @@ from ming_sim.skills import bind_content as _bind_skills
 
 AUTO_SAVE_PREFIX = "auto_"
 AUTO_SAVE_KEEP_TURNS = 3  # 每个 campaign 保留最近 N 个 turn 的全部自动存档（每 turn 含 begin + preresolve）
+# 本月无新诏的占位信号：必须以「本{TURN_UNIT}无新诏」开头（decree.py 靠 startswith 特判，
+# simulator prompt 也据此识别为"无诏"而非一道诏书）。刻意只保留这一句，不再附带长段办理说明——
+# 长段说明会被 simulator 误当成一道真诏书去核销。承办人自主推进的规则已写在 simulator
+# prompt 的「长期局势」章，不依赖这段占位文本传递。
+NO_NEW_DECREE_TEXT = f"本{TURN_UNIT}无新诏。"
 
 
 def prune_auto_saves(saves_dir: str, campaign_id: str, keep_turns: int = AUTO_SAVE_KEEP_TURNS) -> None:
@@ -120,6 +126,8 @@ class ChatTurnResult:
     secret_order_id: int = 0       # 本轮新建密令 id（0=未下密令）
     tax_issue_id: int = 0          # 本轮户部调税立的 issue id（0=未调税）
     tax_adjusted: str = ""         # 本轮户部调税立项摘要（""=未调税）
+    arms_dispatched: str = ""      # 本轮兵部/工部拨发军械摘要（""=未拨发）
+    refresh_armies: List[str] = field(default_factory=list)  # 拨发后需刷新的军名
 
 
 @dataclass
@@ -280,8 +288,12 @@ def apply_appointment(
         power_id="ming",
         status="active",
     )
+    try:
+        db.add_character(state, character)
+    except ValueError as exc:
+        print(f"[WARN] 新建人物失败：{exc}")
+        return ("", displaced)
     content.characters[name] = character
-    db.add_character(state, character)
     # add_character 已写入并分配 portrait_id，回写到内存对象
     row = db.conn.execute(
         "SELECT portrait_id FROM characters WHERE name=?", (name,)
@@ -300,10 +312,12 @@ def _sync_offices_from_db_impl(content: GameContent, db: "GameDB") -> None:
         """
         SELECT name, office, office_type, faction, aliases, personal_skills,
                loyalty, ability, integrity, courage, style,
+               diplomacy, martial, stewardship, intrigue, learning,
                birth_year, historical_death_year, historical_death_month,
                debut_year, debut_month, status, portrait_id, power_id, location,
                summary
         FROM characters
+        WHERE archived = 0
         """
     ).fetchall()
     characters: Dict[str, Character] = {}
@@ -336,6 +350,11 @@ def _sync_offices_from_db_impl(content: GameContent, db: "GameDB") -> None:
             integrity=int(row["integrity"]),
             courage=int(row["courage"]),
             style=row["style"],
+            diplomacy=int(row["diplomacy"] or 50),
+            martial=int(row["martial"] or 50),
+            stewardship=int(row["stewardship"] or 50),
+            intrigue=int(row["intrigue"] or 50),
+            learning=int(row["learning"] or 50),
             birth_year=int(row["birth_year"]),
             historical_death_year=int(row["historical_death_year"]),
             historical_death_month=int(row["historical_death_month"]),
@@ -551,7 +570,12 @@ class GameSession:
         augmented = message
         draft_line = self.registry.build_draft_line()
         if draft_line and draft_line != "无":
-            augmented = f"【本{TURN_UNIT}已核定草案】{draft_line}\n\n{augmented}"
+            augmented = (
+                f"【本{TURN_UNIT}已核定草案·仅供知会，勿重复】以下是本{TURN_UNIT}其他大臣已拟成入档的旨意，"
+                f"只为让你知道朝局已办了哪些事，避免撞车；你若拟旨，propose_directive 的 decree_text "
+                f"必须是你自己新写的圣旨正文，**绝不可照抄或复述下列任何一条**——\n{draft_line}\n\n"
+                f"{augmented}"
+            )
         run_output = agent.run(augmented)
         _dump_llm_messages(run_output, f"大臣对话/{minister_name}")
         answer = extract_agent_text(run_output)
@@ -622,6 +646,13 @@ class GameSession:
                 if issue_id:
                     result.tax_issue_id = issue_id
                     result.tax_adjusted = summary
+            elif tool_name == "dispatch_arms" or tool_result.startswith("__pending_arms_dispatch__"):
+                payload = tool_result.removeprefix("__pending_arms_dispatch__").strip()
+                summary, army_name = self._apply_arms_dispatch(payload, character)
+                if summary:
+                    result.arms_dispatched = summary
+                    if army_name:
+                        result.refresh_armies.append(army_name)
         return result
 
     def revoke_last_chat(self, minister_name: str) -> bool:
@@ -705,6 +736,37 @@ class GameSession:
         )
         return (issue_id, f"{title}（已立项 #{issue_id}，待结算推进）")
 
+    def _apply_arms_dispatch(self, payload: str, proposer: Character) -> Tuple[str, str]:
+        """兵部/工部 dispatch_arms 落地：总库→某军拨发军械（硬卡只拨有的），即时提该军装备。
+        返回 (摘要, 受拨军名)；非法/无命中返回 ("", "")。"""
+        import json as _json
+        try:
+            data = _json.loads(payload) if payload else {}
+        except (ValueError, TypeError):
+            return ("", "")
+        if not isinstance(data, dict):
+            return ("", "")
+        army_raw = str(data.get("army") or "").strip()
+        troop_type = str(data.get("troop_type") or "").strip()
+        weapon = str(data.get("weapon") or "").strip()
+        reason = str(data.get("reason") or "").strip()
+        try:
+            qty = int(data.get("qty"))
+        except (TypeError, ValueError):
+            return ("", "")
+        if not army_raw or not weapon or qty <= 0:
+            return ("", "")
+        army_id = match_army_id_from_text(army_raw, self.content.armies)
+        if army_id is None:
+            return (f"拨发未果：未找到军队「{army_raw}」。", "")
+        res = self.db.apply_arms_dispatch(self.state, army_id, troop_type, weapon, qty, reason=reason)
+        if not res.get("ok"):
+            return (f"拨发未果：{res.get('note') or '总库无此械'}。", "")
+        gain = res.get("equipment_gain") or 0
+        gain_txt = f"，装备+{gain}" if gain else ""
+        troop_txt = f"／{res.get('troop_type')}" if res.get("troop_type") else ""
+        return (f"{res['army']}{troop_txt}获拨{res['weapon']}{res['dispatched']}（{res.get('note','')}{gain_txt}）", res["army"])
+
     def _apply_unlisted_person_registration(self, payload: str) -> Tuple[str, bool]:
         """登记史实未预设/用户确认背景的人物，进入本局正式可召见人物池。"""
         import json as _json
@@ -758,8 +820,12 @@ class GameSession:
             status="active",
             summary=str(data.get("summary") or "").strip(),
         )
+        try:
+            self.db.add_character(self.state, character, source=source_label)
+        except ValueError as exc:
+            print(f"[WARN] 人物补档失败：{exc}")
+            return ("", False)
         self.content.characters[name] = character
-        self.db.add_character(self.state, character, source=source_label)
         row = self.db.conn.execute(
             "SELECT portrait_id FROM characters WHERE name=?", (name,)
         ).fetchone()
@@ -843,6 +909,23 @@ class GameSession:
     def pending_count(self) -> int:
         return self.db.count_pending_directives(self.state)
 
+    def list_structured_directives(self) -> List[Dict[str, object]]:
+        return self.db.list_structured_directives(self.state, statuses=("draft",))
+
+    def add_structured_directive(self, template_id: str, fields: Dict[str, object]) -> Dict[str, object]:
+        directive = compile_structured_directive(template_id, fields, db=self.db)
+        directive_id = self.db.add_structured_directive(self.state, directive)
+        directive["id"] = directive_id
+        directive["status"] = "draft"
+        return directive
+
+    def update_structured_directive(self, directive_id: int, template_id: str, fields: Dict[str, object]) -> None:
+        directive = compile_structured_directive(template_id, fields, db=self.db)
+        self.db.update_structured_directive(directive_id, directive)
+
+    def delete_structured_directive(self, directive_id: int) -> None:
+        self.db.delete_structured_directive(directive_id)
+
     # ── 诏书阶段 ──────────────────────────────────────────────────────────
 
     def enter_review(self) -> None:
@@ -873,7 +956,7 @@ class GameSession:
     def resolve_turn(self, decree: str = "", on_event=None, cheat_directive: str = "") -> ResolveResult:
         """颁诏并推演本回合（两步法）：simulator agent 先写**一整篇**月末邸报，
         extractor agent 再从邸报抽结构化增量落库（resolve_directives）。
-        要求无 pending 残留、≥1 条 draft。
+        要求无 pending 残留。无 draft 时视为本月无新诏，由既有承办人照前旨推进局势。
 
         on_event(kind, data): 推演过程实时回调，透传给 resolve_directives。
         cheat_directive: 作弊控制台强制结算项，拼到邸报最前喂 extractor 当既成事实。
@@ -884,13 +967,15 @@ class GameSession:
         if self.pending_count() > 0:
             raise ValueError(f"尚有 {self.pending_count()} 道大臣拟旨待陛下核定（准/驳），不能颁诏。")
         directives = self.db.list_directives(self.state, statuses=("draft",))
-        if not directives:
-            raise ValueError("网页/CLI 端不允许跳过回合：至少一条草案才能颁诏。")
+        structured_directives = self.db.list_structured_directives(self.state, statuses=("draft",))
         # 结算前先存一份：LLM 推演有可能崩，留个回滚锚点
         self.auto_save("preresolve")
-        decree_text = decree or self.last_decree or write_decree_with_agno(
-            self.llm_config, self.agno_db, self.state, directives, db=self.db
-        )
+        if directives:
+            decree_text = decree or self.last_decree or write_decree_with_agno(
+                self.llm_config, self.agno_db, self.state, directives, db=self.db
+            )
+        else:
+            decree_text = NO_NEW_DECREE_TEXT
         self.last_decree = decree_text
         result = resolve_directives(
             self.state, self.db, self.agno_db, self.llm_config,
@@ -899,6 +984,7 @@ class GameSession:
             on_event=on_event,
             content=self.content, registry=self.registry,
             cheat_directive=cheat_directive,
+            structured_directives=structured_directives,
         )
         if result.awaiting:
             # 决策点暂停：回合未推进，存 awaiting 态供刷新恢复；待 submit_decisions 续跑。

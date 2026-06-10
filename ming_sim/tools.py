@@ -267,7 +267,8 @@ def build_minister_tools(character: Character, context: CourtContext,
         return f"__adjust_tax__{payload}"
 
     def propose_directive(decree_text: str) -> str:
-        """把已定处置方案拟成一道圣旨草稿呈给皇帝审阅。decree_text 为完整圣旨正文。"""
+        """把你这次议定的处置方案拟成一道圣旨草稿呈皇帝审阅。decree_text 必须是你**自己新撰写**的完整圣旨正文，
+        针对当前这件交办的事来写；绝不可照抄、复述上下文里【已核定草案】中别的大臣已入档的旨意。"""
         text = (decree_text or "").strip()
         if not text:
             return "拟旨失败：圣旨正文为空。"
@@ -291,6 +292,30 @@ def build_minister_tools(character: Character, context: CourtContext,
             ensure_ascii=False,
         )
         return f"__pending_appointment__{payload}"
+
+    def dispatch_arms(army: str, troop_type: str, weapon: str, qty: int, reason: str = "") -> str:
+        """从国家军备总库拨发军械给某军的某兵种（兵部/工部专属）。army＝受拨军号、
+        troop_type＝受拨兵种（如「火炮队」「非正规步兵」「手枪骑兵」，须是该军编制内兵种；
+        留空则拨给该军主力兵种）、weapon＝武器型号（如「红夷大炮」「火铳」「燧发枪」）、qty＝拨发件数。
+        装备入该兵种的军械库（军→兵种→装备），凑够实物该兵种方可升级。
+        注意：只能拨总库现有之械，库存不足按现存量照发；皇帝准奏后落地。"""
+        a = (army or "").strip()
+        t = (troop_type or "").strip()
+        w = (weapon or "").strip()
+        if not a or not w:
+            return "拨发失败：受拨军号或武器型号为空。"
+        try:
+            n = int(qty)
+        except (TypeError, ValueError):
+            return "拨发失败：拨发件数须为整数。"
+        if n <= 0:
+            return "拨发失败：拨发件数须为正。"
+        import json as _json
+        payload = _json.dumps(
+            {"army": a, "troop_type": t, "weapon": w, "qty": n, "reason": (reason or "").strip()},
+            ensure_ascii=False,
+        )
+        return f"__pending_arms_dispatch__{payload}"
 
     def register_unlisted_person(
         name: str,
@@ -351,7 +376,7 @@ def build_minister_tools(character: Character, context: CourtContext,
     ) -> str:
         """密令统一入口。action 取值：
         - "issue"：下达新密令。需填 title、content；assignee 留空默认当前大臣；deadline_months=0 无硬限。
-                  限制：不得重复下同一道密令；一个承办人同一时间只能有一条进行中密令；全朝进行中密令最多 5 条。
+                  限制：不得重复下同一道密令；进行中密令的个人上限与全朝总上限以游戏设置为准。
         - "progress"：汇报进展（兼查历史）。填 order_id；progress 非空且本月未推进则落档。
         - "submit"：提交结案。填 order_id、claim（办结陈词200字内）。
         - "rush"：催办加急。填 order_id；deadline_months=1 下月核议，0=本月即核。
@@ -516,6 +541,7 @@ def build_minister_tools(character: Character, context: CourtContext,
         "propose_appointment": propose_appointment,
         "check_treasury": check_treasury,
         "adjust_tax": adjust_tax,
+        "dispatch_arms": dispatch_arms,
     }
     grant = context.db.get_office_court_grant(character.office_type)
     for tool_name in (grant.get("court_tools") or []):
@@ -639,7 +665,7 @@ def build_board_query_tools(context: CourtContext):
         return (
             f"#{row['id']} {row['title']} bar={int(row['bar_value'])} "
             f"inertia={row['inertia']} kind={row['kind']} cancellable={row['cancellable']}\n"
-            f"阶段：{row['stage_text']}。牵涉：{row['faction_hint'] or '—'}。\n"
+            f"阶段：{row['stage_text']}。承办：{(row['assignee'] if 'assignee' in row.keys() else '') or '—'}。牵涉：{row['faction_hint'] or '—'}。\n"
             f"结案条件：{row['resolve_condition'] or '（未填）'}。"
             f"失败条件：{row['fail_condition'] or '（未填）'}。"
         )
@@ -723,8 +749,12 @@ def build_simulator_tools(context: CourtContext):
         「人事除目」（有人事变动时必列，无则不列）：
           任官：旧职→新职 or 起用姓名为官职  → 档房抽office_changes
           去职：姓名+去职缘由（革/狱/流/仕/卒）  → 档房抽character_status_changes
-        「待办未解」：只列active_issues在册局势，逐条状态短语（已具题待覆/已近结案/按其本然推移等），
-        每条一句话点局势名与id，不写bar数字，不写from→to。
+        「待办未解」：只列active_issues在册局势，逐条写本月正向或负向变化；
+        每条一句话点局势名与id，不写bar数字，不写from→to，不写“暂无变化/仍待观察”。
+        有实旨、人财物、权限、盘面利好则写向解决端推进；无对症行动、钱粮未到、拖延反扑则写向失败端退。
+        带承办人的局势必须写此人本月办得如何；承办人能力影响完成度百分比，不是直接加点：
+        先判本月基准进度，再按承办修正%=(能力-50)*1.6+(忠诚-50)*0.6+(清廉-50)*0.5+(胆略-50)*0.4 折算；
+        与帝国修正同口径：base>=0乘(1+pct/100)，base<0乘(1-pct/100)。无承办人则写责任无着或部院互推。
         「建筑只叙事」：不代标数值、不代立新建筑；新建/扩建走局势effect落地，不在邸报直造。
 
         ══ 输出格式 ══
@@ -774,9 +804,11 @@ def build_extractor_tools(context: CourtContext):
                             military_pressure/corruption/population/registered_land/
                             hidden_land/tax_per_turn/natural_disaster/human_disaster/status
                             减人口写人口，禁止写军队人数
-        army_delta          军队变化 {army_id: {field:delta_or_new}}
+        army_delta          军队变化 {army_id: {field:delta_for_numeric_or_new_text}}
                             field 用短键：supply/morale/training/equipment/mobility/loyalty/
                             manpower/maintenance_per_turn/station/commander/troop_type/status/owner_power
+                            数值字段一律是增量；既有军 manpower/maintenance_per_turn 只许增加或减少，
+                            "补至八万/现有八万"须先按盘面换算差额，不能填目标值/现状值
                             owner_power 值可写中文势力名；禁止写 arrears/cohesion
         power_updates       别的势力三项简单属性 {power_id: {"威望":N,"实力":N,"经济":N}}
                             只写非大明势力；三项均为整数增量；不写立场/近动/状态
@@ -784,15 +816,17 @@ def build_extractor_tools(context: CourtContext):
                             如 {"后金":"敌对","蒙古":"摇摆","朝鲜":"倾明"}；无内容填 {}
         issue_advances      既有局势推进列表
                             每项：{issue_id(integer),delta_bar,stage_text,narrative,可选inertia_delta}
-                            delta_bar=皇帝实旨推动量（不含自然漂移inertia，系统自动算）
+                            delta_bar=本月该 issue 的明确变化量，必须非 0（不含自然漂移inertia，系统自动算）
                             档位：极端±40~50、重大±20~35、中等±8~15、轻度±1~5
-                            本月未被实旨推动的填delta_bar:0（靠inertia自然漂）
+                            承办人能力用帝国修正同款百分比：base>=0乘(1+pct/100)，base<0乘(1-pct/100)，不是直接+N
+                            本月未被实旨推动的，也要按拖延/反扑/自然恶化给 -1~-5，
+                            或按已投入资源、既有办理惯性给 +1~+5；禁止填 0
         new_issues          本月新立局势
                             来源(a) origin_kind:"decree"——诏书明文长期工程/改革，需全字段：
                               kind(initiative/situation),title,origin_kind,bar_value(0-100),
                               expected_months(整数),stage_text,resolve_condition,fail_condition,
                               ongoing_effects,effect_on_resolve,effect_on_fail,
-                              cancellable(decree/never/by_progress)
+                              cancellable(decree/never/by_progress),assignee(承办人，可选但建议填在册姓名)
                               effect_on_resolve/fail 可含 metrics/economy/factions/buildings
                               buildings每项：{action:create/modify/remove,...}
                             来源(b) origin_kind:"event_pool"——只两字段：origin_kind+"id"(从candidate_events选)
@@ -807,18 +841,17 @@ def build_extractor_tools(context: CourtContext):
                             scale_amount(月额按比例增减，value填百分比，削三成=-30)。
                             例：宗室禄米总额减至每月30万两 → {key:"宗室禄米_base",mode:"set_amount",value:30}
                             同段口径互相算不通（减至X、实减Y、从A到B矛盾）则留空，不猜增量。
-                            key只从财政系数表选：田赋_rate/辽饷_base/辽饷_rate/盐税_base/盐税_rate/
-                            商税_base/商税_rate/皇庄_base/皇庄_rate/织造_base/织造_rate/矿税_base/矿税_rate/
-                            宗室禄米_base/宗室禄米_rate/官俸_base/官俸_rate/工程_base/工程_rate/
-                            赈灾_base/赈灾_rate/宫廷_base/宫廷_rate/
-                            内廷俸_base/内廷俸_rate/妃嫔_base/妃嫔_rate
+                            key只从财政系数表现有项逐字选，不在表里的税基变化不要写这里。
+                            田赋/辽饷/盐税/商税走region_delta里的田赋亩率/辽饷亩率/盐税基数/商税基数。
         appointments        仅后宫纳妃 [{name,office,office_type:"后宫",reason,approved}]
                             decree_text明文"纳/册封/封/选 某某 为 位号"才立；朝臣一律不进此字段
         character_status_changes  大臣状态变更 [{name,status,reason}]
                             status 直接写中文：罢黜/下狱/流放/致仕/身故/离场
+                            name 必须逐字出现在本月 decree_text 或 narrative 原文里；
                             邸报明文写到此人此事才立；既已罢黜/身故的不重复
         office_changes      朝臣官职变更 [{name,new_office,reason,可选faction/new_office_type}]
                             任何人任某官（新进朝堂/调任/升迁）一律走此字段，不分新旧任
+                            name 必须逐字出现在本月 decree_text 或 narrative 原文里；
                             new_office必须是明制实官名；去职走character_status_changes
 
         ══ 档位判定标准 ══
@@ -845,7 +878,7 @@ def build_extractor_tools(context: CourtContext):
           "new_issues": [{"kind":"initiative","title":"火器营试设","origin_kind":"decree","bar_value":20,"expected_months":10,"stage_text":"...","resolve_condition":"...","fail_condition":"...","ongoing_effects":{},"effect_on_resolve":{"metrics":{"皇威":3}},"effect_on_fail":{"metrics":{"皇威":-4}},"cancellable":"by_progress"}],
           "cancels": [],
           "close_issues": [{"issue_id":9,"reason":"resolved","narrative":"..."}],
-          "fiscal_changes": [{"key":"商税_base","mode":"delta_value","value":10,"reason":"加征商税"}],
+          "fiscal_changes": [{"key":"宗室禄米_base","mode":"delta_amount","value":-10,"reason":"裁减宗藩月支"}],
           "appointments": [],
           "character_status_changes": [{"name":"魏忠贤","status":"流放","reason":"发配凤阳"}],
           "office_changes": [{"name":"孙传庭","new_office":"陕西总督","new_office_type":"督抚","reason":"永城知县擢用"}]

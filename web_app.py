@@ -13,10 +13,12 @@ import os
 import queue
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -27,6 +29,8 @@ from pydantic import BaseModel, Field
 
 from ming_sim.constants import ROOT_DIR
 from ming_sim.paths import bundled_path, user_data_path, user_data_dir
+from ming_sim import scenario_active
+from ming_sim.content import load_character_content, load_event_content
 from ming_sim.exceptions import ExitGame, LLMUnavailable
 from ming_sim.llm_config import (
     load_llm_config,
@@ -40,15 +44,19 @@ from ming_sim.llm_config import (
 from agno.agent import Agent
 
 from ming_sim.agents import _dump_llm_messages, build_simulator_context
-from ming_sim.llm_model import create_chat_model, extract_agent_text, verify_llm_available
+from ming_sim.llm_model import create_agno_db, create_chat_model, extract_agent_text, verify_llm_available
 from ming_sim.llm_contract import fail_if_llm_error
 from ming_sim.issues import _format_issue_ongoing
 from ming_sim.session import GameSession
 from ming_sim.session import AUTO_SAVE_PREFIX
 from ming_sim.context import character_context_with_db, match_minister_from_text
 from ming_sim.constants import TURN_UNIT, BUILDING_CATEGORIES
-from ming_sim.flows import calc_province_fiscal, compute_budget_lines
+from ming_sim.flows import ARMY_SALARY_PRIORITY, calc_province_fiscal, compute_budget_lines
 from ming_sim.simulation import build_simulator_payload
+from ming_sim.directives import (
+    StructuredDirectiveError,
+    load_directive_templates,
+)
 from ming_sim.exceptions import LLMContractError  # noqa: F401  (保留：供错误处理)
 from ming_sim.models import Character, LLMConfig
 from ming_sim.registry import _BASE_SKILLS
@@ -424,6 +432,47 @@ def _llm_error_detail(exc: Exception, prefix: str = "") -> Dict[str, Any]:
     }
 
 
+def _build_llm_config_from_runtime() -> LLMConfig:
+    """按 runtime_llm.json（优先）+ env 组装 LLMConfig。无 API key 抛 LLMUnavailable。
+    WebGame.__init__ 与剧本生成端点共用，避免重复。"""
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    advanced_model = os.environ.get("OPENAI_ADVANCED_MODEL", "")
+    advanced_base_url = os.environ.get("OPENAI_ADVANCED_BASE_URL", "")
+    advanced_api_key = os.environ.get("OPENAI_ADVANCED_API_KEY", "")
+    thinking_level = os.environ.get("OPENAI_THINKING_LEVEL", "")
+    advanced_thinking_level = os.environ.get("OPENAI_ADVANCED_THINKING_LEVEL", "")
+    timeout_seconds = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "180") or 180)
+    # 菜单写的 runtime_llm.json 优先于 env，让「在网页里改的配置」重启后仍生效。
+    runtime = load_runtime_llm()
+    base_url = runtime.get("base_url") or base_url
+    model = runtime.get("model") or model
+    api_key = runtime.get("api_key") or api_key
+    thinking_level = runtime.get("thinking_level") or thinking_level
+    advanced_model = runtime.get("advanced_model") or advanced_model
+    advanced_base_url = runtime.get("advanced_base_url") or advanced_base_url
+    advanced_api_key = runtime.get("advanced_api_key") or advanced_api_key
+    advanced_thinking_level = runtime.get("advanced_thinking_level") or advanced_thinking_level
+    max_tokens = int(runtime.get("max_tokens") or 8000)
+    timeout_seconds = float(runtime.get("timeout_seconds") or timeout_seconds)
+    if not api_key:
+        raise LLMUnavailable("未配 API key，请先到设置页填写。")
+    adv_base = (advanced_base_url or "").strip()
+    return LLMConfig(
+        api_key=api_key,
+        base_url=normalize_openai_base_url(base_url),
+        model=model,
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
+        thinking_level=normalize_thinking_level(thinking_level),
+        advanced_model=(advanced_model or "").strip(),
+        advanced_base_url=normalize_openai_base_url(adv_base) if adv_base else "",
+        advanced_api_key=(advanced_api_key or "").strip(),
+        advanced_thinking_level=normalize_thinking_level(advanced_thinking_level),
+    )
+
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -448,6 +497,11 @@ class DirectiveRequest(BaseModel):
     notes: str = ""
 
 
+class StructuredDirectiveRequest(BaseModel):
+    template_id: str
+    fields: Dict[str, Any] = Field(default_factory=dict)
+
+
 class SecretOrderRequest(BaseModel):
     title: str
     content: str
@@ -458,6 +512,31 @@ class SecretOrderRequest(BaseModel):
 class DirectivePatch(BaseModel):
     text: Optional[str] = None
     notes: Optional[str] = None
+
+
+class ScenarioCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    # 来源：""/"blank"=空白；"__default__"=复制默认（崇祯元年）；其余=复制该剧本 id 的三件套。
+    copy_from: str = ""
+    from_default: bool = False  # 兼容旧字段：True 等价 copy_from="__default__"
+
+
+class ScenarioManifestPatch(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ScenarioFilePut(BaseModel):
+    # 整个文件的 JSON：characters → 对象，events/seed_events → 数组。
+    content: Any
+
+
+class ScenarioGenerateRequest(BaseModel):
+    prompt: str
+    name: str = ""
+    description: str = ""
+    files: Optional[List[str]] = None  # 默认三文件全生成
 
 
 class WebGame:
@@ -472,47 +551,12 @@ class WebGame:
             db_path = user_data_path("ming_sim.db")
         elif not os.path.isabs(db_path):
             db_path = str(user_data_dir() / db_path)
-        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        advanced_model = os.environ.get("OPENAI_ADVANCED_MODEL", "")
-        advanced_base_url = os.environ.get("OPENAI_ADVANCED_BASE_URL", "")
-        advanced_api_key = os.environ.get("OPENAI_ADVANCED_API_KEY", "")
-        thinking_level = os.environ.get("OPENAI_THINKING_LEVEL", "")
-        advanced_thinking_level = os.environ.get("OPENAI_ADVANCED_THINKING_LEVEL", "")
-        timeout_seconds = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "180") or 180)
-        # 菜单写的 runtime_llm.json 优先于 env，让"在网页里改的配置"重启后仍生效。
-        runtime = load_runtime_llm()
-        base_url = runtime.get("base_url") or base_url
-        model = runtime.get("model") or model
-        api_key = runtime.get("api_key") or api_key
-        thinking_level = runtime.get("thinking_level") or thinking_level
-        advanced_model = runtime.get("advanced_model") or advanced_model
-        advanced_base_url = runtime.get("advanced_base_url") or advanced_base_url
-        advanced_api_key = runtime.get("advanced_api_key") or advanced_api_key
-        advanced_thinking_level = runtime.get("advanced_thinking_level") or advanced_thinking_level
-        max_tokens = int(runtime.get("max_tokens") or 8000)
-        timeout_seconds = float(runtime.get("timeout_seconds") or timeout_seconds)
-        if not api_key:
-            raise LLMUnavailable("未配 API key，请先到设置页填写。")
+        llm_config = _build_llm_config_from_runtime()
         random.seed(int(os.environ.get("MING_SIM_SEED", "7")))
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self.db_path = db_path
         if fresh:
             _delete_sqlite_db_files_or_raise(db_path)
-        adv_base = (advanced_base_url or "").strip()
-        llm_config = LLMConfig(
-            api_key=api_key,
-            base_url=normalize_openai_base_url(base_url),
-            model=model,
-            max_tokens=max_tokens,
-            timeout_seconds=timeout_seconds,
-            thinking_level=normalize_thinking_level(thinking_level),
-            advanced_model=(advanced_model or "").strip(),
-            advanced_base_url=normalize_openai_base_url(adv_base) if adv_base else "",
-            advanced_api_key=(advanced_api_key or "").strip(),
-            advanced_thinking_level=normalize_thinking_level(advanced_thinking_level),
-        )
         self.session = GameSession(db_path, llm_config)
         self.session.begin_turn()
         # 召对记录持久化在 chat_messages 表，启动时恢复进内存缓存。
@@ -796,10 +840,12 @@ class WebGame:
         office = character.office  # 去职者已被清空，可能为空串
         # summary 不含官职（卡片/详情已单独显 office），避免重复
         summary = f"{character.faction}一系，行事{character.style}。"
-        power_row = self.db.conn.execute(
-            "SELECT power_id FROM characters WHERE name=?", (character.name,)
+        meta_row = self.db.conn.execute(
+            "SELECT power_id, origin, archived FROM characters WHERE name=?", (character.name,)
         ).fetchone()
-        power_id = (power_row["power_id"] if power_row else None) or getattr(character, "power_id", "ming") or "ming"
+        power_id = (meta_row["power_id"] if meta_row else None) or getattr(character, "power_id", "ming") or "ming"
+        origin = (meta_row["origin"] if meta_row else None) or "preset"
+        archived = bool(int((meta_row["archived"] if meta_row else 0) or 0))
         return {
             "name": character.name,
             "office": office,
@@ -811,6 +857,11 @@ class WebGame:
             "ability": character.ability,
             "integrity": character.integrity,
             "courage": character.courage,
+            "diplomacy": character.diplomacy,
+            "martial": character.martial,
+            "stewardship": character.stewardship,
+            "intrigue": character.intrigue,
+            "learning": character.learning,
             "style": character.style,
             "location": character.location,
             "birth_year": character.birth_year,
@@ -825,6 +876,8 @@ class WebGame:
             "description": character.summary,
             "portrait_id": character.portrait_id,
             "power_id": power_id,
+            "origin": origin,
+            "archived": archived,
             "skills": self._runtime_skill_payloads(character),
             "favorite": character.name in self.favorites,
         }
@@ -850,6 +903,64 @@ class WebGame:
             "notes": row["notes"],
             "authority": row["notes"] or "",
         }
+
+    def _character_from_db_row(self, row) -> Character:
+        try:
+            aliases = json.loads(row["aliases"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            aliases = []
+        try:
+            personal_skills = json.loads(row["personal_skills"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            personal_skills = []
+        if not isinstance(aliases, list):
+            aliases = []
+        if not isinstance(personal_skills, list):
+            personal_skills = []
+        return Character(
+            name=str(row["name"]),
+            office=str(row["office"] or ""),
+            office_type=str(row["office_type"] or ""),
+            faction=str(row["faction"] or "中立"),
+            aliases=[str(item) for item in aliases if str(item).strip()],
+            personal_skills=[str(item) for item in personal_skills if str(item).strip()],
+            loyalty=int(row["loyalty"] or 50),
+            ability=int(row["ability"] or 50),
+            integrity=int(row["integrity"] or 50),
+            courage=int(row["courage"] or 50),
+            style=str(row["style"] or ""),
+            power_id=str(row["power_id"] or "ming"),
+            diplomacy=int(row["diplomacy"] or 50),
+            martial=int(row["martial"] or 50),
+            stewardship=int(row["stewardship"] or 50),
+            intrigue=int(row["intrigue"] or 50),
+            learning=int(row["learning"] or 50),
+            location=str(row["location"] or ""),
+            birth_year=int(row["birth_year"] or 0),
+            historical_death_year=int(row["historical_death_year"] or 0),
+            historical_death_month=int(row["historical_death_month"] or 0),
+            debut_year=int(row["debut_year"] or 0),
+            debut_month=int(row["debut_month"] or 0),
+            status=str(row["status"] or "active"),
+            summary=str(row["summary"] or ""),
+            portrait_id=str(row["portrait_id"] or ""),
+        )
+
+    def archived_character_payloads(self) -> List[Dict[str, Any]]:
+        rows = self.db.conn.execute(
+            """
+            SELECT name, office, office_type, faction, aliases, personal_skills,
+                   loyalty, ability, integrity, courage, style,
+                   diplomacy, martial, stewardship, intrigue, learning,
+                   birth_year, historical_death_year, historical_death_month,
+                   debut_year, debut_month, status, portrait_id, power_id, location,
+                   summary
+            FROM characters
+            WHERE archived=1
+            ORDER BY name
+            """
+        ).fetchall()
+        return [self.public_character(self._character_from_db_row(row)) for row in rows]
 
     def directive_rows(self):
         # 颁诏候选 = draft；UI 列表含 pending
@@ -987,6 +1098,10 @@ class WebGame:
                 "is_manual": bool(row["is_manual"]) if "is_manual" in row.keys() else False,
                 "duration_turns": int(row["duration_turns"] or 0) if "duration_turns" in row.keys() else 0,
                 "goal": (row["goal"] if "goal" in row.keys() else "") or "",
+                "assignee": (row["assignee"] if "assignee" in row.keys() else "") or "",
+                "budget_pool": round(float(row["budget_pool"] or 0), 1) if "budget_pool" in row.keys() else 0.0,
+                "budget_source": (row["budget_source"] if "budget_source" in row.keys() else "") or "",
+                "death_authority": bool(row["death_authority"]) if "death_authority" in row.keys() else False,
                 "origin_turn": int(row["origin_turn"] or 0),
             })
         return payloads
@@ -1091,6 +1206,36 @@ class WebGame:
             account["base_expense_total"] = base_expense_total
             account["base_net"] = base_income_total - base_expense_total
             account["modifier_pct"] = int(legacy_mods.get(str(account_name), 0) or 0)
+            # 各军军饷预估实发：固定收支只是「应发」预算，真账（flows.apply_fixed_period_flows）
+            # 受国库余额约束——逐军按 ARMY_SALARY_PRIORITY 发 min(应发, max(0,国库剩余))，国库见底
+            # 后续军队全欠。这里复刻同一约束，给军饷行标上「预计实发」，免得 HUD 把账面应发当实扣。
+            salary_item = next(
+                (it for it in account["expense"] if it["name"] == "各军军饷"), None
+            )
+            if salary_item is not None:
+                net_pct = int(legacy_mods.get(str(account_name), 0) or 0)
+                # 发饷时国库可用 = 余额 + 本月固定净收入（发饷在固定收支落账之后）
+                available = max(
+                    0,
+                    int(account["balance"]) + income_total - (expense_total - int(salary_item["amount"])),
+                )
+                # 口径与应发行（maintenance_per_turn>0，无 active 过滤）一致，
+                # 也与真账 flows.apply_fixed_period_flows 的逐军循环一致。
+                army_map = {
+                    str(r["id"]): abs(self.db.apply_legacy_pct(-int(r["maintenance_per_turn"]), net_pct))
+                    for r in self.db.conn.execute(
+                        "SELECT id, maintenance_per_turn FROM armies "
+                        "WHERE owner_power='ming' AND maintenance_per_turn>0"
+                    ).fetchall()
+                }
+                ordered_ids = [k for k in ARMY_SALARY_PRIORITY if k in army_map]
+                ordered_ids += [k for k in army_map if k not in ARMY_SALARY_PRIORITY]
+                paid_estimate = 0
+                for aid in ordered_ids:
+                    pay = min(army_map[aid], available)
+                    paid_estimate += pay
+                    available -= pay
+                salary_item["paid_estimate"] = int(paid_estimate)
         # 本月入账（上月末结算）：上月末 LLM 推演 + 固定财政 tick 落的 ledger
         # 时序上 state.turn 在结算末尾 +1 进入新月，所以"本月可见的入账"是 cur_turn - 1 的 ledger。
         # 语义对齐玩家直觉："上月末抄家/清丈的钱，算这个月的收入"。
@@ -1143,6 +1288,13 @@ class WebGame:
             "timeline": row.get("timeline", []),
         }
 
+    def _armies_with_arms(self) -> list:
+        """军队盘面 + 各军持有武器明细（army_arms），供军队抽屉展示。"""
+        armies = self.db.army_payload()
+        for a in armies:
+            a["arms"] = self.db.army_arms_payload(str(a["id"]))
+        return armies
+
     def state_payload(self) -> Dict[str, Any]:
         directives = [self.directive_payload(row) for row in self.directive_rows()]
         regions = self.regions_payload()
@@ -1166,14 +1318,25 @@ class WebGame:
             "ending": self.ending_payload(),
             "events": [],
             "regions": regions,
-            "armies": self.db.army_payload(),
+            "armies": self._armies_with_arms(),
+            "arms_stock": self.db.arms_stock_payload(),
+            "departments": self.db.department_payload(),
             "technologies": self.db.technology_payload(),
             "preset_trees": _preset_tree_payload(self),
+            # 兵种单价表 {兵种名: per_kilo}，前端兵种月饷据此算，消除前端硬编码表（单一来源 troop_cost.json）。
+            "troop_rates": {
+                str(t.get("tier") or ""): float(t.get("per_kilo") or 0.0)
+                for t in (self.content.troop_cost.get("tiers") or [])
+            },
             "map_nodes": self.map_nodes(regions),
             "ministers": [
                 self.public_character(c)
                 for c in self.content.characters.values()
                 if c.office_type != "后宫" and self.character_power_id(c) == "ming"
+            ],
+            "archived_ministers": [
+                c for c in self.archived_character_payloads()
+                if c.get("office_type") != "后宫" and (c.get("power_id") or "ming") == "ming"
             ],
             "consorts": [
                 self.public_character(c)
@@ -1181,6 +1344,7 @@ class WebGame:
                 if c.office_type == "后宫" and c.status == "active" and self.character_power_id(c) == "ming"
             ],
             "directives": directives,
+            "structured_directives": self.session.list_structured_directives(),
             "pending_count": self.session.pending_count(),
             "pending_decisions": (
                 self.session.pending_decisions()
@@ -2095,6 +2259,383 @@ def _has_main_db() -> bool:
     return os.path.isfile(db_path)
 
 
+# ---- 自定义剧本（scenarios）----
+
+_SCENARIO_FILES = {
+    "characters": "characters.json",
+    "events": "events.json",
+    "seed_events": "seed_events.json",
+}
+
+
+def _scenario_slug(raw: str) -> str:
+    """剧本 id 净化：仅留字母/数字/中文/._-，拒绝以 . 开头。空则报错。"""
+    cleaned = "".join(c for c in (raw or "").strip() if c.isalnum() or c in "._-")
+    if not cleaned or cleaned.startswith("."):
+        raise HTTPException(status_code=400, detail="剧本名非法（仅允许字母/数字/汉字/._-）。")
+    return cleaned
+
+
+def _scenario_dir(scenario_id: str) -> str:
+    return str(scenario_active.scenarios_root() / scenario_id)
+
+
+def _scenario_files_present(scenario_dir: str) -> Dict[str, bool]:
+    return {
+        key: os.path.isfile(os.path.join(scenario_dir, fname))
+        for key, fname in _SCENARIO_FILES.items()
+    }
+
+
+def _read_manifest(scenario_id: str) -> Dict[str, Any]:
+    scenario_dir = _scenario_dir(scenario_id)
+    path = os.path.join(scenario_dir, "manifest.json")
+    data: Dict[str, Any] = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data["id"] = scenario_id
+    data.setdefault("name", scenario_id)
+    data.setdefault("description", "")
+    data.setdefault("source", "manual")
+    data["files"] = _scenario_files_present(scenario_dir)  # 以盘上真相为准
+    return data
+
+
+def _write_manifest(scenario_id: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
+    scenario_dir = _scenario_dir(scenario_id)
+    os.makedirs(scenario_dir, exist_ok=True)
+    manifest = dict(manifest)
+    manifest["id"] = scenario_id
+    manifest["files"] = _scenario_files_present(scenario_dir)
+    manifest["updated"] = int(time.time())
+    manifest.setdefault("created", manifest["updated"])
+    with open(os.path.join(scenario_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=1)
+    return manifest
+
+
+def _validate_scenario_dir(scenario_dir: str) -> Optional[str]:
+    """把激活目录临时指向 scenario_dir，跑真 loader 校验（与游戏实际加载字节一致）。
+    返回中文错误串或 None（通过）。只校验目录里实际存在的文件（部分覆盖）。"""
+    with scenario_active.override(scenario_dir):
+        try:
+            if os.path.isfile(os.path.join(scenario_dir, "characters.json")):
+                load_character_content()
+            if os.path.isfile(os.path.join(scenario_dir, "events.json")):
+                load_event_content("events.json")
+            if os.path.isfile(os.path.join(scenario_dir, "seed_events.json")):
+                load_event_content("seed_events.json")
+        except SystemExit as exc:
+            return str(exc)
+    return None
+
+
+def _scan_scenarios() -> List[Dict[str, Any]]:
+    root = scenario_active.scenarios_root()
+    out: List[Dict[str, Any]] = []
+    if not os.path.isdir(root):
+        return out
+    for name in sorted(os.listdir(root)):
+        if name.startswith("."):  # 跳过 .gen-tmp-* 等临时目录
+            continue
+        if not os.path.isdir(os.path.join(root, name)):
+            continue
+        out.append(_read_manifest(name))
+    out.sort(key=lambda m: m.get("updated", 0), reverse=True)
+    return out
+
+
+def _active_scenario_manifest() -> Optional[Dict[str, Any]]:
+    sid = scenario_active.active_scenario_id()
+    if not sid:
+        return None
+    if not os.path.isdir(_scenario_dir(sid)):
+        return None
+    return _read_manifest(sid)
+
+
+@app.get("/api/scenarios")
+async def api_scenarios_list() -> Dict[str, Any]:
+    return {"scenarios": _scan_scenarios(), "active_id": scenario_active.active_scenario_id()}
+
+
+def _read_scenario_full(sid: str) -> Dict[str, Any]:
+    """读一份剧本的完整内容：{manifest, characters, events, seed_events}（缺则 null）。"""
+    scenario_dir = _scenario_dir(sid)
+    out: Dict[str, Any] = {"manifest": _read_manifest(sid)}
+    for key, fname in _SCENARIO_FILES.items():
+        path = os.path.join(scenario_dir, fname)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    out[key] = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                out[key] = None
+        else:
+            out[key] = None
+    return out
+
+
+@app.get("/api/scenarios/{scenario_id}")
+async def api_scenario_get(scenario_id: str) -> Dict[str, Any]:
+    sid = _scenario_slug(scenario_id)
+    if not os.path.isdir(_scenario_dir(sid)):
+        raise HTTPException(status_code=404, detail="剧本不存在。")
+    return _read_scenario_full(sid)
+
+
+@app.post("/api/scenarios")
+async def api_scenario_create(request: ScenarioCreateRequest) -> Dict[str, Any]:
+    name = (request.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="剧本名不能为空。")
+    sid = _scenario_slug(f"{name}_{int(time.time())}")
+    scenario_dir = _scenario_dir(sid)
+    if os.path.exists(scenario_dir):
+        raise HTTPException(status_code=409, detail="剧本已存在。")
+    os.makedirs(scenario_dir)
+    # 来源解析：copy_from 优先；兼容旧 from_default。
+    copy_from = (request.copy_from or "").strip()
+    if not copy_from and request.from_default:
+        copy_from = "__default__"
+    if copy_from and copy_from != "blank":
+        if copy_from == "__default__":
+            src_dir = bundled_path("content")
+        else:
+            src_dir = _scenario_dir(_scenario_slug(copy_from))
+            if not os.path.isdir(src_dir):
+                shutil.rmtree(scenario_dir, ignore_errors=True)
+                raise HTTPException(status_code=404, detail="复制来源剧本不存在。")
+        # 直接复制三件套文件（自包含，不走 fallback）。
+        for fname in _SCENARIO_FILES.values():
+            src = os.path.join(src_dir, fname)
+            if os.path.isfile(src):
+                shutil.copyfile(src, os.path.join(scenario_dir, fname))
+    manifest = _write_manifest(sid, {
+        "name": name,
+        "description": (request.description or "").strip(),
+        "source": "manual",
+    })
+    return {"manifest": manifest, "active_id": scenario_active.active_scenario_id()}
+
+
+@app.put("/api/scenarios/{scenario_id}/manifest")
+async def api_scenario_patch_manifest(scenario_id: str, request: ScenarioManifestPatch) -> Dict[str, Any]:
+    sid = _scenario_slug(scenario_id)
+    if not os.path.isdir(_scenario_dir(sid)):
+        raise HTTPException(status_code=404, detail="剧本不存在。")
+    manifest = _read_manifest(sid)
+    if request.name is not None and request.name.strip():
+        manifest["name"] = request.name.strip()
+    if request.description is not None:
+        manifest["description"] = request.description.strip()
+    return {"manifest": _write_manifest(sid, manifest)}
+
+
+@app.put("/api/scenarios/{scenario_id}/{file_key}")
+async def api_scenario_put_file(scenario_id: str, file_key: str, request: ScenarioFilePut) -> Dict[str, Any]:
+    sid = _scenario_slug(scenario_id)
+    fname = _SCENARIO_FILES.get(file_key)
+    if not fname:
+        raise HTTPException(status_code=400, detail="文件类型非法（characters/events/seed_events）。")
+    scenario_dir = _scenario_dir(sid)
+    if not os.path.isdir(scenario_dir):
+        raise HTTPException(status_code=404, detail="剧本不存在。")
+    # 先写临时文件 + 临时目录校验，过了再落正式文件，避免半写坏档。
+    tmp_dir = os.path.join(scenario_dir, f".validate-{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp_dir)
+    try:
+        with open(os.path.join(tmp_dir, fname), "w", encoding="utf-8") as fh:
+            json.dump(request.content, fh, ensure_ascii=False, indent=1)
+        err = _validate_scenario_dir(tmp_dir)
+        if err:
+            raise HTTPException(status_code=422, detail=f"设定校验未过：{err}")
+        shutil.move(os.path.join(tmp_dir, fname), os.path.join(scenario_dir, fname))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return {"manifest": _read_manifest(sid)}
+
+
+@app.delete("/api/scenarios/{scenario_id}")
+async def api_scenario_delete(scenario_id: str) -> Dict[str, Any]:
+    sid = _scenario_slug(scenario_id)
+    scenario_dir = _scenario_dir(sid)
+    if not os.path.isdir(scenario_dir):
+        raise HTTPException(status_code=404, detail="剧本不存在。")
+    if scenario_active.active_scenario_id() == sid:
+        scenario_active.set_active_scenario(None)  # 删的是激活剧本 → 清指针
+    shutil.rmtree(scenario_dir, ignore_errors=True)
+    return {"scenarios": _scan_scenarios(), "active_id": scenario_active.active_scenario_id()}
+
+
+@app.post("/api/scenarios/{scenario_id}/activate")
+async def api_scenario_activate(scenario_id: str) -> Dict[str, Any]:
+    sid = _scenario_slug(scenario_id)
+    scenario_dir = _scenario_dir(sid)
+    if not os.path.isdir(scenario_dir):
+        raise HTTPException(status_code=404, detail="剧本不存在。")
+    err = _validate_scenario_dir(scenario_dir)
+    if err:
+        raise HTTPException(status_code=422, detail=f"剧本校验未过，无法激活：{err}")
+    scenario_active.set_active_scenario(sid)
+    # 仅写指针，不动正在跑的局；下次「开始游戏/继续」时 GameContent.load() 自然拾取。
+    return {"active_id": sid, "scenarios": _scan_scenarios()}
+
+
+@app.post("/api/scenarios/deactivate")
+async def api_scenario_deactivate() -> Dict[str, Any]:
+    scenario_active.set_active_scenario(None)
+    return {"active_id": "", "scenarios": _scan_scenarios()}
+
+
+@app.post("/api/scenarios/generate")
+async def api_scenario_generate(request: ScenarioGenerateRequest) -> Dict[str, Any]:
+    """LLM 生成剧本内容（不落盘），返回供前端编辑。分文件逐个生成。"""
+    prompt = (request.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="请填写剧本构思。")
+    targets = request.files or ["characters", "events", "seed_events"]
+    targets = [t for t in targets if t in _SCENARIO_FILES]
+    if not targets:
+        raise HTTPException(status_code=400, detail="未指定要生成的文件。")
+    try:
+        llm_config = _build_llm_config_from_runtime()
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=412, detail=_llm_error_detail(exc))
+
+    # 生成 agent 需要 content 已 bind（菜单态可能尚无 GameSession）。
+    from ming_sim import agents as _agents
+    from ming_sim.content import GameContent
+    _agents.bind_content(GameContent.load())
+
+    def _run() -> Dict[str, Any]:
+        result: Dict[str, Any] = {"status": {}}
+        for target in targets:
+            try:
+                content = _agents.generate_scenario_file(llm_config, None, target, prompt)
+                result[target] = content
+                result["status"][target] = "generated"
+            except Exception as exc:  # 单文件失败不拖累其它
+                result[target] = None
+                result["status"][target] = f"failed: {exc}"
+        return result
+
+    result = await asyncio.to_thread(_run)
+
+    # 写临时目录跑校验，把警告连同内容一起回（不自动激活、不落正式盘）。
+    tmp_dir = str(scenario_active.scenarios_root() / f".gen-tmp-{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    try:
+        for target in targets:
+            if result.get(target) is None:
+                continue
+            with open(os.path.join(tmp_dir, _SCENARIO_FILES[target]), "w", encoding="utf-8") as fh:
+                json.dump(result[target], fh, ensure_ascii=False)
+        result["validation"] = _validate_scenario_dir(tmp_dir)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return result
+
+
+# ---- 剧本对话式编辑（coding-agent 模式）----
+
+def _scenario_editor_agno_db():
+    """剧本编辑会话的 agno 历史库，存 scenarios/.scenario-editor.db。
+    菜单态也可用、跨重启持久；各剧本按 session_id 隔离，共用一个库文件。"""
+    return create_agno_db(str(scenario_active.scenarios_root() / ".scenario-editor.db"))
+
+
+def _scenario_counts_brief(scenario_dir: str) -> str:
+    from ming_sim.scenario_tools import build_scenario_editor_tools
+    tools = {t.__name__: t for t in build_scenario_editor_tools(scenario_dir)}
+    return tools["list_current"]("summary")
+
+
+def _scenario_chat_stream(scenario_id: str, message: str) -> Iterator[Dict[str, Any]]:
+    """剧本编辑对话：流式 yield delta，终态拼 changes + 回读整份剧本 + 软校验。"""
+    sid = _scenario_slug(scenario_id)
+    scenario_dir = _scenario_dir(sid)
+    if not os.path.isdir(scenario_dir):
+        yield {"type": "error", "message": "剧本不存在。"}
+        return
+    text = (message or "").strip()
+    if not text:
+        yield {"type": "error", "message": "请输入指令。"}
+        return
+    try:
+        llm_config = _build_llm_config_from_runtime()
+    except LLMUnavailable as exc:
+        yield {"type": "error", "detail": _llm_error_detail(exc)}
+        return
+
+    from ming_sim import agents as _agents
+    from ming_sim.content import GameContent
+    from ming_sim.scenario_tools import build_scenario_editor_tools, _EDIT_TOOL_NAMES
+    _agents.bind_content(GameContent.load())  # 菜单态可能无 GameSession
+
+    agno_db = _scenario_editor_agno_db()
+    tools = build_scenario_editor_tools(scenario_dir)
+    agent = _agents.create_scenario_editor_agent(llm_config, agno_db, sid, tools)
+    run_input = f"【当前剧本概况】{_scenario_counts_brief(scenario_dir)}\n\n{text}"
+
+    chunks: List[str] = []
+    run_output = None
+    try:
+        stream = agent.run(run_input, stream=True, stream_events=True, yield_run_output=True)
+        for event in stream:
+            content = getattr(event, "content", None)
+            if getattr(event, "event", "") == "RunContent" and content:
+                delta = str(content)
+                chunks.append(delta)
+                yield {"type": "delta", "content": delta}
+            if type(event).__name__ in ("RunOutput", "RunCompletedEvent"):
+                run_output = event
+        _dump_llm_messages(run_output, f"剧本编辑/{sid}", agent=agent)
+        reply = "".join(chunks).strip()
+        fail_if_llm_error(reply, "LLM 调用")
+        if not reply and run_output is not None:
+            reply = extract_agent_text(run_output)
+
+        changes: List[Dict[str, str]] = []
+        if run_output is not None:
+            for te in getattr(run_output, "tools", None) or []:
+                tname = getattr(te, "tool_name", "")
+                if tname in _EDIT_TOOL_NAMES:
+                    changes.append({"tool": tname, "result": str(getattr(te, "result", "") or "")})
+
+        yield {"type": "done", "payload": {
+            "reply": reply or "（已处理。）",
+            "changes": changes,
+            "scenario": _read_scenario_full(sid),
+            "validation": _validate_scenario_dir(scenario_dir),
+        }}
+    except LLMUnavailable as exc:
+        yield {"type": "error", "detail": _llm_error_detail(exc)}
+    except Exception as exc:  # noqa: BLE001
+        yield {"type": "error", "message": f"剧本编辑失败：{exc}"}
+
+
+@app.post("/api/scenarios/{scenario_id}/chat/stream")
+async def api_scenario_chat_stream(scenario_id: str, request: ChatRequest) -> StreamingResponse:
+    async def generate() -> AsyncIterator[str]:
+        for item in _scenario_chat_stream(scenario_id, request.message):
+            item_type = str(item.get("type", "message"))
+            if item_type == "delta":
+                yield sse_event("delta", {"content": item.get("content", "")})
+            elif item_type == "done":
+                yield sse_event("done", item.get("payload", {}))
+            elif item_type == "error":
+                yield sse_event("error", item.get("detail") or {"message": item.get("message", "未知错误")})
+            await asyncio.sleep(0)
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
 @app.get("/api/menu/status")
 async def api_menu_status() -> Dict[str, Any]:
     """菜单页状态：API key 是否配好、上次主 DB 是否存在、存档列表。"""
@@ -2108,6 +2649,7 @@ async def api_menu_status() -> Dict[str, Any]:
         "campaigns": _scan_campaigns(),
         "current_campaign": _main_db_campaign_id(),
         "game_settings": load_runtime_game(),
+        "active_scenario": _active_scenario_manifest(),
         "llm": {
             "base_url": runtime.get("base_url") or os.environ.get("OPENAI_BASE_URL", ""),
             "model": runtime.get("model") or os.environ.get("OPENAI_MODEL", ""),
@@ -2137,6 +2679,8 @@ async def api_menu_new_game() -> Dict[str, Any]:
         web_game = WebGame(fresh=True)
     except LLMUnavailable as exc:
         raise HTTPException(status_code=412, detail=_llm_error_detail(exc))
+    except SystemExit as exc:
+        raise HTTPException(status_code=500, detail=f"当前剧本文件损坏：{exc}，请到自定义剧本修正或停用。")
     return steam_events.with_events(
         {"state": web_game.state_payload()},
         [steam_events.add_stat(steam_events.STAT_RUNS_STARTED)],
@@ -2153,6 +2697,8 @@ async def api_menu_continue() -> Dict[str, Any]:
         web_game = WebGame(fresh=False)
     except LLMUnavailable as exc:
         raise HTTPException(status_code=412, detail=_llm_error_detail(exc))
+    except SystemExit as exc:
+        raise HTTPException(status_code=500, detail=f"当前剧本文件损坏：{exc}，请到自定义剧本修正或停用。")
     return {"state": web_game.state_payload()}
 
 
@@ -2164,6 +2710,8 @@ async def api_menu_load_save(name: str) -> Dict[str, Any]:
         web_game = WebGame(fresh=False)  # 先有 session 才能 load_save
     except LLMUnavailable as exc:
         raise HTTPException(status_code=412, detail=_llm_error_detail(exc))
+    except SystemExit as exc:
+        raise HTTPException(status_code=500, detail=f"当前剧本文件损坏：{exc}，请到自定义剧本修正或停用。")
     web_game.load_save(name)
     return {"state": web_game.state_payload()}
 
@@ -2363,10 +2911,25 @@ class GameSettingsRequest(BaseModel):
     hitl_min_decisions: int = 1
     # 朝会聊天室 ReAct 交锋轮数，未形成结论前继续驱动 agent；默认 3。
     court_chat_debate_rounds: int = 3
+    # 朝会流式输出速度档位，1-5。默认 3。
+    court_chat_stream_speed: int = 3
     # decree 来源 active 局势同时进行上限；默认 10，调高增加推演 token 消耗。
     max_decree_issues: int = 10
     # 每条 active 局势注入推演的最近推进日志条数。0=不带推进日志。
     issue_log_limit: int = 6
+    # 单个承办人同时进行中的密令上限；默认 1。
+    secret_order_person_limit: int = 1
+    # 全朝同时进行中的密令总上限；默认 5。
+    secret_order_total_limit: int = 5
+    # 本局朝臣人物建档上限；后宫不计入。默认 120，调高会增加名册/推演 token 消耗。
+    character_limit: int = 120
+    # 大臣 / 推演 / 结算三个核心 agent 的采样参数。
+    minister_temperature: float = 0.6
+    minister_top_p: float = 0.9
+    simulator_temperature: float = 0.5
+    simulator_top_p: float = 0.5
+    extractor_temperature: float = 0.1
+    extractor_top_p: float = 0.1
 
 
 @app.get("/api/menu/game_settings")
@@ -2381,8 +2944,18 @@ async def api_menu_save_game_settings(request: GameSettingsRequest) -> Dict[str,
     saved = save_runtime_game(
         request.hitl_min_decisions,
         request.court_chat_debate_rounds,
+        request.court_chat_stream_speed,
         request.max_decree_issues,
         request.issue_log_limit,
+        request.secret_order_person_limit,
+        request.secret_order_total_limit,
+        request.character_limit,
+        request.minister_temperature,
+        request.minister_top_p,
+        request.simulator_temperature,
+        request.simulator_top_p,
+        request.extractor_temperature,
+        request.extractor_top_p,
     )
     return {"ok": True, "game_settings": saved}
 
@@ -2441,10 +3014,10 @@ class ManualIssueEntity(BaseModel):
 class ManualIssueCreateRequest(BaseModel):
     # 名称（局势标题），必填。
     title: str = ""
-    # 持续回合数；0=无硬期限，>0 到期自动撤销（无奖励）。
-    duration_turns: int = 0
     # 目标：皇帝给该局势定的方向意图，喂给推演逐月推进。立项后锁定不可改。
     goal: str = ""
+    # 承办人：主责大臣姓名。推演按其职掌、能力、状态自动推进或恶化。
+    assignee: str = ""
     # 分类（题材），落 tags；与 ISSUE_THEMES 对齐。
     tags: list[str] = []
     # 走满后落成的实体固定字段（玩家填）。组装成 effect_on_resolve 立项即预埋，走满直接落地。
@@ -2454,7 +3027,17 @@ class ManualIssueCreateRequest(BaseModel):
 class ManualIssueUpdateRequest(BaseModel):
     # 注意：goal 立项后锁定，不在此可改。
     title: Optional[str] = None
-    duration_turns: Optional[int] = None
+    assignee: Optional[str] = None
+
+
+class IssueAssigneeUpdateRequest(BaseModel):
+    assignee: str = ""
+
+
+class IssueAuthorizationRequest(BaseModel):
+    budget_add: float = 0      # 本次追加专款万两（累加进 budget_pool）
+    budget_source: str = ""    # 专款出库：'国库' / '内库' / ''(不改)
+    death_authority: bool = False  # 专断之权（生杀权）开关
 
 
 def _build_manual_resolve_effect(entity: "ManualIssueEntity | None", title: str) -> dict:
@@ -2656,23 +3239,51 @@ async def api_create_manual_issue(request: ManualIssueCreateRequest) -> Dict[str
         resolve_condition=str(preset_override.get("resolve_condition") or ""),
         fail_condition=str(preset_override.get("fail_condition") or ""),
         is_manual=True,
-        duration_turns=max(0, int(request.duration_turns or 0)),
+        duration_turns=0,
         goal=str(request.goal or preset_override.get("goal") or "").strip(),
+        assignee=str(request.assignee or "").strip(),
     )
     print(f"[issue/api] 手动新建局势 id={issue_id} title={title!r} tags={tags} 预埋effect={resolve_effect}")
-    return {"id": issue_id, "title": title, "duration_turns": max(0, int(request.duration_turns or 0))}
+    return {"id": issue_id, "title": title, "duration_turns": 0}
 
 
 @app.patch("/api/issues/manual/{issue_id}")
 async def api_update_manual_issue(issue_id: int, request: ManualIssueUpdateRequest) -> Dict[str, Any]:
-    """改手动 decree 局势：名称 / 持续回合数。goal 立项后锁定，不可改。"""
+    """改手动 decree 局势：名称 / 承办人。goal 立项后锁定，不可改。"""
     ok = get_game().db.update_manual_issue(
-        issue_id, title=request.title, duration_turns=request.duration_turns
+        issue_id, title=request.title, assignee=request.assignee
     )
     if not ok:
         raise HTTPException(status_code=404, detail=f"未找到可改的手动局势 #{issue_id}（仅手动新建且进行中的可改）")
-    print(f"[issue/api] 改手动局势 id={issue_id} title={request.title!r} duration={request.duration_turns}")
+    print(f"[issue/api] 改手动局势 id={issue_id} title={request.title!r} assignee={request.assignee!r}")
     return {"updated": True, "id": issue_id}
+
+
+@app.patch("/api/issues/{issue_id}/assignee")
+async def api_update_issue_assignee(issue_id: int, request: IssueAssigneeUpdateRequest) -> Dict[str, Any]:
+    """改任意 active 局势的承办人。"""
+    ok = get_game().db.update_issue_assignee(issue_id, request.assignee)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"未找到可改的在办局势 #{issue_id}")
+    print(f"[issue/api] 改局势承办人 id={issue_id} assignee={request.assignee!r}")
+    return {"updated": True, "id": issue_id, "assignee": request.assignee.strip()}
+
+
+@app.post("/api/issues/{issue_id}/authorization")
+async def api_set_issue_authorization(issue_id: int, request: IssueAuthorizationRequest) -> Dict[str, Any]:
+    """给 active 局势的承办人设授权：追加专款（指定出库）、开/关生杀权。
+    承办人此后每月自主从专款推进，不必皇帝再下圣旨。"""
+    result = get_game().db.set_issue_authorization(
+        issue_id,
+        budget_add=request.budget_add,
+        budget_source=request.budget_source,
+        death_authority=request.death_authority,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"未找到可改的在办局势 #{issue_id}")
+    print(f"[issue/api] 设局势授权 id={issue_id} 追加={request.budget_add}万两 出库={request.budget_source!r} "
+          f"生杀权={request.death_authority} → 池余={result['budget_pool']}")
+    return {"updated": True, "id": issue_id, **result}
 
 
 @app.delete("/api/issues/manual/{issue_id}")
@@ -2742,6 +3353,9 @@ async def api_buildings(region_id: str = "") -> Dict[str, Any]:
 async def api_add_favorite(minister_name: str) -> Dict[str, Any]:
     if minister_name not in get_game().content.characters:
         raise HTTPException(status_code=404, detail=f"未找到：{minister_name}")
+    row = get_game().db.conn.execute("SELECT archived FROM characters WHERE name=?", (minister_name,)).fetchone()
+    if row is not None and int(row["archived"] or 0):
+        raise HTTPException(status_code=409, detail=f"{minister_name}已归档，请先恢复。")
     get_game().favorites.add(minister_name)
     get_game().db.kv_set("favorites", json.dumps(sorted(get_game().favorites)))
     return {"favorites": sorted(get_game().favorites)}
@@ -2754,21 +3368,76 @@ async def api_remove_favorite(minister_name: str) -> Dict[str, Any]:
     return {"favorites": sorted(get_game().favorites)}
 
 
+@app.post("/api/ministers/{minister_name}/archive")
+async def api_archive_minister(minister_name: str) -> Dict[str, Any]:
+    game = get_game()
+    try:
+        result = game.db.archive_runtime_character(game.session.state, minister_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    game.content.characters.pop(minister_name, None)
+    game.session.temporary_characters.pop(minister_name, None)
+    game.chat_history.pop(minister_name, None)
+    game.favorites.discard(minister_name)
+    game.db.kv_set("favorites", json.dumps(sorted(game.favorites)))
+    if getattr(game.session, "registry", None) is not None:
+        game.session.registry.agents.pop(minister_name, None)
+        game.session.registry.session_ids.pop(minister_name, None)
+    return {"ok": True, **result}
+
+
+@app.post("/api/ministers/{minister_name}/restore")
+async def api_restore_minister(minister_name: str) -> Dict[str, Any]:
+    game = get_game()
+    try:
+        result = game.db.restore_archived_character(minister_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    row = game.db.conn.execute(
+        """
+        SELECT name, office, office_type, faction, aliases, personal_skills,
+               loyalty, ability, integrity, courage, style,
+               diplomacy, martial, stewardship, intrigue, learning,
+               birth_year, historical_death_year, historical_death_month,
+               debut_year, debut_month, status, portrait_id, power_id, location,
+               summary
+        FROM characters
+        WHERE name=? AND archived=0
+        """,
+        (minister_name,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"未找到已恢复人物：{minister_name}")
+    character = game._character_from_db_row(row)
+    game.content.characters[character.name] = character
+    game.chat_history.setdefault(character.name, [])
+    if getattr(game.session, "registry", None) is not None:
+        game.session.registry.session_ids.setdefault(
+            character.name,
+            f"minister-{character.name}-turn-{game.session.state.turn}",
+        )
+        game.session.registry.agents.pop(character.name, None)
+    return {"ok": True, "minister": game.public_character(character), **result}
+
+
 _STATUS_LABEL_WEB = {
     "active": "在朝", "offstage": "尚未登场", "dead": "已殁", "dismissed": "已罢黜",
     "imprisoned": "下狱", "exiled": "流放", "retired": "致仕",
 }
 
 
-def _require_active_minister(minister_name: str) -> None:
+def _require_chat_capable_minister(minister_name: str) -> None:
     if minister_name in get_game().session.temporary_characters:
         return
     if minister_name not in get_game().content.characters:
         raise HTTPException(status_code=404, detail=f"未找到人物：{minister_name}")
+    archived_row = get_game().db.conn.execute("SELECT archived FROM characters WHERE name=?", (minister_name,)).fetchone()
+    if archived_row is not None and int(archived_row["archived"] or 0):
+        raise HTTPException(status_code=409, detail=f"{minister_name}已归档，请先恢复。")
     if get_game().character_power_id(get_game().content.characters[minister_name]) != "ming":
         raise HTTPException(status_code=409, detail=f"{minister_name}不属大明朝廷，无法召见。")
     status, reason = get_game().db.get_character_status(minister_name)
-    if status != "active":
+    if status in {"dead", "offstage"}:
         label = _STATUS_LABEL_WEB.get(status, status)
         detail = f"{minister_name}已{label}，无法召见。" + (reason or "")
         raise HTTPException(status_code=409, detail=detail.strip())
@@ -2776,12 +3445,16 @@ def _require_active_minister(minister_name: str) -> None:
 
 @app.get("/api/ministers/{minister_name}/chat")
 async def api_chat_history(minister_name: str) -> Dict[str, Any]:
-    _require_active_minister(minister_name)
+    if minister_name not in get_game().content.characters and minister_name not in get_game().session.temporary_characters:
+        raise HTTPException(status_code=404, detail=f"未找到人物：{minister_name}")
+    archived_row = get_game().db.conn.execute("SELECT archived FROM characters WHERE name=?", (minister_name,)).fetchone()
+    if archived_row is not None and int(archived_row["archived"] or 0):
+        raise HTTPException(status_code=409, detail=f"{minister_name}已归档，请先恢复。")
     character = get_game().session._character(minister_name)
     return {
         "minister": get_game().public_character(character),
         "history": get_game().chat_history.get(minister_name, []),
-        "suggestions": get_game().suggestions_for(character),
+        "suggestions": get_game().suggestions_for(character) if character.status == "active" else [],
     }
 
 
@@ -2801,22 +3474,26 @@ async def api_create_secret_order(minister_name: str, request: SecretOrderReques
     if not title or not content:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="title 和 content 不能为空")
-    order_id = game.db.create_secret_order(
-        game.session.state, minister_name, title, content, request.tags, deadline_months=request.deadline_months
-    )
+    try:
+        order_id = game.db.create_secret_order(
+            game.session.state, minister_name, title, content, request.tags, deadline_months=request.deadline_months
+        )
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     print(f"[secret_order/api] 直接落库 minister={minister_name} title={title!r} id={order_id}")
     return {"order_id": order_id, "minister_name": minister_name, "title": title, "status": "active"}
 
 
 @app.post("/api/ministers/{minister_name}/chat")
 async def api_chat(minister_name: str, request: ChatRequest) -> Dict[str, Any]:
-    _require_active_minister(minister_name)
+    _require_chat_capable_minister(minister_name)
     return get_game().chat(minister_name, request.message)
 
 
 @app.post("/api/ministers/{minister_name}/chat/stream")
 async def api_chat_stream(minister_name: str, request: ChatRequest) -> StreamingResponse:
-    _require_active_minister(minister_name)
+    _require_chat_capable_minister(minister_name)
     async def generate() -> AsyncIterator[str]:
         for item in get_game().chat_stream(minister_name, request.message):
             item_type = str(item.get("type", "message"))
@@ -2901,6 +3578,35 @@ async def api_create_directive(request: DirectiveRequest) -> Dict[str, Any]:
     }
 
 
+@app.get("/api/structured_directives/templates")
+async def api_structured_directive_templates() -> Dict[str, Any]:
+    return {"templates": load_directive_templates()}
+
+
+@app.post("/api/structured_directives")
+async def api_create_structured_directive(request: StructuredDirectiveRequest) -> Dict[str, Any]:
+    try:
+        get_game().session.add_structured_directive(request.template_id, request.fields)
+    except StructuredDirectiveError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    return {"structured_directives": get_game().session.list_structured_directives()}
+
+
+@app.patch("/api/structured_directives/{directive_id}")
+async def api_update_structured_directive(directive_id: int, request: StructuredDirectiveRequest) -> Dict[str, Any]:
+    try:
+        get_game().session.update_structured_directive(directive_id, request.template_id, request.fields)
+    except StructuredDirectiveError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    return {"structured_directives": get_game().session.list_structured_directives()}
+
+
+@app.delete("/api/structured_directives/{directive_id}")
+async def api_delete_structured_directive(directive_id: int) -> Dict[str, Any]:
+    get_game().session.delete_structured_directive(directive_id)
+    return {"structured_directives": get_game().session.list_structured_directives()}
+
+
 @app.patch("/api/directives/{directive_id}")
 async def api_update_directive(directive_id: int, request: DirectivePatch) -> Dict[str, Any]:
     rows = get_game().directive_rows()
@@ -2978,6 +3684,10 @@ async def api_issue_decree(body: IssueDecreeRequest = IssueDecreeRequest()) -> D
     """非流式颁诏（保留兼容）。前端默认走 /api/decree/issue/stream。"""
     game = get_game()
     was_ended = bool(game.state.ended)
+    issued_decree = bool(
+        game.session.db.list_directives(game.state, statuses=("draft",))
+        or game.session.db.list_structured_directives(game.state, statuses=("draft",))
+    )
     try:
         result = game.session.resolve_turn(cheat_directive=body.cheat)
     except ValueError as e:
@@ -2990,10 +3700,11 @@ async def api_issue_decree(body: IssueDecreeRequest = IssueDecreeRequest()) -> D
     report = result.report
     game.refresh_turn()
     events = [
-        steam_events.add_stat(steam_events.STAT_DECREES_ISSUED),
         steam_events.add_stat(steam_events.STAT_TURNS_PLAYED),
         steam_events.set_stat(steam_events.STAT_MAX_TURN_REACHED, int(game.state.turn)),
     ]
+    if issued_decree:
+        events.insert(0, steam_events.add_stat(steam_events.STAT_DECREES_ISSUED))
     if not was_ended and game.state.ended:
         events.append(steam_events.add_stat(steam_events.STAT_ENDINGS_REACHED))
     return steam_events.with_events({"decree": decree, "report": report, "state": game.state_payload()}, events)
@@ -3016,6 +3727,10 @@ async def api_issue_decree_stream(body: IssueDecreeRequest = IssueDecreeRequest(
         try:
             game = get_game()
             was_ended = bool(game.state.ended)
+            issued_decree = bool(
+                game.session.db.list_directives(game.state, statuses=("draft",))
+                or game.session.db.list_structured_directives(game.state, statuses=("draft",))
+            )
             result = game.session.resolve_turn(on_event=on_event, cheat_directive=body.cheat)
             decree = game.session.last_decree
             if result.awaiting:
@@ -3029,10 +3744,11 @@ async def api_issue_decree_stream(body: IssueDecreeRequest = IssueDecreeRequest(
             report = result.report
             game.refresh_turn()
             events = [
-                steam_events.add_stat(steam_events.STAT_DECREES_ISSUED),
                 steam_events.add_stat(steam_events.STAT_TURNS_PLAYED),
                 steam_events.set_stat(steam_events.STAT_MAX_TURN_REACHED, int(game.state.turn)),
             ]
+            if issued_decree:
+                events.insert(0, steam_events.add_stat(steam_events.STAT_DECREES_ISSUED))
             if not was_ended and game.state.ended:
                 events.append(steam_events.add_stat(steam_events.STAT_ENDINGS_REACHED))
             ev_queue.put(("__done__", {

@@ -1,0 +1,490 @@
+{
+  "version": 6,
+  "note": "兵种/军需表（明末写实→现代升级线）：troop_composition 的 key 必须是本表 tier 名（固定兵种闭集）。per_kilo=月饷单价（万两/千人/月），程序按 tier 名精确查表算军费。keywords 含旧名别名供老档归一。requires_tech=前置科技中文名（须在 technologies 表已解锁才可编；空=开局可用）；近现代兵种挂的科技未必在预设池，须等推演现场研成同名科技。同级并列兵种（轻骑兵/重骑兵/家丁骑、火枪兵/长矛兵/刀盾兵）非升级关系，按战场需要选编；泛词（骑兵/步兵）归该系基础档。requires_equipment 已废，装备维度由 AI 据 held_arms 软判。equipment=该兵种依赖装备类别（人读注释）。upgrades=升级线。",
+  "unit": "万两/千人/月",
+  "tiers": [
+    {
+      "tier": "杂兵",
+      "category": "步兵",
+      "per_kilo": 0.08,
+      "keywords": [
+        "杂兵",
+        "卫所",
+        "募兵",
+        "边军",
+        "土兵",
+        "流民",
+        "步卒",
+        "步兵",
+        "非正规步兵",
+        "守军",
+        "关隘",
+        "镇",
+        "弓",
+        "饥民",
+        "逃卒",
+        "驿卒",
+        "游击",
+        "降军"
+      ],
+      "equipment": [
+        "武器"
+      ],
+      "upgrades": [
+        "火枪兵",
+        "长矛兵",
+        "刀盾兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "长矛兵",
+      "category": "步兵",
+      "per_kilo": 0.1,
+      "keywords": [
+        "长矛兵",
+        "长枪兵",
+        "矛兵",
+        "枪兵"
+      ],
+      "equipment": [
+        "长矛"
+      ],
+      "upgrades": [
+        "火枪兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "刀盾兵",
+      "category": "步兵",
+      "per_kilo": 0.1,
+      "keywords": [
+        "刀盾兵",
+        "藤牌兵",
+        "刀牌手",
+        "盾兵"
+      ],
+      "equipment": [
+        "腰刀",
+        "藤牌"
+      ],
+      "upgrades": [
+        "火枪兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "火枪兵",
+      "category": "步兵",
+      "per_kilo": 0.14,
+      "keywords": [
+        "火枪兵",
+        "火铳手",
+        "鸟铳手",
+        "铳手",
+        "火器营",
+        "火器手"
+      ],
+      "equipment": [
+        "武器",
+        "火铳"
+      ],
+      "upgrades": [
+        "线列兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "车营",
+      "category": "步兵",
+      "per_kilo": 0.18,
+      "keywords": [
+        "车营",
+        "战车营",
+        "偏厢车"
+      ],
+      "equipment": [
+        "战车",
+        "火器",
+        "火炮"
+      ],
+      "upgrades": [
+        "线列兵"
+      ],
+      "requires_tech": "火器新法"
+    },
+    {
+      "tier": "线列兵",
+      "category": "步兵",
+      "per_kilo": 0.2,
+      "keywords": [
+        "线列兵",
+        "线列步兵"
+      ],
+      "equipment": [
+        "武器"
+      ],
+      "upgrades": [
+        "散兵线"
+      ],
+      "requires_tech": "练兵新制"
+    },
+    {
+      "tier": "散兵线",
+      "category": "步兵",
+      "per_kilo": 0.28,
+      "keywords": [
+        "散兵线",
+        "散兵"
+      ],
+      "equipment": [
+        "武器",
+        "弹药"
+      ],
+      "upgrades": [
+        "堑壕兵"
+      ],
+      "requires_tech": "燧发枪法"
+    },
+    {
+      "tier": "堑壕兵",
+      "category": "步兵",
+      "per_kilo": 0.34,
+      "keywords": [
+        "堑壕兵",
+        "堑壕步兵"
+      ],
+      "equipment": [
+        "武器",
+        "弹药"
+      ],
+      "upgrades": [
+        "突击步兵"
+      ],
+      "requires_tech": "后膛枪法"
+    },
+    {
+      "tier": "突击步兵",
+      "category": "步兵",
+      "per_kilo": 0.42,
+      "keywords": [
+        "突击步兵",
+        "班组步兵"
+      ],
+      "equipment": [
+        "武器",
+        "弹药"
+      ],
+      "upgrades": [
+        "机械化步兵"
+      ],
+      "requires_tech": "速射枪法"
+    },
+    {
+      "tier": "机械化步兵",
+      "category": "步兵",
+      "per_kilo": 0.5,
+      "keywords": [
+        "机械化步兵"
+      ],
+      "equipment": [
+        "武器",
+        "弹药",
+        "车辆"
+      ],
+      "upgrades": [],
+      "requires_tech": "内燃机甲"
+    },
+    {
+      "tier": "轻骑兵",
+      "category": "骑兵",
+      "per_kilo": 0.16,
+      "keywords": [
+        "轻骑兵",
+        "轻骑",
+        "夜不收",
+        "哨骑",
+        "骑兵",
+        "骑",
+        "马",
+        "八旗",
+        "巴牙喇",
+        "披甲"
+      ],
+      "equipment": [
+        "座骑",
+        "武器"
+      ],
+      "upgrades": [
+        "龙骑兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "重骑兵",
+      "category": "骑兵",
+      "per_kilo": 0.22,
+      "keywords": [
+        "重骑兵",
+        "重骑",
+        "铁骑",
+        "具装",
+        "关宁铁骑"
+      ],
+      "equipment": [
+        "座骑",
+        "重甲",
+        "武器"
+      ],
+      "upgrades": [
+        "龙骑兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "家丁骑",
+      "category": "骑兵",
+      "per_kilo": 0.28,
+      "keywords": [
+        "家丁骑",
+        "家丁",
+        "亲兵骑",
+        "标骑"
+      ],
+      "equipment": [
+        "座骑",
+        "武器",
+        "火铳"
+      ],
+      "upgrades": [
+        "龙骑兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "龙骑兵",
+      "category": "骑兵",
+      "per_kilo": 0.24,
+      "keywords": [
+        "龙骑兵",
+        "龙骑"
+      ],
+      "equipment": [
+        "座骑",
+        "武器"
+      ],
+      "upgrades": [
+        "胸甲骑兵"
+      ],
+      "requires_tech": "火器新法"
+    },
+    {
+      "tier": "胸甲骑兵",
+      "category": "骑兵",
+      "per_kilo": 0.32,
+      "keywords": [
+        "胸甲骑兵",
+        "胸甲骑",
+        "骠骑兵",
+        "手枪骑兵"
+      ],
+      "equipment": [
+        "座骑",
+        "武器",
+        "手枪"
+      ],
+      "upgrades": [
+        "机械化骑兵"
+      ],
+      "requires_tech": "燧发枪法"
+    },
+    {
+      "tier": "机械化骑兵",
+      "category": "骑兵",
+      "per_kilo": 0.46,
+      "keywords": [
+        "机械化骑兵",
+        "装甲骑兵"
+      ],
+      "equipment": [
+        "车辆",
+        "武器"
+      ],
+      "upgrades": [],
+      "requires_tech": "内燃机甲"
+    },
+    {
+      "tier": "火炮队",
+      "category": "炮兵",
+      "per_kilo": 0.2,
+      "keywords": [
+        "火炮队",
+        "炮兵",
+        "佛郎机炮手",
+        "火器炮兵",
+        "铳",
+        "佛郎机",
+        "炮"
+      ],
+      "equipment": [
+        "武器",
+        "火炮"
+      ],
+      "upgrades": [
+        "野战炮兵"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "野战炮兵",
+      "category": "炮兵",
+      "per_kilo": 0.28,
+      "keywords": [
+        "野战炮兵",
+        "野炮"
+      ],
+      "equipment": [
+        "武器",
+        "火炮",
+        "弹药"
+      ],
+      "upgrades": [
+        "榴弹炮兵"
+      ],
+      "requires_tech": "火炮新铸"
+    },
+    {
+      "tier": "榴弹炮兵",
+      "category": "炮兵",
+      "per_kilo": 0.4,
+      "keywords": [
+        "榴弹炮兵",
+        "榴霰炮兵",
+        "攻城炮兵"
+      ],
+      "equipment": [
+        "火炮",
+        "弹药"
+      ],
+      "upgrades": [],
+      "requires_tech": "速射枪法"
+    },
+    {
+      "tier": "水师",
+      "category": "水师",
+      "per_kilo": 0.18,
+      "keywords": [
+        "水师",
+        "水军",
+        "桨帆舰队",
+        "海军",
+        "船",
+        "舰",
+        "岛",
+        "海防",
+        "操江",
+        "炮船"
+      ],
+      "equipment": [
+        "舰船"
+      ],
+      "upgrades": [
+        "风帆战舰"
+      ],
+      "requires_tech": ""
+    },
+    {
+      "tier": "风帆战舰",
+      "category": "水师",
+      "per_kilo": 0.28,
+      "keywords": [
+        "风帆战舰",
+        "帆船"
+      ],
+      "equipment": [
+        "舰船"
+      ],
+      "upgrades": [
+        "铁甲舰"
+      ],
+      "requires_tech": "海船新制"
+    },
+    {
+      "tier": "铁甲舰",
+      "category": "水师",
+      "per_kilo": 0.45,
+      "keywords": [
+        "铁甲舰",
+        "铁甲船"
+      ],
+      "equipment": [
+        "舰船"
+      ],
+      "upgrades": [
+        "无畏舰"
+      ],
+      "requires_tech": "钢铁舰甲"
+    },
+    {
+      "tier": "无畏舰",
+      "category": "水师",
+      "per_kilo": 0.7,
+      "keywords": [
+        "无畏舰"
+      ],
+      "equipment": [
+        "舰船"
+      ],
+      "upgrades": [],
+      "requires_tech": "钢铁舰甲"
+    },
+    {
+      "tier": "侦察机",
+      "category": "空军",
+      "per_kilo": 1.0,
+      "keywords": [
+        "侦察机",
+        "空军",
+        "飞机",
+        "飞艇",
+        "航空"
+      ],
+      "equipment": [
+        "飞机"
+      ],
+      "upgrades": [
+        "战斗机",
+        "轰炸机"
+      ],
+      "requires_tech": "航空术"
+    },
+    {
+      "tier": "战斗机",
+      "category": "空军",
+      "per_kilo": 1.35,
+      "keywords": [
+        "战斗机"
+      ],
+      "equipment": [
+        "飞机"
+      ],
+      "upgrades": [],
+      "requires_tech": "航空术"
+    },
+    {
+      "tier": "轰炸机",
+      "category": "空军",
+      "per_kilo": 1.6,
+      "keywords": [
+        "轰炸机"
+      ],
+      "equipment": [
+        "飞机"
+      ],
+      "upgrades": [],
+      "requires_tech": "航空术"
+    }
+  ],
+  "default_tier": "杂兵"
+}

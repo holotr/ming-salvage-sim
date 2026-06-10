@@ -150,13 +150,25 @@ def format_metric_delta(delta: Dict[str, int]) -> str:
 
 
 def character_context(character: Character) -> str:
-    return (
+    parts = [
         f"{character.name}，{character.office}，职位类型：{character.office_type}，派系：{character.faction}，"
         f"别名：{', '.join(character.aliases) or '无'}，"
         f"人物标签：{', '.join(character.personal_skills)}，"
         f"忠诚{character.loyalty}，能力{character.ability}，清廉{character.integrity}，"
-        f"胆略{character.courage}，风格：{character.style}"
-    )
+        f"胆略{character.courage}，"
+        f"五维：外交{character.diplomacy}/军事{character.martial}/管理{character.stewardship}/"
+        f"谋略{character.intrigue}/学识{character.learning}，"
+        f"风格：{character.style}",
+    ]
+    if character.summary:
+        parts.append(f"人物简介：{character.summary}")
+    if character.location:
+        parts.append(f"当前所在：{character.location}")
+    if character.status and character.status != "active":
+        parts.append(f"当前状态：{character.status}")
+    if character.power_id and character.power_id != "ming":
+        parts.append(f"所属势力：{character.power_id}")
+    return "，".join(parts)
 
 
 def character_context_with_db(character: Character, db: GameDB) -> str:

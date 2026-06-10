@@ -12,7 +12,7 @@ import { ChatModal, ClosedIssuesModal, EdictModal, EndingModal, HistoryModal, Re
 import { SituationDrawer, SituationPanel } from "./components/situation";
 import { getMapIntelStyle, refreshLabelMaps, scoreTone } from "./format";
 import { forwardSteamEvents, type SteamEvent } from "./steamEvents";
-import type { AppView, ChatMessage, ClosedIssue, CourtChatMessage, CourtChatResponse, Directive, GameState, MenuStatus, Minister, ModalName, PendingDecision, SecretOrder, Suggestion } from "./types";
+import type { AppView, ChatMessage, ClosedIssue, CourtChatMessage, CourtChatResponse, Directive, GameState, MenuStatus, Minister, ModalName, PendingDecision, SecretOrder, StructuredDirective, StructuredDirectiveTemplate, Suggestion } from "./types";
 import "./styles.css";
 
 function App() {
@@ -63,12 +63,17 @@ function App() {
   const [courtChatLiveMessages, setCourtChatLiveMessages] = React.useState<CourtChatMessage[]>([]);
   const [courtChatSelectedMinisters, setCourtChatSelectedMinisters] = React.useState<string[]>([]);
   const [courtChatDecision, setCourtChatDecision] = React.useState<CourtChatMessage | null>(null);
+  const [courtChatStreamSpeed, setCourtChatStreamSpeed] = React.useState<number>(() => {
+    const saved = Number(localStorage.getItem("courtChatStreamSpeed") || "3");
+    return Number.isFinite(saved) ? Math.min(5, Math.max(1, saved)) : 3;
+  });
   const courtChatDeltaQueueRef = React.useRef<{ speaker: string; delta: string }[]>([]);
   const courtChatDrainTimerRef = React.useRef<number | null>(null);
   const courtChatAbortRef = React.useRef<AbortController | null>(null);
   const [composerHint, setComposerHint] = React.useState("");
   const [input, setInput] = React.useState("");
   const [directiveText, setDirectiveText] = React.useState("");
+  const [structuredDirectiveTemplates, setStructuredDirectiveTemplates] = React.useState<StructuredDirectiveTemplate[]>([]);
   const [editingDirectiveId, setEditingDirectiveId] = React.useState<number | null>(null);
   const [editingDirectiveText, setEditingDirectiveText] = React.useState("");
   const [decree, setDecree] = React.useState("");
@@ -92,7 +97,7 @@ function App() {
   // 作弊控制台（Ctrl+~）：cheatDirective 暂存强制结算项，下次颁诏随结算一次性穿入。
   const [cheatOpen, setCheatOpen] = React.useState(false);
   const [cheatDirective, setCheatDirective] = React.useState("");
-  // HITL 决策点：颁诏推演若出重大抉择，暂停弹窗逐个亲裁，裁完续跑结算。
+  // HITL 决策点：颁诏推演若出遇阻纠偏，暂停弹窗逐个亲裁，裁完续跑结算。
   const [pendingDecisions, setPendingDecisions] = React.useState<PendingDecision[]>([]);
   const settling = busy === "月末结算";
 
@@ -104,6 +109,11 @@ function App() {
     setDecree(data.last_decree || "");
     setReport(data.last_report || "");
   }, [selectedMinister]);
+
+  const loadStructuredDirectiveTemplates = React.useCallback(async () => {
+    const data = await api<{ templates: StructuredDirectiveTemplate[] }>("/api/structured_directives/templates");
+    setStructuredDirectiveTemplates(data.templates || []);
+  }, []);
 
   const loadMinisterChat = React.useCallback(async (ministerName: string) => {
     const data = await api<{ minister: Minister; history: ChatMessage[]; suggestions: Suggestion[] }>(`/api/ministers/${encodeURIComponent(ministerName)}/chat`);
@@ -153,25 +163,38 @@ function App() {
     });
   }, []);
 
+  const courtChatDeltaDelay = React.useMemo(() => {
+    const delays: Record<number, number> = { 1: 170, 2: 120, 3: 85, 4: 45, 5: 0 };
+    return delays[courtChatStreamSpeed] ?? 85;
+  }, [courtChatStreamSpeed]);
+
+  const updateCourtChatStreamSpeed = React.useCallback((value: number, persistLocal = true) => {
+    const next = Math.min(5, Math.max(1, Math.round(value)));
+    setCourtChatStreamSpeed(next);
+    if (persistLocal) {
+      localStorage.setItem("courtChatStreamSpeed", String(next));
+    }
+  }, []);
+
   const drainCourtChatDeltas = React.useCallback(() => {
     const next = courtChatDeltaQueueRef.current.shift();
     if (next) {
       appendCourtChatDelta(next.speaker, next.delta);
     }
     if (courtChatDeltaQueueRef.current.length) {
-      courtChatDrainTimerRef.current = window.setTimeout(drainCourtChatDeltas, 85);
+      courtChatDrainTimerRef.current = window.setTimeout(drainCourtChatDeltas, courtChatDeltaDelay);
     } else {
       courtChatDrainTimerRef.current = null;
     }
-  }, [appendCourtChatDelta]);
+  }, [appendCourtChatDelta, courtChatDeltaDelay]);
 
   const queueCourtChatDelta = React.useCallback((speaker: string, delta: string) => {
     if (!speaker || !delta) return;
     courtChatDeltaQueueRef.current.push({ speaker, delta });
     if (courtChatDrainTimerRef.current === null) {
-      courtChatDrainTimerRef.current = window.setTimeout(drainCourtChatDeltas, 85);
+      courtChatDrainTimerRef.current = window.setTimeout(drainCourtChatDeltas, courtChatDeltaDelay);
     }
-  }, [drainCourtChatDeltas]);
+  }, [courtChatDeltaDelay, drainCourtChatDeltas]);
 
   const flushCourtChatDeltas = React.useCallback(() => {
     while (courtChatDeltaQueueRef.current.length) {
@@ -205,8 +228,12 @@ function App() {
   const refreshMenuStatus = React.useCallback(async () => {
     const s = await api<MenuStatus>("/api/menu/status");
     setMenuStatus(s);
+    const configuredSpeed = Number(s.game_settings?.court_chat_stream_speed);
+    if (Number.isFinite(configuredSpeed)) {
+      updateCourtChatStreamSpeed(configuredSpeed, false);
+    }
     return s;
-  }, []);
+  }, [updateCourtChatStreamSpeed]);
 
   React.useEffect(() => {
     refreshMenuStatus()
@@ -214,15 +241,17 @@ function App() {
         if (s.has_running_game) {
           setAppView("game");
           loadState().catch((err) => setError(err.message));
+          loadStructuredDirectiveTemplates().catch(() => {});
         }
       })
       .catch((err) => setError(err.message));
-  }, [refreshMenuStatus, loadState]);
+  }, [refreshMenuStatus, loadState, loadStructuredDirectiveTemplates]);
 
   const enterGameAfterMenu = React.useCallback(async () => {
     setAppView("game");
     await loadState();
-  }, [loadState]);
+    await loadStructuredDirectiveTemplates();
+  }, [loadState, loadStructuredDirectiveTemplates]);
 
   const exitToMenu = React.useCallback(async () => {
     await api("/api/menu/exit_to_menu", { method: "POST" });
@@ -396,22 +425,19 @@ function App() {
     return powerId ? { ...node, power: powerById.get(powerId) } : node;
   });
   const selectedNode = mapNodes.find((node) => node.id === selectedNodeId) || mapNodes[0];
-  const ministers = filterMinisters(state.ministers, ministerGroup);
+  const rosterMinisters = [...(state.ministers || []), ...(state.archived_ministers || [])];
+  const ministers = filterMinisters(rosterMinisters, ministerGroup);
   const activeCourtMinisterNames = ministers.filter(canAttendCourtChat).map((m) => m.name);
   const effectiveCourtChatSelectedMinisters = courtChatSelectedMinisters.filter((name) => activeCourtMinisterNames.includes(name));
   const courtChatRosterSelection = effectiveCourtChatSelectedMinisters;
   const consorts = filterConsorts(state.consorts || [], haremGroup);
-  const allCharacters = [...state.ministers, ...(state.consorts || [])];
+  const allCharacters = [...rosterMinisters, ...(state.consorts || [])];
   const activeMinister = selectedMinister
     ? allCharacters.find((m) => m.name === selectedMinister) || temporaryActiveMinister
     : null;
   const mapIntelStyle = selectedNode ? getMapIntelStyle(selectedNode) : undefined;
 
   const openChat = (minister: Minister) => {
-    if (minister.status && minister.status !== "active") {
-      setError(`${minister.name}已${minister.status_label}${minister.status_reason ? "（" + minister.status_reason + "）" : ""}，无法召见。`);
-      return;
-    }
     const switchingMinister = selectedMinister !== minister.name;
     if (switchingMinister) {
       setChat([]);
@@ -437,6 +463,10 @@ function App() {
     if (busy) return;
     if (!activeMinister) return;
     const message = text.trim();
+    if (activeMinister.status === "dead" || activeMinister.status === "offstage") {
+      setComposerHint(`${activeMinister.name}${activeMinister.status_label || activeMinister.status}，不能继续召对。`);
+      return;
+    }
     if (!message) {
       setComposerHint("请先问话或点一个奏对题目");
       return;
@@ -696,6 +726,42 @@ function App() {
     }
   };
 
+  const archiveMinister = async (minister: Minister) => {
+    if (minister.status === "active" || minister.origin !== "runtime") return;
+    if (!window.confirm(`归档「${minister.name}」？归档后此人保留数据库记录，但不再进入名册、召对候选和月末推演。`)) return;
+    setBusy("归档人物");
+    setError("");
+    try {
+      await api(`/api/ministers/${encodeURIComponent(minister.name)}/archive`, {
+        method: "POST",
+      });
+      setSelectedMinister("");
+      setTemporaryActiveMinister(null);
+      setActiveModal("none");
+      await loadState();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const restoreMinister = async (minister: Minister) => {
+    if (!minister.archived) return;
+    setBusy("恢复人物");
+    setError("");
+    try {
+      await api(`/api/ministers/${encodeURIComponent(minister.name)}/restore`, {
+        method: "POST",
+      });
+      await loadState();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+
   const startEditDirective = (directive: Directive) => {
     setEditingDirectiveId(directive.id);
     setEditingDirectiveText(directive.text);
@@ -733,6 +799,43 @@ function App() {
       if (editingDirectiveId === directiveId) {
         cancelEditDirective();
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const saveStructuredDirective = async (
+    directive: StructuredDirective | null,
+    templateId: string,
+    fields: Record<string, string>,
+  ) => {
+    setBusy(directive ? "修改固定指令" : "新增固定指令");
+    setError("");
+    try {
+      const data = await api<{ structured_directives: StructuredDirective[] }>(
+        directive ? `/api/structured_directives/${directive.id}` : "/api/structured_directives",
+        {
+          method: directive ? "PATCH" : "POST",
+          body: JSON.stringify({ template_id: templateId, fields }),
+        },
+      );
+      setState((current) => (current ? { ...current, structured_directives: data.structured_directives } : current));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const deleteStructuredDirective = async (directiveId: number) => {
+    setBusy("删除固定指令");
+    setError("");
+    try {
+      const data = await api<{ structured_directives: StructuredDirective[] }>(`/api/structured_directives/${directiveId}`, { method: "DELETE" });
+      setState((current) => (current ? { ...current, structured_directives: data.structured_directives } : current));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -899,7 +1002,7 @@ function App() {
         return;
       }
       if (outcome.kind === "decisions") {
-        // 出重大抉择：暂停弹窗逐个亲裁，裁完调 submitDecisions 续跑结算。
+        // 出遇阻纠偏：暂停弹窗逐个亲裁，裁完调 submitDecisions 续跑结算。
         setPendingDecisions(outcome.data.decisions || []);
         setBusy("");
         return;
@@ -1001,6 +1104,7 @@ function App() {
               issues={state.issues}
               closedIssues={state.closed_this_turn || []}
               hasLegacies={(state.legacies || []).length > 0}
+              ministers={state.ministers || []}
               compact
               onOpenDrawer={() => setSituationDrawerOpen(true)}
               onChanged={() => loadState()}
@@ -1068,8 +1172,8 @@ function App() {
           caption="密令" sub="進行中密令" onClick={() => setActiveModal("secret_orders")} />
         <CommandSlot slotKey="史册" img="史册"
           caption="史冊" sub="歷代奏報/詔書" onClick={() => setActiveModal("history")} />
-        <CommandSlot slotKey="拟诏" img="拟诏" badge={state.directives.length}
-          caption="擬詔/結束回合" sub={state.directives.length ? `${state.directives.length} 道` : "本回合"}
+        <CommandSlot slotKey="拟诏" img="拟诏" badge={state.directives.length + (state.structured_directives?.length || 0)}
+          caption="擬詔/結束回合" sub={(state.directives.length + (state.structured_directives?.length || 0)) ? `${state.directives.length + (state.structured_directives?.length || 0)} 道` : "本回合"}
           onClick={() => setActiveModal("edict")} />
       </div>
 
@@ -1079,6 +1183,7 @@ function App() {
         closedIssues={state.closed_this_turn || []}
         maxDecreeIssues={state.max_decree_issues ?? 10}
         regions={(state.regions || []).filter((r) => (r.controlled_by ?? "ming") === "ming").map((r) => ({ id: r.id, name: r.name }))}
+        ministers={state.ministers || []}
         presetTrees={state.preset_trees}
         onChanged={() => loadState()}
         onClose={() => setSituationDrawerOpen(false)}
@@ -1093,6 +1198,7 @@ function App() {
         onGroupChange={setMinisterGroup}
         onClose={guardClose(() => setDrawerOpen(false))}
         onOpenChat={openChat}
+        onRestoreMinister={restoreMinister}
         onUploadPortrait={uploadPortrait}
         courtChatHistory={courtChatHistory}
         courtChatInput={courtChatInput}
@@ -1103,8 +1209,10 @@ function App() {
         courtChatLiveMessages={courtChatLiveMessages}
         courtChatDecision={courtChatDecision}
         courtChatSelectedMinisters={courtChatSelectedMinisters}
+        courtChatStreamSpeed={courtChatStreamSpeed}
         onCourtChatSelectedMinistersChange={setCourtChatSelectedMinisters}
         onCourtChatInputChange={setCourtChatInput}
+        onCourtChatStreamSpeedChange={updateCourtChatStreamSpeed}
         onSendCourtChat={sendCourtChat}
         onStopCourtChat={stopCourtChat}
         onSummarizeCourtChat={summarizeCourtChat}
@@ -1126,6 +1234,8 @@ function App() {
 
       <ArmyDrawer
         armies={state.armies}
+        armsStock={state.arms_stock}
+        troopRates={state.troop_rates}
         open={armyDrawerOpen}
         selectedArmyId={selectedArmyId}
         onSelectArmy={setSelectedArmyId}
@@ -1163,6 +1273,7 @@ function App() {
 
       <AppointmentDrawer
         ministers={state.ministers}
+        departments={state.departments || []}
         open={appointmentDrawerOpen}
         onOpenChat={openChat}
         onClose={guardClose(() => setAppointmentDrawerOpen(false))}
@@ -1211,6 +1322,7 @@ function App() {
             onRejectDirective={rejectDirective}
             onUndoLast={undoLastChat}
             onOpenEdict={() => setActiveModal("edict")}
+            onArchive={() => archiveMinister(activeMinister)}
             onClose={guardClose(() => setActiveModal("none"))}
           />
         </FullscreenModal>
@@ -1220,6 +1332,7 @@ function App() {
         <FullscreenModal title="诏书草案" subtitle="本月指令、拟诏与颁布" bgClass="modal-bg-edict" onClose={guardClose(() => setActiveModal("none"))}>
           <EdictModal
             state={state}
+            ministers={state.ministers || []}
             directiveText={directiveText}
             editingDirectiveId={editingDirectiveId}
             editingDirectiveText={editingDirectiveText}
@@ -1227,6 +1340,7 @@ function App() {
             report={report}
             busy={busy}
             error={error}
+            structuredDirectiveTemplates={structuredDirectiveTemplates}
             onDirectiveTextChange={setDirectiveText}
             onEditingTextChange={setEditingDirectiveText}
             onCreateDirective={createDirective}
@@ -1242,6 +1356,8 @@ function App() {
             onConfirmDirective={confirmDirective}
             onRejectDirective={rejectDirective}
             onConfirmAllDirectives={confirmAllDirectives}
+            onSaveStructuredDirective={saveStructuredDirective}
+            onDeleteStructuredDirective={deleteStructuredDirective}
             onGoToCourtChat={() => { setActiveModal("none"); setDrawerOpen(true); }}
             onIssueCreated={() => loadState()}
           />
@@ -1332,8 +1448,8 @@ const canAttendCourtChat = (minister: Minister) => {
 };
 
 
-// HITL 重大抉择弹窗：逐个亲裁本回合决策点，全部选完一次提交续跑结算。
-// 每个决策：标题 + 背景 + 2-3 预设选项（点选）+ 朱批输入框（可补自由旨意）。
+// HITL 遇阻纠偏弹窗：逐个亲裁本回合纠偏点，全部选完一次提交续跑结算。
+// 每个纠偏：标题 + 背景 + 2-3 预设选项（点选）+ 朱批输入框（可补自由旨意）。
 function DecisionModal({
   decisions,
   onResolve,
@@ -1364,10 +1480,10 @@ function DecisionModal({
   };
 
   return (
-    <div className="decision-modal" role="dialog" aria-modal="true" aria-label="月末重大抉择">
+    <div className="decision-modal" role="dialog" aria-modal="true" aria-label="月末遇阻纠偏">
       <div className="decision-window">
         <div className="decision-head">
-          <span className="decision-kicker">月末亲裁 · {cursor + 1}/{total}</span>
+          <span className="decision-kicker">遇阻纠偏 · {cursor + 1}/{total}</span>
           <h2 className="decision-title">{cur.title}</h2>
         </div>
         {cur.context ? <p className="decision-context">{cur.context}</p> : null}

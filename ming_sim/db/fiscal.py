@@ -31,12 +31,11 @@ from ming_sim.db._helpers import (
 
 class _FiscalMixin:
     # dynamic 税科目 → regions.fiscal 子字段映射。dynamic 税实收走 calc_province_fiscal
-    # 读 region.fiscal（不读 fiscal_config 的 base），故对这些 key 做裁撤/调额必须同步改
-    # 各省 fiscal 字段才真生效——否则只动目录不动钱（账目与叙事脱节）。
+    # 读 region.fiscal（不读 fiscal_config 的 base），调额必须改各省 fiscal 字段才真生效。
     #   田赋＝regions.tax_per_turn（官民田×田赋亩率的月额），裁撤走 scale_tian_fu 缩放；
     #   皇庄收入＝各省 huang_tian×租率（flows 实算），调额改 huang_tian 或租率，不在本表。
     _DYNAMIC_REGION_FIELD = {
-        "辽饷": "liao_xiang", "盐税": "salt_tax", "商税": "commerce_tax",
+        "辽饷": "liao_xiang_li", "盐税": "salt_tax", "商税": "commerce_tax",
     }
 
     def init_fiscal_config(self) -> None:
@@ -161,6 +160,31 @@ class _FiscalMixin:
                     )
             _refresh_fiscal_metadata()
 
+        def _migrate_fiscal_v12_remove_obsolete_dynamic() -> None:
+            """v12：田赋/辽饷/盐税/商税改由省级 fiscal 字段表达，删除旧目录残留。"""
+            obsolete_keys = (
+                "田赋_rate",
+                "辽饷_base", "辽饷_rate",
+                "盐税_base", "盐税_rate",
+                "商税_base", "商税_rate",
+                "皇庄_base",
+            )
+            self.conn.execute(
+                f"DELETE FROM fiscal_config WHERE key IN ({','.join('?' for _ in obsolete_keys)})",
+                obsolete_keys,
+            )
+            _seed_missing()
+            _refresh_fiscal_metadata()
+
+        def _migrate_fiscal_v13_remove_disaster_population_penalty() -> None:
+            """v13：natural_disaster/human_disaster 只作叙事字段，不再自动扣年度人口。"""
+            self.conn.execute(
+                "DELETE FROM fiscal_config WHERE key = ?",
+                ("人口灾荒减损_base",),
+            )
+            _seed_missing()
+            _refresh_fiscal_metadata()
+
         # 每版迁移：从 N-1 → N，只动那版真正变的东西。键＝目标版本号 N。
         # 不在表里的版本步走默认 _seed_missing（只补缺 key）。将来要改某 key 默认 / 删某 key /
         # 加新 key，就在这里登记一条 lambda，只动那一项，别动其它——这样玩家改过的全保住。
@@ -169,6 +193,10 @@ class _FiscalMixin:
             7: _migrate_fiscal_v7_defaults,
             # v11：新增人口增长率系统的 6 个 _base 科目，默认迁移只补缺 key 即可。
             11: _seed_missing,
+            # v12：裁掉已转入 regions.fiscal/公式实算的旧 dynamic 目录键。
+            12: _migrate_fiscal_v12_remove_obsolete_dynamic,
+            # v13：移除由天灾/人祸文本非空触发的人口硬扣。
+            13: _migrate_fiscal_v13_remove_disaster_population_penalty,
             # 8: lambda: self._add_fiscal_key("关税_base", ...),   # 例：将来加新税
         }
 
@@ -296,7 +324,7 @@ class _FiscalMixin:
         return key
 
     def apply_dynamic_fiscal_scale(self, stem: str, ratio: float, region_id: str = "") -> int:
-        """按 ratio 缩放 regions.fiscal 中该 dynamic 税字段（辽饷/盐税/商税）。
+        """按 ratio 缩放 regions.fiscal 中该 dynamic 税字段（辽饷亩率/盐税月额/商税月额）。
 
         ratio=0 即彻底罢废（字段归零）；0<ratio<1 即按比例削减。田赋走 scale_tian_fu。
         region_id 为空＝全国所有省；填省 id＝仅该省定向调。
@@ -322,6 +350,77 @@ class _FiscalMixin:
             self.conn.execute(
                 "UPDATE regions SET fiscal = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (json.dumps(fiscal, ensure_ascii=False), str(row["id"])),
+            )
+            touched += 1
+        if touched:
+            self.conn.commit()
+        return touched
+
+    # 可按「绝对万两增量」全国摊派的省级税字段（额是万两/月，能直接加减）。
+    # 辽饷/田赋是「亩率·毫」不在此（绝对万两加它没意义，调它们走 scale_*）。
+    _ABS_DELTA_REGION_FIELD = {"盐税": "salt_tax", "商税": "commerce_tax"}
+
+    def apply_dynamic_fiscal_delta(self, stem: str, total_delta: int, region_id: str = "") -> int:
+        """把「全国/某省 商税或盐税 月额 +X/-X 万两」落到 regions.fiscal。
+
+        - region_id 填省 id：该省字段直接 += total_delta（下限 0）。
+        - region_id 为空＝全国：把 total_delta 按**各省现有占比**摊派到每省（占比大的多摊），
+          末位省吃掉四舍五入余数，保证摊派总和恰为 total_delta；全省皆 0 时按省数均摊。
+        玩家「加征商税十万」不分省即走全国分支——数据仍逐省落库（实收只认 regions.fiscal），
+        却不必让玩家/LLM 指定省份。返回被改动的省数。仅 商税/盐税 适用；其余 stem 返回 0。
+        """
+        field = self._ABS_DELTA_REGION_FIELD.get(stem)
+        if field is None or total_delta == 0:
+            return 0
+        if region_id:
+            row = self.conn.execute("SELECT fiscal FROM regions WHERE id = ?", (region_id,)).fetchone()
+            if row is None:
+                return 0
+            fiscal: dict = json.loads(str(row["fiscal"] or "{}"))
+            old = int(fiscal.get(field, 0) or 0)
+            new = max(0, old + int(total_delta))
+            if new == old:
+                return 0
+            fiscal[field] = new
+            self.conn.execute(
+                "UPDATE regions SET fiscal = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(fiscal, ensure_ascii=False), region_id),
+            )
+            self.conn.commit()
+            return 1
+        # 全国按占比摊派
+        rows = self.conn.execute("SELECT id, fiscal FROM regions").fetchall()
+        provinces = []
+        for r in rows:
+            f = json.loads(str(r["fiscal"] or "{}"))
+            provinces.append((str(r["id"]), f, int(f.get(field, 0) or 0)))
+        base_total = sum(v for _, _, v in provinces)
+        n = len(provinces)
+        if n == 0:
+            return 0
+        # 分配整数增量：按占比取整，余数累加到末位，确保 sum 恰为 total_delta
+        allocs: list[int] = []
+        running = 0
+        for i, (_rid, _f, cur) in enumerate(provinces):
+            if i == n - 1:
+                alloc = int(total_delta) - running  # 末位吃余数
+            elif base_total > 0:
+                alloc = round(int(total_delta) * cur / base_total)
+            else:
+                alloc = round(int(total_delta) / n)  # 全 0 时均摊
+            running += alloc
+            allocs.append(alloc)
+        touched = 0
+        for (rid, f, cur), alloc in zip(provinces, allocs):
+            if alloc == 0:
+                continue
+            new = max(0, cur + alloc)
+            if new == cur:
+                continue
+            f[field] = new
+            self.conn.execute(
+                "UPDATE regions SET fiscal = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(f, ensure_ascii=False), rid),
             )
             touched += 1
         if touched:
@@ -360,11 +459,9 @@ class _FiscalMixin:
     def remove_fiscal_item(self, key: str) -> Optional[str]:
         """彻底裁撤一个月固定收支项（罢税/裁俸）：删 base+rate 两行。
 
-        完全放开——含 dynamic（田赋/辽饷/盐税/商税/皇庄），后果玩家自负。
-        - fixed 项：删目录条目即停止逐月落账。
-        - dynamic 税（辽饷/盐税/商税）：实收走 region.fiscal，故同步把各省该字段归零；
-          田赋走 tax_per_turn 压到仅留三税基；皇庄收入读 fiscal_config，删 config 即停。
-          这样「永久罢辽饷」当真停收，不再只动目录不动钱。
+        只对 fiscal_config 中仍存在的月固定收支项生效；删目录条目即停止逐月落账。
+        v12 后田赋/辽饷/盐税/商税不再是 fiscal_config 科目，停征应改 regions.fiscal
+        的 tian_fu_li / liao_xiang_li / salt_tax / commerce_tax。
         删不存在的项返回 None。返回被删的 base key（按 stem 归一）。
         """
         stem = self._stem_of(key)
@@ -372,7 +469,7 @@ class _FiscalMixin:
             return None
         base_key = f"{stem}_base"
         rate_key = f"{stem}_rate"
-        # 存在性查 base 或 rate 任一——田赋只有 田赋_rate（无 base），但仍是可裁撤的 dynamic 项。
+        # 存在性查 base 或 rate 任一；v12 后田赋/三税通常已不在 fiscal_config。
         exists = self.conn.execute(
             "SELECT 1 FROM fiscal_config WHERE key IN (?, ?)", (base_key, rate_key)
         ).fetchone()
@@ -381,7 +478,7 @@ class _FiscalMixin:
         self.conn.execute(
             "DELETE FROM fiscal_config WHERE key IN (?, ?)", (base_key, rate_key)
         )
-        # dynamic 税：同步罢废各省实收字段（皇庄走 config 不在此）。
+        # 老档兼容：若 v12 前的 dynamic 税残留仍被删到，同步归零省级字段。
         if stem in self._DYNAMIC_REGION_FIELD:
             self.apply_dynamic_fiscal_scale(stem, 0.0)
         elif stem == "田赋":

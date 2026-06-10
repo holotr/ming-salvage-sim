@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+import httpx
 from agno.agent import Agent
 from agno.db.sqlite import SqliteDb
 from agno.models.openai import OpenAIChat
@@ -90,8 +91,12 @@ def create_chat_model(
         "base_url": llm_config.base_url,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "timeout": llm_config.timeout_seconds,
-        "max_retries": 1,
+        # read=20：流式下「两次 socket 读之间」最多 20s，即 chunk 间隔超 20s 判卡死，
+        # 抛 httpx.ReadTimeout → openai APITimeoutError → 上层包成 LLMUnavailable 提示用户。
+        # 持续吐字不误伤；总超时仍用 timeout_seconds 兜底。标量 timeout 对流式几乎不触发，故必须分项。
+        "timeout": httpx.Timeout(llm_config.timeout_seconds, connect=10.0, read=20.0),
+        # 0：超时立即冒泡，不静默重试（重试会让「卡住」再多等一整轮才报错）。
+        "max_retries": 0,
         "role_map": {"system": "system", "user": "user", "assistant": "assistant", "tool": "tool"},
         "extra_body": extra_body,
     }

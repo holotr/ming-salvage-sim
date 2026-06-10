@@ -34,6 +34,7 @@ export type Army = {
   commander: string;
   controller: string;
   troop_type: string;
+  troop_composition?: Record<string, number>;
   manpower: number;
   maintenance_per_turn: number;
   supply: number;
@@ -45,6 +46,24 @@ export type Army = {
   loyalty: number;
   status: string;
   owner_power?: string;
+  arms?: ArmyWeapon[];
+};
+
+export type ArmyWeapon = {
+  troop_type: string;
+  id: string;
+  name: string;
+  tier: string;
+  qty: number;
+};
+
+export type ArmsStockItem = {
+  id: string;
+  name: string;
+  tier: string;
+  qty: number;
+  unlocked: boolean;
+  requires_tech: string;
 };
 
 export type Power = {
@@ -85,6 +104,14 @@ export type Technology = {
   effect_summary: string;
   status: string;
   origin: string;
+};
+
+export type Department = {
+  name: string;
+  authority_scope: string;
+  power: number;
+  responsibility: number;
+  corruption_risk: number;
 };
 
 export type PresetTreeItem = {
@@ -156,6 +183,11 @@ export type Minister = {
   ability?: number;
   integrity?: number;
   courage?: number;
+  diplomacy?: number;
+  martial?: number;
+  stewardship?: number;
+  intrigue?: number;
+  learning?: number;
   style: string;
   location?: string;
   birth_year?: number;
@@ -171,6 +203,8 @@ export type Minister = {
   favorite: boolean;
   portrait_id?: string;  // 空/undefined=无专属，前端 fallback 到池
   power_id?: string;     // 大明=ming, 后金=houjin, 流寇=bandits 等
+  origin?: string;       // preset/runtime
+  archived?: boolean;
   skills: Array<{ id: string; name: string; kind?: string; sources: string[]; description: string }>;
 };
 
@@ -200,6 +234,37 @@ export type Directive = {
   authority: string;
 };
 
+export type StructuredDirectiveFieldSpec = {
+  key: string;
+  label: string;
+  type: "text" | "textarea" | "select" | "number";
+  option_source?: "armies" | "regions" | "regions_or_all" | "weapons" | "people" | "departments" | "buildings" | "taxes";
+  required?: boolean;
+  required_when?: { field: string; values: string[] };
+  placeholder?: string;
+  options?: string[];
+};
+
+export type StructuredDirectiveTemplate = {
+  id: string;
+  label: string;
+  category: string;
+  settlement_hint: string;
+  compiled_text: string;
+  fields: StructuredDirectiveFieldSpec[];
+};
+
+export type StructuredDirective = {
+  id: number;
+  template_id: string;
+  category: string;
+  title: string;
+  fields: Record<string, string>;
+  compiled_text: string;
+  settlement_hint: string;
+  status: string;
+};
+
 export type Issue = {
   id: number;
   kind: "situation" | "initiative";
@@ -223,6 +288,10 @@ export type Issue = {
   is_manual?: boolean;
   duration_turns?: number;
   goal?: string;
+  assignee?: string;
+  budget_pool?: number;       // 承办人专款余额（万两）
+  budget_source?: string;     // 专款出库：'国库' / '内库' / ''
+  death_authority?: boolean;  // 专断之权（生杀权）
   origin_turn?: number;
 };
 
@@ -271,6 +340,7 @@ export type BudgetItem = {
   basis?: string;
   basis_total?: number;
   rate_unit?: string;
+  paid_estimate?: number;  // 各军军饷专用：受国库约束的预计实发（< amount 表示发不满、差额转欠饷）
 };
 
 export type BudgetMovement = {
@@ -331,12 +401,18 @@ export type GameState = {
   events: EventItem[];
   regions: Region[];
   armies: Army[];
+  buildings?: Building[];
+  arms_stock?: ArmsStockItem[];
+  departments: Department[];
   technologies: Technology[];
   preset_trees?: PresetTrees;
+  troop_rates?: Record<string, number>;  // 兵种单价表，来自 troop_cost.json（前端不再硬编码）
   map_nodes: MapNode[];
   ministers: Minister[];
+  archived_ministers?: Minister[];
   consorts: Minister[];
   directives: Directive[];
+  structured_directives: StructuredDirective[];
   pending_count: number;
   pending_decisions?: PendingDecision[];
   last_decree: string;
@@ -471,11 +547,22 @@ export type MenuStatus = {
   saves: MenuSave[];
   campaigns?: MenuCampaign[];
   current_campaign?: string;
+  active_scenario?: ScenarioManifest | null;
   game_settings?: {
     hitl_min_decisions: number;
     court_chat_debate_rounds?: number;
+    court_chat_stream_speed?: number;
     max_decree_issues?: number;
     issue_log_limit?: number;
+    secret_order_person_limit?: number;
+    secret_order_total_limit?: number;
+    character_limit?: number;
+    minister_temperature?: number;
+    minister_top_p?: number;
+    simulator_temperature?: number;
+    simulator_top_p?: number;
+    extractor_temperature?: number;
+    extractor_top_p?: number;
   };
   llm: {
     base_url: string;
@@ -491,11 +578,119 @@ export type MenuStatus = {
   };
 };
 
+// ---- 自定义剧本 ----
+
+export type ScenarioManifest = {
+  id: string;
+  name: string;
+  description: string;
+  created?: number;
+  updated?: number;
+  source?: "manual" | "generated";
+  files: { characters: boolean; events: boolean; seed_events: boolean };
+};
+
+export type ScenarioFaction = {
+  name: string;
+  satisfaction: number;
+  leverage: number;
+  agenda: string;
+};
+
+export type ScenarioCharacter = {
+  name: string;
+  office: string;
+  office_type: string;
+  faction: string;
+  loyalty: number;
+  ability: number;
+  integrity: number;
+  courage: number;
+  style: string;
+  power_id: string;
+  aliases?: string[];
+  personal_skills?: string[];
+  diplomacy?: number;
+  martial?: number;
+  stewardship?: number;
+  intrigue?: number;
+  learning?: number;
+  location?: string;
+  birth_year?: number;
+  historical_death_year?: number;
+  historical_death_month?: number;
+  debut_year?: number;
+  debut_month?: number;
+  status?: string;
+  summary?: string;
+  portrait_id?: string;
+  [key: string]: unknown;
+};
+
+export type ScenarioCharactersFile = {
+  factions: ScenarioFaction[];
+  characters: ScenarioCharacter[];
+};
+
+export type ScenarioEvent = {
+  id: string;
+  title: string;
+  kind: string;
+  summary: string;
+  urgency: number;
+  severity: number;
+  credibility: number;
+  interests: string[];
+  audiences: string[];
+  event_type: "situation" | "node" | "ending";
+  precondition?: string;
+  resolve_condition?: string;
+  fail_condition?: string;
+  trigger_year?: number;
+  trigger_month?: number;
+  is_historical?: boolean;
+  require?: unknown;
+  trigger_gate?: unknown;
+  auto_trigger?: boolean;
+  bar_value?: number;
+  bar_good_meaning?: string;
+  bar_bad_meaning?: string;
+  inertia?: number;
+  region_hint?: string;
+  tags?: string[];
+  [key: string]: unknown;
+};
+
+export type ScenarioFull = {
+  manifest: ScenarioManifest;
+  characters: ScenarioCharactersFile | null;
+  events: ScenarioEvent[] | null;
+  seed_events: ScenarioEvent[] | null;
+};
+
+export type ScenarioGenerateResult = {
+  status: Record<string, string>;
+  validation?: string | null;
+  characters?: ScenarioCharactersFile | null;
+  events?: ScenarioEvent[] | null;
+  seed_events?: ScenarioEvent[] | null;
+};
+
+export type ScenarioChange = { tool: string; result: string };
+
+export type ScenarioChatResult = {
+  reply: string;
+  changes: ScenarioChange[];
+  scenario: ScenarioFull;
+  validation?: string | null;
+};
+
 export type ExtractionData = {
   turn: number;
   year: number;
   period: number;
   exists: boolean;
+  narrative?: string;
   extractor_output?: any;
 };
 

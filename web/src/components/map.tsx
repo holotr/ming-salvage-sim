@@ -829,7 +829,7 @@ export function NodeIntel({ node }: { node: MapNode }) {
               return (
                 <tr key={army.id}>
                   <td>{army.name}</td>
-                  <td>{army.troop_type}</td>
+                  <td>{army.troop_composition ? Object.entries(army.troop_composition).map(([k, v]) => `${k}${v}`).join("、") : army.troop_type}</td>
                   <td>{army.manpower}</td>
                   <td>{monthlyAmount(maint)}</td>
                   <td>{army.morale}</td>

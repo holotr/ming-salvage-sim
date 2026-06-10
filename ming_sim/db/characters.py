@@ -20,6 +20,7 @@ from ming_sim.constants import (
     FISCAL_SCORE_FIELDS, REGION_FIELD_ALIASES, REGION_SCORE_FIELDS, REGION_TEXT_FIELDS, TURN_UNIT,
 )
 from ming_sim.content import GameContent
+from ming_sim.llm_config import load_runtime_game
 from ming_sim.matching import match_army_id_from_text, match_region_id_from_text
 from ming_sim.models import Event, GameState, monthly_amount, period_label
 from ming_sim.token_stats import tlog
@@ -87,12 +88,13 @@ class _CharactersMixin:
         valid = {"active", "offstage", "dismissed", "imprisoned", "exiled", "retired", "dead"}
         if status not in valid:
             raise ValueError(f"character status 非法：{status}")
-        # 去职（下狱/革职/流放/致仕/死）即削职：清空 characters.office，
-        # 原职仍留在 character_offices 备档可追溯。复职（active/offstage）不动 office。
+        # 去职（下狱/革职/流放/致仕/死）即削职：清空 characters.office 与 office_type，
+        # 原职仍留在 character_offices 备档可追溯。复职（active/offstage）不动职。
+        # 归属看 power_id（仍是 ming），起复授官不受 office_type 清空影响。
         ousted = status in {"dismissed", "imprisoned", "exiled", "retired", "dead"}
         if ousted:
             self.conn.execute(
-                "UPDATE characters SET status=?, status_reason=?, status_changed_turn=?, office='' WHERE name=?",
+                "UPDATE characters SET status=?, status_reason=?, status_changed_turn=?, office='', office_type='' WHERE name=?",
                 (status, reason[:200], state.turn, name),
             )
         else:
@@ -158,13 +160,14 @@ class _CharactersMixin:
         """既有官员调任/升迁：改 characters.office（office_type 给空则不动），
         同步 character_offices 备档。状态不变（仍 active）。"""
         office = normalize_office(office)
-        current_type = (
-            self.conn.execute(
-                "SELECT office_type FROM characters WHERE name=? AND power_id='ming'", (name,)
-            ).fetchone() or {"office_type": ""}
-        )["office_type"]
-        if not current_type:
+        # 归属判据看 power_id，不看 office_type——去职者 office_type 已清空，
+        # 但仍是大明臣属（power_id='ming'），起复授官不应被误拒。
+        row = self.conn.execute(
+            "SELECT office_type FROM characters WHERE name=? AND power_id='ming'", (name,)
+        ).fetchone()
+        if row is None:
             raise ValueError(f"{name}不属大明朝廷，不能授予大明官职")
+        current_type = row["office_type"] or ""
         eff_type = infer_office_type_from_office(office, office_type or current_type)
         if office_type or eff_type != current_type:
             self.conn.execute(
@@ -382,6 +385,16 @@ class _CharactersMixin:
             return
         character.office = normalize_office(character.office)
         character.office_type = infer_office_type_from_office(character.office, character.office_type)
+        if character.office_type != "后宫":
+            character_limit = int(load_runtime_game().get("character_limit", 120))
+            current_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM characters WHERE archived = 0 AND office_type <> '后宫'"
+            ).fetchone()[0] or 0)
+            if current_count >= character_limit:
+                raise ValueError(
+                    f"本局朝臣人物已达上限 {character_limit} 人；朝臣越多，大臣名册与推演上下文 token 消耗越高。"
+                    "可在游戏设置中调高人物上限，或先归档非在朝的运行时朝臣。"
+                )
         # 若没有专属 portrait_id，按 office_type 分配预设池头像
         portrait_id = character.portrait_id
         if not portrait_id:
@@ -397,9 +410,10 @@ class _CharactersMixin:
             """
             INSERT INTO characters
             (name, office, office_type, faction, aliases, personal_skills, loyalty, ability, integrity, courage, style,
+             diplomacy, martial, stewardship, intrigue, learning,
              birth_year, historical_death_year, historical_death_month, debut_year, debut_month,
-             status, status_reason, status_changed_turn, portrait_id, power_id, location, summary)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             status, status_reason, status_changed_turn, portrait_id, power_id, location, summary, origin, archived)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 character.name,
@@ -413,6 +427,11 @@ class _CharactersMixin:
                 character.integrity,
                 character.courage,
                 character.style,
+                character.diplomacy,
+                character.martial,
+                character.stewardship,
+                character.intrigue,
+                character.learning,
                 character.birth_year,
                 character.historical_death_year,
                 character.historical_death_month,
@@ -425,6 +444,8 @@ class _CharactersMixin:
                 getattr(character, "power_id", "ming") or "ming",
                 getattr(character, "location", "") or "",
                 getattr(character, "summary", "") or "",
+                "runtime",
+                0,
             ),
         )
         self.conn.execute(
@@ -440,6 +461,75 @@ class _CharactersMixin:
             (character.name, character.office, character.office_type, office_source),
         )
         self.conn.commit()
+
+    def archive_runtime_character(self, state: GameState, name: str) -> Dict[str, object]:
+        """归档运行时人物：保留 DB 记录与历史，但从正式名册/推演中移除。"""
+        row = self.conn.execute(
+            "SELECT name, status, origin, archived FROM characters WHERE name=?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"未找到人物：{name}")
+        if int(row["archived"] or 0):
+            return {"archived": True, "name": name}
+        if str(row["origin"] or "preset") == "preset":
+            raise ValueError("预设人物不能归档。")
+        if str(row["status"] or "active") == "active":
+            raise ValueError("在朝人物不能归档，请先罢黜、下狱、流放或致仕。")
+        self.conn.execute(
+            """
+            UPDATE characters
+            SET archived=1,
+                status_reason=CASE
+                    WHEN trim(status_reason) <> '' THEN status_reason || '；已归档，不再进入推演'
+                    ELSE '已归档，不再进入推演'
+                END,
+                status_changed_turn=?
+            WHERE name=?
+            """,
+            (state.turn, name),
+        )
+        self.conn.execute(
+            "UPDATE secret_orders SET status='cancelled', turn_closed=?, updated_at=CURRENT_TIMESTAMP "
+            "WHERE minister_name=? AND status IN ('active', 'pending_review')",
+            (state.turn, name),
+        )
+        self.conn.commit()
+        return {"archived": True, "name": name}
+
+    def restore_archived_character(self, name: str) -> Dict[str, object]:
+        """恢复已归档的运行时人物，使其重新进入正式名册/推演。"""
+        row = self.conn.execute(
+            "SELECT name, origin, archived, office_type FROM characters WHERE name=?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"未找到人物：{name}")
+        if str(row["origin"] or "preset") == "preset":
+            raise ValueError("预设人物不能执行归档恢复。")
+        if not int(row["archived"] or 0):
+            return {"archived": False, "name": name}
+        if str(row["office_type"] or "") != "后宫":
+            character_limit = int(load_runtime_game().get("character_limit", 120))
+            current_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM characters WHERE archived = 0 AND office_type <> '后宫'"
+            ).fetchone()[0] or 0)
+            if current_count >= character_limit:
+                raise ValueError(
+                    f"本局朝臣人物已达上限 {character_limit} 人；恢复后也会进入名册与推演上下文。"
+                    "请先归档其他运行时朝臣，或在游戏设置中调高人物上限。"
+                )
+        self.conn.execute(
+            """
+            UPDATE characters
+            SET archived=0,
+                status_reason=replace(replace(status_reason, '；已归档，不再进入推演', ''), '已归档，不再进入推演', '')
+            WHERE name=?
+            """,
+            (name,),
+        )
+        self.conn.commit()
+        return {"archived": False, "name": name}
 
     def grant_skill(self, state: GameState, character_name: str, skill_id: str, granted_by: str = "皇帝") -> bool:
         exists = self.conn.execute(

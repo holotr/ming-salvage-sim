@@ -29,11 +29,11 @@ FISCAL_SCORE_FIELDS = ("corruption",)
 FISCAL_QUANTITY_FIELDS = (
     "grain_output", "grain_stock",
     "guan_min_tian", "wang_tian", "huang_tian", "tian_fu_li",
-    "liao_xiang", "salt_tax", "commerce_tax",
+    "liao_xiang_li", "salt_tax", "commerce_tax",
 )
 ARMY_SCORE_FIELDS = ("supply", "morale", "training", "equipment", "arrears", "mobility", "loyalty")
 ARMY_QUANTITY_FIELDS = ("manpower", "maintenance_per_turn")
-ARMY_TEXT_FIELDS = ("station", "commander", "controller", "troop_type", "status", "owner_power")
+ARMY_TEXT_FIELDS = ("name", "station", "commander", "controller", "troop_type", "troop_composition", "status", "owner_power")
 BUILDING_CATEGORIES = ("财政", "军事", "民生", "科技", "交通", "内廷")
 BUILDING_OUTPUT_METRICS = ("国库", "内库", "民心", "皇威", "")
 BUILDING_SCORE_FIELDS = ("condition", "risk")
@@ -127,15 +127,17 @@ REGION_FIELD_LABELS = {
     "wang_tian": "藩王庄田",
     "huang_tian": "皇庄",
     "tian_fu_li": "田赋亩率",
-    "liao_xiang": "辽饷基数",
+    "liao_xiang_li": "辽饷亩率",
     "salt_tax": "盐税基数",
     "commerce_tax": "商税基数",
 }
 ARMY_FIELD_LABELS = {
+    "name": "番号",
     "station": "驻扎地",
     "commander": "统帅",
     "controller": "主管",
     "troop_type": "兵种",
+    "troop_composition": "编制",
     "manpower": "人数",
     "maintenance_per_turn": "维护费",
     "supply": "补给",
@@ -172,9 +174,11 @@ REGION_FIELD_ALIASES = {
     "tian_fu_li": "tian_fu_li",
     "田赋亩率": "tian_fu_li",
     "亩率": "tian_fu_li",
-    "liao_xiang": "liao_xiang",
-    "辽饷基数": "liao_xiang",
-    "辽饷": "liao_xiang",
+    "liao_xiang_li": "liao_xiang_li",
+    "liao_xiang": "liao_xiang_li",
+    "辽饷亩率": "liao_xiang_li",
+    "辽饷基数": "liao_xiang_li",
+    "辽饷": "liao_xiang_li",
     "salt_tax": "salt_tax",
     "盐税基数": "salt_tax",
     "盐税": "salt_tax",
@@ -221,6 +225,7 @@ ARMY_FIELD_ALIASES = {
     "主管": "controller",
     "管辖": "controller",
     "兵种": "troop_type",
+    "编制": "troop_composition",
     "人数": "manpower",
     "兵力": "manpower",
     "维护费": "maintenance_per_turn",

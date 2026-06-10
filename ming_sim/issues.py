@@ -21,6 +21,7 @@ from ming_sim.constants import (
 from ming_sim.content import GameContent
 from ming_sim.context import victory_status
 from ming_sim.db import GameDB, infer_office_type_from_office, normalize_office
+from ming_sim.gating import evaluate_gate
 from ming_sim.flows import (
     ISSUE_METRIC_KEYS,
     ISSUE_METRIC_LOCK_CAPS,
@@ -323,6 +324,7 @@ def _apply_issue_buildings(
                     output_amount=int(op.get("output_amount", 0)),
                     status=str(op.get("status") or ""),
                     origin="issue",
+                    requires_tech=str(op.get("requires_tech") or ""),
                 )
                 applied.append({"action": "create", "building_id": bid,
                                  "name": str(op.get("name") or "")})
@@ -341,6 +343,13 @@ def _apply_issue_buildings(
                 print(f"[WARN] issue effect buildings: action 非法 '{action}'，跳过。")
         except Exception as exc:
             print(f"[WARN] issue effect buildings 落库失败：{exc}；op={op}")
+            # 程序拒绝了这次新建（含科技门控未解锁）→ 透出到明细让玩家知情，而非静默吞掉
+            applied.append({
+                "action": action or "create",
+                "name": str(op.get("name") or ""),
+                "rejected": True,
+                "note": str(exc)[:120],
+            })
     return applied
 
 
@@ -414,6 +423,25 @@ def _preset_override_new_issue(ni: Dict[str, object]) -> Dict[str, object]:
     merged["effect_on_resolve"] = dict(preset.effect_on_resolve)
     merged["effect_on_fail"] = dict(preset.effect_on_fail)
     return merged
+
+
+def _unmet_tech_prereqs(db: GameDB, ni: Dict[str, object]) -> List[str]:
+    """命中预设科技的 new_issue：检查 preset.requires 前置科技链是否全已研成。
+    requires 存前置科技 key → 转预设 name → 查 technologies 表。返回未满足的前置科技名（空=全满足）。"""
+    scope, preset = _find_preset_key(ni)
+    if scope != "technologies" or preset is None:
+        return []
+    requires = getattr(preset, "requires", None) or []
+    if not requires:
+        return []
+    pool = _ctx().preset_technologies
+    unmet: List[str] = []
+    for req_key in requires:
+        req_preset = pool.get(str(req_key).strip())
+        req_name = req_preset.name if req_preset is not None else str(req_key)
+        if not db.tech_unlocked(req_name):
+            unmet.append(req_name)
+    return unmet
 
 
 def _apply_issue_departments(
@@ -503,7 +531,7 @@ def _apply_issue_technologies(
 def _apply_issue_fiscal(db: GameDB, state: GameState, ops: object, reason: str) -> None:
     """落地 issue effect 里的 fiscal 段：调税 issue 结案时真改 region.fiscal。
     op：{tax:田赋/辽饷/盐税/商税, ratio:倍率, region_id?:省id(空=全国), region_name?}。
-    田赋走 scale_tian_fu，辽饷/盐税/商税走 apply_dynamic_fiscal_scale；全国调同步改 fiscal_config base。
+    田赋走 scale_tian_fu，辽饷/盐税/商税走 apply_dynamic_fiscal_scale。
     这是户部 adjust_tax 立项的唯一落库点——issue 成功才改账，失败/搁浅不动税。
     """
     if not isinstance(ops, list):
@@ -528,13 +556,6 @@ def _apply_issue_fiscal(db: GameDB, state: GameState, ops: object, reason: str) 
                 touched = db.scale_tian_fu(ratio, region_id)
             else:
                 touched = db.apply_dynamic_fiscal_scale(tax, ratio, region_id)
-            # 全国一刀切才同步 fiscal_config base（单省覆盖不动全局目录，否则全国账误随单省漂）。
-            if not region_id:
-                cfg = db.get_fiscal_config()
-                base_key = f"{tax}_base"
-                cur = cfg.get(base_key)
-                if cur is not None:
-                    db.set_fiscal_config(base_key, max(0, round(int(cur) * ratio)))
             scope = op.get("region_name") or ("全国" if not region_id else region_id)
             print(f"[issue_fiscal] {scope}{tax}×{ratio} 落库（{touched}省）：{reason}")
         except Exception as exc:
@@ -608,14 +629,29 @@ def make_issue_log_compactor(
 
 def issue_to_payload(row: sqlite3.Row, advances: List[sqlite3.Row]) -> Dict[str, object]:
     """喂给推演 agent 的事项精简视图：状态、进度、效果、完整推进日志。"""
+    def _advance_time(a: sqlite3.Row) -> Dict[str, object]:
+        turn = int(a["turn"])
+        keys = a.keys() if hasattr(a, "keys") else []
+        year = int(a["year"] or 0) if "year" in keys else 0
+        period = int(a["period"] or 0) if "period" in keys else 0
+        if year <= 0 or period <= 0:
+            month_index = 1627 * 12 + 10 + max(0, turn - 1)
+            year = month_index // 12
+            period = month_index % 12
+            if period == 0:
+                year -= 1
+                period = 12
+        return {"turn": turn, "year": year, "period": period, "time": f"{year}年{period}月"}
+
     keys = row.keys() if hasattr(row, "keys") else []
     resolve_cond = row["resolve_condition"] if "resolve_condition" in keys else ""
     fail_cond = row["fail_condition"] if "fail_condition" in keys else ""
     goal = (row["goal"] if "goal" in keys else "") or ""
+    assignee = (row["assignee"] if "assignee" in keys else "") or ""
     timeline = [
         {
             "id": int(a["id"]),
-            "turn": int(a["turn"]),
+            **_advance_time(a),
             "narrative": _compact_issue_log(a["narrative"]),
         }
         for a in advances
@@ -642,6 +678,17 @@ def issue_to_payload(row: sqlite3.Row, advances: List[sqlite3.Row]) -> Dict[str,
     }
     if goal.strip():
         payload["目标"] = goal.strip()
+    if assignee.strip():
+        payload["承办人"] = assignee.strip()
+    # 承办人授权：皇帝批了专款/生杀权后，承办人本月可自主推进（不必再下圣旨）。
+    budget_pool = float((row["budget_pool"] if "budget_pool" in keys else 0) or 0)
+    budget_source = str((row["budget_source"] if "budget_source" in keys else "") or "")
+    death_authority = int((row["death_authority"] if "death_authority" in keys else 0) or 0)
+    if budget_pool > 0 and budget_source in ("国库", "内库"):
+        payload["专款余额"] = round(budget_pool, 1)
+        payload["专款出库"] = budget_source
+    if death_authority:
+        payload["专断之权"] = True
     return payload
 
 
@@ -671,169 +718,21 @@ def _event_window_open(ev: Event, state: GameState) -> bool:
     return True
 
 
-_GATE_AGG_FUNCS = {
-    "max": max,
-    "min": min,
-    "sum": sum,
-    "avg": lambda xs: sum(xs) // max(1, len(xs)),
-}
-
-
-def _eval_gate_key(key: str, metrics: Dict[str, int], db: GameDB) -> Optional[int]:
-    """把 gate key 解析成一个 int 值。形式：
-      - 'metric_name'                           → metrics[key]
-      - 'region.<id>.<field>'                   → regions 表
-      - 'region.<id1>|<id2>|.<field>.<agg>'     → 多省聚合 (max/min/avg/sum)
-      - 'army.<id>.<field>' / 多军 + agg
-      - 'building.<id>.<field>' / 多建筑 + agg
-      - 'power.<id>.<field>' / 多 + agg
-      - 'class.<name>.<field>'                  → classes 表全国汇总 (region_id='')
-      - 'class.<name>@<region>.<field>'         → classes 表省级
-      - 'class.<name>@<r1>|<r2>|.<field>.<agg>' → 多省同阶级聚合
-    解析失败/数据缺失返回 None（gate 视为不通过，由调用方处理）。
-    """
-    if "." not in key:
-        if key in metrics:
-            return int(metrics[key])
-        return None
-    parts = key.split(".")
-    table = parts[0]
-    if table not in ("region", "army", "building", "power", "class", "faction"):
-        return None
-    # 末段可能是 agg，先抽出
-    agg = None
-    if parts[-1] in _GATE_AGG_FUNCS:
-        agg = parts[-1]
-        parts = parts[:-1]
-    if len(parts) < 3:
-        return None
-    field = parts[-1]
-    id_segment = ".".join(parts[1:-1])
-    if table == "class" and "@" in id_segment and "|" in id_segment.split("@", 1)[1]:
-        # 简写：class.<name>@<r1>|<r2>|<r3>.<field> → 展开成 [name@r1, name@r2, name@r3]
-        cname, rest = id_segment.split("@", 1)
-        ids = [f"{cname}@{r}" for r in rest.split("|") if r]
-    else:
-        ids = id_segment.split("|") if "|" in id_segment else [id_segment]
-        ids = [x for x in ids if x]
-    if not ids:
-        return None
-    # class 表的 id 是 name 或 name@region；其它表 id 就是行 id
-    values: List[int] = []
-    for cid in ids:
-        row = None
-        if table == "region":
-            if field in ("grain_output", "grain_stock"):
-                row = db.conn.execute(
-                    f"SELECT json_extract(fiscal,'$.{field}') FROM regions WHERE id = ?",
-                    (cid,),
-                ).fetchone()
-            else:
-                row = db.conn.execute(f"SELECT {field} FROM regions WHERE id = ?", (cid,)).fetchone()
-        elif table == "army":
-            row = db.conn.execute(f"SELECT {field} FROM armies WHERE id = ?", (cid,)).fetchone()
-        elif table == "building":
-            row = db.conn.execute(f"SELECT {field} FROM buildings WHERE id = ?", (cid,)).fetchone()
-        elif table == "power":
-            row = db.conn.execute(f"SELECT {field} FROM powers WHERE id = ?", (cid,)).fetchone()
-        elif table == "faction":
-            # factions 表主键是 name（中文，如 阉党），field 取 leverage/satisfaction
-            row = db.conn.execute(f"SELECT {field} FROM factions WHERE name = ?", (cid,)).fetchone()
-        elif table == "class":
-            if "@" in cid:
-                cname, rid = cid.split("@", 1)
-            else:
-                cname, rid = cid, ""
-            row = db.conn.execute(
-                f"SELECT {field} FROM classes WHERE name = ? AND region_id = ?",
-                (cname, rid),
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            values.append(int(row[0]))
-        except (TypeError, ValueError):
-            return None
-    if not values:
-        return None
-    if len(values) == 1:
-        return values[0]
-    if agg is None:
-        # 多 id 但没指明聚合 → 默认 min（最严苛，要全部满足）
-        agg = "min"
-    return _GATE_AGG_FUNCS[agg](values)
-
-
-def _eval_gate_key_str(key: str, db: GameDB) -> Optional[str]:
-    """取一个文本型字段值（如 region.<id>.controlled_by → 'ming'/'houjin'）。
-    仅支持单 id 的 region/army/power 文本字段；解析失败返回 None。
-    """
-    parts = key.split(".")
-    if len(parts) != 3:
-        return None
-    table, cid, field = parts
-    sql = {
-        "region": f"SELECT {field} FROM regions WHERE id = ?",
-        "army": f"SELECT {field} FROM armies WHERE id = ?",
-        "power": f"SELECT {field} FROM powers WHERE id = ?",
-    }.get(table)
-    if sql is None:
-        return None
-    row = db.conn.execute(sql, (cid,)).fetchone()
-    if row is None:
-        return None
-    return str(row[0])
-
-
-def _gate_passed(gate: Dict[str, str], metrics: Dict[str, int], db: GameDB) -> bool:
-    """trigger_gate 全部条件满足才返回 True。条件形如 '<=240'（数值）或 '==ming'（文本相等）。
-    key 形式见 _eval_gate_key。
-    """
-    for key, cond in gate.items():
-        cond = cond.strip()
-        # 文本相等：==<word> / !=<word>（RHS 非纯数字）
-        sm = re.match(r"^(==|!=)\s*(.+)$", cond)
-        if sm and not re.match(r"^-?\d+$", sm.group(2).strip()):
-            sop, sval = sm.group(1), sm.group(2).strip()
-            cur = _eval_gate_key_str(key, db)
-            if cur is None:
-                return False
-            if sop == "==" and cur != sval:
-                return False
-            if sop == "!=" and cur == sval:
-                return False
-            continue
-        m = re.match(r"^(>=|<=|>|<|==)\s*(-?\d+)$", cond)
-        if not m:
-            return False
-        op, num = m.group(1), int(m.group(2))
-        val = _eval_gate_key(key, metrics, db)
-        if val is None:
-            return False
-        if op == ">=" and not val >= num:
-            return False
-        if op == "<=" and not val <= num:
-            return False
-        if op == ">" and not val > num:
-            return False
-        if op == "<" and not val < num:
-            return False
-        if op == "==" and not val == num:
-            return False
-    return True
-
-
 def gather_candidate_events(state: GameState, db: GameDB) -> List[Event]:
     """程序筛选：历史锚定事件按 trigger 时间到点、seed 情势按 trigger_gate 达标，
     都排除已触发过的。返回的候选清单交推演 agent 因果判定是否真触发。"""
     c = _ctx()
     spawned = _spawned_event_refs(db)
     candidates: List[Event] = []
-    # 历史锚定 EVENTS：到点（含错过补出）即进候选
+    # 历史锚定 EVENTS：到点（含错过补出）即进候选；有 require 则须程序求值通过（可证伪前提）。
     for ev in c.events:
         if ev.id in spawned or ev.trigger_year <= 0:
             continue
         if not _event_window_open(ev, state):
+            continue
+        # require 不满足 → 跳过该 node（如袁崇焕不在辽东则斩毛文龙不浮现）。
+        # 无 require（历史既定型）短路，行为不变。
+        if ev.require and not evaluate_gate(ev.require, state.metrics, db):
             continue
         candidates.append(ev)
     # seed 情势：trigger_gate 阈值达标即进候选
@@ -845,7 +744,7 @@ def gather_candidate_events(state: GameState, db: GameDB) -> List[Event]:
             continue
         if not _event_window_open(ev, state):
             continue
-        if _gate_passed(ev.trigger_gate, state.metrics, db):
+        if evaluate_gate(ev.trigger_gate, state.metrics, db):
             candidates.append(ev)
     return candidates
 
@@ -862,12 +761,12 @@ def auto_trigger_seed_issues(state: GameState, db: GameDB) -> List[Dict[str, obj
         if not ev.auto_trigger:
             continue
         # trigger_gate 为空 = 开局即立的局势，只由 seed_opening_crises 立一次，绝不在此重立。
-        # （空 gate 会被 _gate_passed 判为恒真，必须显式排除，否则每回合都试图重立。）
+        # （空 gate 会被 evaluate_gate 判为恒真，必须显式排除，否则每回合都试图重立。）
         if not ev.trigger_gate:
             continue
         if not _event_window_open(ev, state):
             continue
-        if not _gate_passed(ev.trigger_gate, state.metrics, db):
+        if not evaluate_gate(ev.trigger_gate, state.metrics, db):
             continue
         if ev.event_type != "situation":
             # 非 situation（node/ending）不转 issue，仅记触发避免重复
@@ -931,6 +830,9 @@ def show_active_issues(db: GameDB) -> None:
         inertia = int(row["inertia"])
         ongoing_txt = _format_issue_ongoing(row["ongoing_effects"] or "{}")
         line_parts = [_format_inertia(inertia)]
+        assignee = str((row["assignee"] if "assignee" in row.keys() else "") or "").strip()
+        if assignee:
+            line_parts.append(f"承办：{assignee}")
         if ongoing_txt:
             line_parts.append(f"每{TURN_UNIT}固定：{ongoing_txt}")
         print(f"  {' | '.join(line_parts)}")
@@ -993,7 +895,10 @@ def event_to_issue(db: GameDB, state: GameState, ev: Event) -> Optional[int]:
         ongoing = {"metrics": {"皇威": 1}}
         inertia = +10
         polarity = "pos"
-    effect_resolve, effect_fail = _situation_terminal_effects(ev.kind, int(ev.severity), polarity)
+    # resolve 效果按 kind/severity 推缺省（所有 situation 都有达成回血）；
+    # fail 效果不推断——崩坏与否一律由事件 JSON 显式声明（effect_on_fail 非空才会崩）。
+    effect_resolve = _situation_resolve_effect(ev.kind, int(ev.severity), polarity)
+    effect_fail: Dict[str, object] = {}
     # 精调字段优先：合并自 opening_crises 的手调危机带 bar/ongoing/effect/meaning，直接用其值；
     # 缺省（0/空）则用上面按 severity/kind 推导的默认。
     if ev.bar_value:
@@ -1034,21 +939,14 @@ def event_to_issue(db: GameDB, state: GameState, ev: Event) -> Optional[int]:
         return None
 
 
-# 会崩坏的局势：人为可控、有明确「彻底失败」时刻——镇压不住/边镇沦陷/朝局崩坏。
-# 它们 bar 能跌到 0、status 转 failed 终结，落 effect_on_fail 一锤子永久重创。
-# 不在此集合的（天灾/饥荒等不可控天象、正面机遇）无失败态：bar 下限 1、永不 failed、
-# effect_on_fail 留空，伤害全靠 ongoing_effects 持续累积。db.advance_issue 据 effect_on_fail
-# 是否非空来判能否崩坏，故此处「会崩坏」与「非空 fail effect」必须一致。
-_COLLAPSIBLE_KINDS = frozenset({
-    "人祸", "兵变", "流寇", "民变", "抗税", "党争", "朝议", "外族", "边事",
-})
+def _situation_resolve_effect(kind: str, severity: int, polarity: str) -> Dict[str, object]:
+    """situation 达成（bar→100）的一锤子永久回血/加成。所有 situation 都有。
+    按 severity 推量级（轻 50 / 中 65 / 重 80），民心/皇威由 kind 倾向决定
+    （边事/外族偏皇威，灾害/民变偏民心，余者两者兼得）。
 
-
-def _situation_terminal_effects(kind: str, severity: int, polarity: str):
-    """situation 终结一锤子永久效果。按 severity 推量级（轻 50 / 中 65 / 重 80）。
-    resolve：达成（bar→100）落永久回血/加成，所有 situation 都有。
-    fail：仅「会崩坏」局势（_COLLAPSIBLE_KINDS）有，崩坏（bar→0）落永久重创，幅度重于回血。
-    民心/皇威由 kind 倾向决定（边事/外族偏皇威，灾害/民变偏民心，余者两者兼得）。"""
+    失败效果（effect_on_fail）不在此推断——崩坏与否一律由事件 JSON 显式声明
+    （effect_on_fail 非空=会崩坏，空=不崩，只靠 ongoing_effects 持续流血）。
+    见 db.advance_issue 的 can_collapse 判定。"""
     mag = 1 if severity < 55 else (2 if severity < 70 else 3)
     if kind in ("外族", "边事", "友邦", "归附", "盟约", "战机", "敌乱"):
         axis = "皇威"
@@ -1057,17 +955,14 @@ def _situation_terminal_effects(kind: str, severity: int, polarity: str):
     else:
         axis = "both"
 
-    def _metrics(amount: int) -> Dict[str, int]:
-        if axis == "both":
-            half = max(1, abs(amount) // 2)
-            s = 1 if amount > 0 else -1
-            return {"民心": s * half, "皇威": s * half}
-        return {axis: amount}
-
-    resolve_amt = (3 if polarity == "neg" else 4) * mag
-    effect_resolve = {"metrics": _metrics(resolve_amt)}
-    effect_fail = {"metrics": _metrics(-5 * mag)} if kind in _COLLAPSIBLE_KINDS else {}
-    return effect_resolve, effect_fail
+    amount = (3 if polarity == "neg" else 4) * mag
+    if axis == "both":
+        half = max(1, abs(amount) // 2)
+        s = 1 if amount > 0 else -1
+        metrics = {"民心": s * half, "皇威": s * half}
+    else:
+        metrics = {axis: amount}
+    return {"metrics": metrics}
 
 
 def _normalize_cancellable(raw: object) -> str:
@@ -1228,7 +1123,8 @@ _FALLBACK_BUILDING_CATEGORY = "民生"
 
 def _synth_resolve_effect_for_issue(db: GameDB, row: sqlite3.Row) -> Dict[str, object]:
     """大模型漏填实体时的兜底：按 issue 的 tags 题材，自动造一个最简实体落地段。
-    工程→建筑(region_hint 或默认京师 beizhili)、政治→部门、科技→科技。题材不属三类则返回空。
+    工程→建筑(region_hint 或默认京师 beizhili)、科技→科技。政治类改革/政策不自动落部门；
+    只有 effect_on_resolve 明确写 departments:create 或命中预设部门时才新设衙门。
     名称用 issue 标题。这是「推进时发现没有 effect_on_resolve 就生成一个」的程序保底。"""
     try:
         tags = json.loads(row["tags"] or "[]")
@@ -1248,8 +1144,6 @@ def _synth_resolve_effect_for_issue(db: GameDB, row: sqlite3.Row) -> Dict[str, o
             region = "beizhili"  # 京师，必存在，作兜底选址
         return {"buildings": [{"action": "create", "region_id": region, "name": title,
                                "category": _FALLBACK_BUILDING_CATEGORY, "maintenance": 1}]}
-    if entity == "departments":
-        return {"departments": [{"action": "create", "name": title, "authority_scope": "", "power": 50}]}
     if entity == "technologies":
         return {"technologies": [{"action": "create", "name": title, "category": "科技", "effect_summary": ""}]}
     return {}
@@ -1261,6 +1155,157 @@ def _effect_has_entity(effect: Dict[str, object]) -> bool:
         if isinstance(effect.get(seg), list) and effect.get(seg):
             return True
     return False
+
+
+def _issue_baseline_delta(row: sqlite3.Row) -> int:
+    """自动兜底用的本月基准推进量；承办人只改百分比，不直接给点数。"""
+    bar = int(row["bar_value"] or 0)
+    inertia = abs(int(row["inertia"] or 0))
+    duration = int((row["duration_turns"] if "duration_turns" in row.keys() else 0) or 0)
+    if inertia > 0:
+        return max(3, min(12, inertia))
+    if duration > 0:
+        return max(3, min(12, round(max(1, 100 - bar) / max(1, duration))))
+    return 6
+
+
+_ASSIGNEE_PCT_BASES = {
+    "ability": 1.6,
+    "loyalty": 0.6,
+    "integrity": 0.5,
+    "courage": 0.4,
+}
+
+
+_ASSIGNEE_DOMAIN_KEYWORDS = {
+    "stewardship": ("税", "赋", "饷", "银", "钱", "粮", "库", "财政", "财赋", "清丈", "盐", "商", "屯田", "漕", "工", "厂", "营造", "工程"),
+    "martial": ("军", "兵", "边", "辽", "饷", "练", "营", "将", "火器", "城防", "剿", "战", "守"),
+    "diplomacy": ("士林", "民心", "舆", "名望", "安抚", "劝", "赈", "科举", "教化", "盟", "使", "贡", "抚", "议和", "外", "蒙古", "朝鲜", "后金", "女真"),
+    "learning": ("学", "书院", "历", "法", "器", "工艺", "技术", "火器", "制造", "译", "医"),
+    "intrigue": ("情报", "密", "缉", "查", "案", "党", "阉", "锦衣", "东厂", "反间", "侦"),
+}
+
+
+def _issue_domain(row: sqlite3.Row) -> str:
+    text = " ".join(
+        str((row[key] if key in row.keys() else "") or "")
+        for key in ("title", "kind", "goal", "stage_text", "bar_good_meaning", "bar_bad_meaning")
+    )
+    for domain, keywords in _ASSIGNEE_DOMAIN_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return domain
+    return "stewardship"
+
+
+def _assignee_net_pct(
+    ability: int,
+    loyalty: int,
+    integrity: int,
+    courage: int,
+    domain_score: int = 50,
+) -> int:
+    """承办人百分比修正：50 为 0%；同帝国修正一样用带符号 net_pct 套基准增量。"""
+    pct = (
+        (domain_score - 50) * 1.3
+        + (ability - 50) * 0.7
+        + (loyalty - 50) * _ASSIGNEE_PCT_BASES["loyalty"]
+        + (integrity - 50) * _ASSIGNEE_PCT_BASES["integrity"]
+        + (courage - 50) * _ASSIGNEE_PCT_BASES["courage"]
+    )
+    return max(-80, min(80, round(pct)))
+
+
+def _apply_assignee_pct(base_delta: int, net_pct: int) -> int:
+    delta = round(GameDB.apply_legacy_pct(float(base_delta), int(net_pct)))
+    if delta == 0:
+        return 1 if base_delta >= 0 else -1
+    return delta
+
+
+def _auto_issue_delta_by_assignee(db: GameDB, row: sqlite3.Row) -> tuple[int, str]:
+    """LLM 漏抽/填 0 时的兜底：基准进度按帝国修正同款百分比公式折算。"""
+    assignee = str((row["assignee"] if "assignee" in row.keys() else "") or "").strip()
+    inertia = int(row["inertia"] or 0)
+    base_delta = _issue_baseline_delta(row)
+    if assignee:
+        ch = db.conn.execute(
+            """
+            SELECT name, office, office_type, status, ability, loyalty, integrity, courage,
+                   diplomacy, martial, stewardship, intrigue, learning
+            FROM characters WHERE name=?
+            """,
+            (assignee,),
+        ).fetchone()
+        if ch is None:
+            net_pct = -40
+            return _apply_assignee_pct(base_delta, net_pct), f"承办人{assignee}不在名册，承办修正{net_pct}%，责任无着，本月误期。"
+        if str(ch["status"]) != "active":
+            net_pct = -50
+            return _apply_assignee_pct(base_delta, net_pct), f"承办人{assignee}已非在朝，承办修正{net_pct}%，事项无人实办。"
+        ability = int(ch["ability"] or 50)
+        loyalty = int(ch["loyalty"] or 50)
+        integrity = int(ch["integrity"] or 50)
+        courage = int(ch["courage"] or 50)
+        domain = _issue_domain(row)
+        net_pct = _assignee_net_pct(ability, loyalty, integrity, courage, int(ch[domain] or 50))
+        delta = _apply_assignee_pct(base_delta, net_pct)
+        if net_pct >= 50:
+            tone = "才具卓异，调度有方"
+        elif net_pct >= 25:
+            tone = "能力出众，督办有力"
+        elif net_pct >= 0:
+            tone = "尚能胜任，诸司按令"
+        elif net_pct >= -25:
+            tone = "才具平平，进度打折"
+        elif net_pct >= -50:
+            tone = "能力不足，勉强维持"
+        else:
+            tone = "庸懦误事，部下推诿"
+        return delta, f"承办人{assignee}{tone}，基准{base_delta}按承办修正{net_pct}%折算。"
+    if inertia > 0:
+        return min(3, max(1, inertia)), "无专责承办，仍循既有势头小幅推进。"
+    if inertia < 0:
+        return max(-3, min(-1, inertia)), "无专责承办，局势按旧患自然转坏。"
+    return -1, "无专责承办，文移空转一月，事项轻微误期。"
+
+
+def _ensure_issue_monthly_motion(
+    db: GameDB,
+    state: GameState,
+    touched_ids: set,
+    applied_advances: List[Dict[str, object]],
+    compact_log: Callable[[object], str],
+) -> None:
+    """保证每条 active issue 每月有非 0 推进。模型漏条/填 0 时由程序补一条轻微变化。"""
+    for row in db.list_active_issues():
+        issue_id = int(row["id"])
+        if issue_id in touched_ids:
+            continue
+        delta, narrative = _auto_issue_delta_by_assignee(db, row)
+        if delta == 0:
+            delta = -1
+        new_row = db.advance_issue(
+            state,
+            issue_id,
+            trigger_kind="auto_assignee",
+            delta_bar=delta,
+            stage_text=str(row["stage_text"] or "")[:120],
+            narrative=compact_log(narrative),
+            metric_delta={},
+        )
+        if new_row is None:
+            continue
+        touched_ids.add(issue_id)
+        applied_advances.append({
+            "issue_id": issue_id,
+            "title": new_row["title"],
+            "from_value": int(new_row["bar_value"]) - delta,
+            "to_value": int(new_row["bar_value"]),
+            "stage_text": new_row["stage_text"],
+            "status": new_row["status"],
+            "narrative": narrative,
+            "auto_assignee": True,
+        })
 
 
 def apply_issue_tracker_output(
@@ -1282,7 +1327,26 @@ def apply_issue_tracker_output(
             issue_id = int(adv.get("issue_id"))
         except (TypeError, ValueError):
             continue
-        delta_bar = int(adv.get("delta_bar") or 0)
+        base_delta_bar = int(adv.get("delta_bar") or 0)
+        issue_row = db.conn.execute("SELECT * FROM issues WHERE id=?", (issue_id,)).fetchone()
+        if issue_row is None or issue_row["status"] != "active":
+            continue
+        # 承办人专款支取：本{TURN_UNIT}从该 issue 专款里花了多少（extractor 抽自邸报），
+        # 实扣指定库+减池（spend_issue_budget 内按库余额/池余额 clamp）。先于进度处理，
+        # 因为「只花钱无进度增量」（base_delta_bar==0）的情形也要落账扣款。
+        try:
+            budget_spent = float(adv.get("budget_spent") or 0)
+        except (TypeError, ValueError):
+            budget_spent = 0.0
+        budget_spent_actual = 0.0
+        if budget_spent > 0:
+            budget_spent_actual = db.spend_issue_budget(state, issue_id, budget_spent)
+        if base_delta_bar == 0:
+            continue
+        # 承办人影响已在推演侧（season_simulator 先叙事再定档）一次性计入档位，
+        # extractor 抽出的 delta_bar 即推演官按承办人专业能力+盘面推过的最终量；
+        # 这里不再叠第二道承办系数（否则档位区间被冲破，如 normal 落成 +11），只做 ±50 clamp。
+        delta_bar = max(-50, min(50, int(base_delta_bar)))
         inertia_delta = int(adv.get("inertia_delta") or 0)
         stage_text = str(adv.get("stage_text") or "")[:120]
         narrative = compact_log(adv.get("narrative") or "")
@@ -1305,6 +1369,7 @@ def apply_issue_tracker_output(
         if new_row is None:
             continue
         touched_ids.add(issue_id)
+        building_ops: List[Dict[str, object]] = []
         # 终结结算：bar 自然推到 100/0 触发的 resolved/failed，与 close_issues 一样落终结效果（含建筑）
         if new_row["status"] == "resolved":
             # 预设为底 + 本条推进现填覆盖（issue 立项时已带实体的用预设；空的用现填）。
@@ -1321,7 +1386,7 @@ def apply_issue_tracker_output(
             _apply_metric_dict(state, effect.get("metrics") or {}, db=db)
             _apply_economy_list(db, state, effect.get("economy") or [])
             _apply_faction_dict(db, effect.get("factions") or {})
-            _apply_issue_buildings(db, state, effect.get("buildings"), _ISSUE_PSEUDO_EVENT, f"局势#{issue_id}结案")
+            building_ops = _apply_issue_buildings(db, state, effect.get("buildings"), _ISSUE_PSEUDO_EVENT, f"局势#{issue_id}结案")
             _preset_lg = _apply_issue_departments(db, state, effect.get("departments"), f"局势#{issue_id}结案", issue_id)
             _preset_lg = _apply_issue_technologies(db, state, effect.get("technologies"), f"局势#{issue_id}结案", issue_id) or _preset_lg
             _apply_issue_fiscal(db, state, effect.get("fiscal"), f"局势#{issue_id}结案")
@@ -1333,16 +1398,20 @@ def apply_issue_tracker_output(
             _apply_metric_dict(state, effect.get("metrics") or {}, db=db)
             _apply_economy_list(db, state, effect.get("economy") or [])
             _apply_faction_dict(db, effect.get("factions") or {})
-            _apply_issue_buildings(db, state, effect.get("buildings"), _ISSUE_PSEUDO_EVENT, f"局势#{issue_id}失败")
+            building_ops = _apply_issue_buildings(db, state, effect.get("buildings"), _ISSUE_PSEUDO_EVENT, f"局势#{issue_id}失败")
             _spawn_legacy_from_effect(db, state, effect, issue_id, str(new_row["title"]))
         applied_advances.append({
             "issue_id": issue_id,
             "title": new_row["title"],
             "from_value": int(new_row["bar_value"]) - delta_bar,
             "to_value": int(new_row["bar_value"]),
+            "base_delta_bar": base_delta_bar,
+            "delta_bar": delta_bar,
             "stage_text": new_row["stage_text"],
             "status": new_row["status"],
             "narrative": narrative,
+            **({"building_ops": building_ops} if building_ops else {}),
+            **({"budget_spent": round(budget_spent_actual, 1)} if budget_spent_actual > 0 else {}),
         })
 
     # 2) new_issues：接两种来源——
@@ -1397,6 +1466,12 @@ def apply_issue_tracker_output(
         if kind == "initiative" and initiative_active >= 10:
             applied_new.append({"title": title, "rejected": True, "reason": "已有十事在办，朝廷分身乏术，难再添新工。"})
             continue
+        unmet = _unmet_tech_prereqs(db, ni)
+        if unmet:
+            reason_txt = f"前置科技未成：需先研成「{'、'.join(unmet)}」方可立此事"
+            print(f"[INFO] new_issue 已拒：'{title}'（{reason_txt}）")
+            applied_new.append({"title": title, "rejected": True, "reason": reason_txt})
+            continue
         try:
             issue_id = db.insert_issue(
                 state,
@@ -1422,6 +1497,7 @@ def apply_issue_tracker_output(
                 effect_on_fail=dict(ni.get("effect_on_fail") or {}),
                 resolve_condition=str(ni.get("resolve_condition") or "")[:300],
                 fail_condition=str(ni.get("fail_condition") or "")[:300],
+                assignee=str(ni.get("assignee") or ""),
             )
             decree_active += 1
             if kind == "initiative":
@@ -1449,7 +1525,7 @@ def apply_issue_tracker_output(
             db.advance_issue(
                 state, issue_id,
                 trigger_kind="decree",
-                delta_bar=0,
+                delta_bar=-2,
                 stage_text=row["stage_text"],
                 narrative=compact_log(cn.get("narrative") or "陛下欲罢，然此事非诏可消。"),
                 metric_delta={"皇威": -2},
@@ -1471,6 +1547,8 @@ def apply_issue_tracker_output(
         )
         touched_ids.add(issue_id)
         applied_cancels.append({"issue_id": issue_id, "rejected": False, "title": row["title"]})
+
+    _ensure_issue_monthly_motion(db, state, touched_ids, applied_advances, compact_log)
 
     state.clamp()
     return {
@@ -1588,6 +1666,16 @@ def apply_score_extraction(
     # 注：建筑的新建/变更/废止不走顶层字段，全由 issue 的 effect_on_resolve /
     #     effect_on_fail 里的 `buildings` 段在局势结案时落地（见 _apply_issue_buildings）。
 
+    # 4.5) arms_changes：军备总库叙事性增减（缴获/炸毁/采购）。建筑稳定月产由 flows 唯一变更，
+    #      extractor 不重复抽建筑产出；未列型号由 weapon_meta 动态归 tier 注册。
+    arms_changes_raw = extracted.get("arms_changes") or {}
+    arms_changes: List[Dict[str, object]] = []
+    if isinstance(arms_changes_raw, dict) and arms_changes_raw:
+        try:
+            arms_changes = db.apply_arms_stock_deltas(state, arms_changes_raw)
+        except Exception as exc:
+            print(f"[WARN] arms_changes 落库失败：{exc}")
+
     # 5) power_updates：非明势力三项简表（威望/实力/经济）落库
     power_updates_raw = extracted.get("power_updates") or {}
     power_changes: List[Dict[str, object]] = []
@@ -1606,8 +1694,8 @@ def apply_score_extraction(
         "cancels": extracted.get("cancels") or [],
     }, log_compactor=issue_log_compactor)
 
-    # 6.4) fiscal_removes：推演彻底裁撤月固定收支项（罢税/裁俸），优先级最高，先于 creates/changes。
-    #      含 dynamic（田赋/辽饷/盐税/商税/皇庄），后果玩家自负。删 base+rate 两行。
+    # 6.4) fiscal_removes：推演彻底裁撤 fiscal_config 中现存的月固定收支项，优先级最高。
+    #      田赋/辽饷/盐税/商税停征走 regions.fiscal 字段变化，不走删 base+rate。
     applied_fiscal_removes: List[Dict[str, object]] = []
     for remove in extracted.get("fiscal_removes") or []:
         key = str(remove.get("key") or "")
@@ -1746,6 +1834,7 @@ def apply_score_extraction(
             ch.status = status
             if status in {"dismissed", "imprisoned", "exiled", "retired", "dead"}:
                 ch.office = ""
+                ch.office_type = ""
         applied_status_changes.append({
             "name": name, "status": status, "reason": reason,
             **({"location": new_location} if new_location else {}),
@@ -1916,6 +2005,7 @@ def apply_score_extraction(
         "region_changes": region_changes,
         "army_changes": army_changes,
         "created_armies": created_armies,
+        "arms_changes": arms_changes,
         "power_changes": power_changes,
         "issue_summary": issue_summary,
         "world_advance": extracted.get("world_advance") or {},
@@ -2050,12 +2140,12 @@ def apply_issue_inertia_and_ongoing(
             db.conn.execute(
                 """
                 INSERT INTO issue_advances (
-                    issue_id, turn, trigger_kind, delta_bar,
+                    issue_id, turn, year, period, trigger_kind, delta_bar,
                     from_value, to_value, narrative, metric_delta
-                ) VALUES (?, ?, 'ongoing', 0, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'ongoing', 0, ?, ?, ?, ?)
                 """,
                 (
-                    issue_id, state.turn, bar, bar,
+                    issue_id, state.turn, state.year, state.period, bar, bar,
                     f"持续效果落账 (折扣 {int(scale*100)}%)",
                     json.dumps({"metrics": metric_part, "economy": economy_part}, ensure_ascii=False),
                 ),
@@ -2082,7 +2172,7 @@ def clear_gated_legacies(db: GameDB, state: GameState) -> List[str]:
             gate = {}
         if not gate:
             continue
-        if _gate_passed(gate, state.metrics, db):
+        if evaluate_gate(gate, state.metrics, db):
             db.conn.execute("UPDATE legacies SET status='cleared' WHERE id=?", (int(row["id"]),))
             cleared.append(str(row["name"]))
     if cleared:
@@ -2097,7 +2187,7 @@ def sync_opening_legacies(db: GameDB, state: GameState) -> None:
     - 未达标：该 legacy_key 不存在 active 行则 insert（永久 duration=-1，仅靠 gate 消除）。
     一个函数覆盖新档（全补）/旧档（补缺）/达标档（不补/清残）。"""
     for leg in _ctx().opening_legacies:
-        passed = _gate_passed(leg.clear_gate, state.metrics, db)
+        passed = evaluate_gate(leg.clear_gate, state.metrics, db)
         existing = db.conn.execute(
             "SELECT id FROM legacies WHERE legacy_key=? AND status='active'",
             (leg.key,),

@@ -244,6 +244,14 @@ def _start_server(port: int, debug: bool) -> None:
     并把错误存 _server_error 供主线程展示。"""
     global _server_error
     try:
+        # Agno initializes asyncio primitives at import time. In a non-main
+        # launcher thread Python may not have a current loop, especially in
+        # frozen pywebview builds, so create one before importing web_app.
+        import asyncio
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
         import uvicorn
         from web_app import app
         _log("web_app 导入成功，uvicorn.run 启动中...")

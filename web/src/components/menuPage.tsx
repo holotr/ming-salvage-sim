@@ -2,6 +2,7 @@ import React from "react";
 import { Loader2, Trash2 } from "lucide-react";
 import { api, apiUrl, normalizeApiError } from "../api";
 import type { MenuCampaign, MenuStatus } from "../types";
+import { ScenarioManagerModal } from "./scenarioManager";
 
 type LauncherLogInfo = {
   data_dir: string;
@@ -28,6 +29,7 @@ export function MenuPage({
   const [showSaveList, setShowSaveList] = React.useState(false);
   const [showGameSettings, setShowGameSettings] = React.useState(false);
   const [showDebugTools, setShowDebugTools] = React.useState(false);
+  const [showScenarios, setShowScenarios] = React.useState(false);
 
   const guard = async (label: string, fn: () => Promise<void>) => {
     setBusy(label);
@@ -97,6 +99,9 @@ export function MenuPage({
           <button className="menu-btn" disabled={!!busy} onClick={() => setShowGameSettings(true)}>
             游戏设置
           </button>
+          <button className="menu-btn" disabled={!!busy} onClick={() => setShowScenarios(true)}>
+            自定义剧本
+          </button>
           <button className="menu-btn" disabled={!!busy} onClick={() => setShowDebugTools(true)}>
             调试
           </button>
@@ -108,6 +113,9 @@ export function MenuPage({
             当前接口：{status.llm.base_url} · {status.llm.model}
           </div>
         )}
+        <div className="menu-llm-info">
+          当前剧本：{status?.active_scenario?.name ?? "默认（崇祯元年）"}
+        </div>
       </div>
 
       {showApiForm && (
@@ -149,6 +157,15 @@ export function MenuPage({
 
       {showDebugTools && (
         <DebugToolsModal onClose={() => setShowDebugTools(false)} />
+      )}
+
+      {showScenarios && (
+        <ScenarioManagerModal
+          onClose={() => setShowScenarios(false)}
+          onChanged={async () => {
+            await onRefresh();
+          }}
+        />
       )}
     </div>
   );
@@ -226,8 +243,18 @@ export function GameSettingsModal({
   initial?: {
     hitl_min_decisions: number;
     court_chat_debate_rounds?: number;
+    court_chat_stream_speed?: number;
     max_decree_issues?: number;
     issue_log_limit?: number;
+    secret_order_person_limit?: number;
+    secret_order_total_limit?: number;
+    character_limit?: number;
+    minister_temperature?: number;
+    minister_top_p?: number;
+    simulator_temperature?: number;
+    simulator_top_p?: number;
+    extractor_temperature?: number;
+    extractor_top_p?: number;
   };
   onClose: () => void;
   onSaved: () => Promise<void>;
@@ -238,11 +265,41 @@ export function GameSettingsModal({
   const [courtChatDebateRounds, setCourtChatDebateRounds] = React.useState<number>(
     initial?.court_chat_debate_rounds ?? 3
   );
+  const [courtChatStreamSpeed, setCourtChatStreamSpeed] = React.useState<number>(
+    initial?.court_chat_stream_speed ?? 3
+  );
   const [maxDecreeIssues, setMaxDecreeIssues] = React.useState<number>(
     initial?.max_decree_issues ?? 10
   );
   const [issueLogLimit, setIssueLogLimit] = React.useState<number>(
     initial?.issue_log_limit ?? 6
+  );
+  const [secretOrderPersonLimit, setSecretOrderPersonLimit] = React.useState<number>(
+    initial?.secret_order_person_limit ?? 1
+  );
+  const [secretOrderTotalLimit, setSecretOrderTotalLimit] = React.useState<number>(
+    initial?.secret_order_total_limit ?? 5
+  );
+  const [characterLimit, setCharacterLimit] = React.useState<number>(
+    initial?.character_limit ?? 120
+  );
+  const [ministerTemperature, setMinisterTemperature] = React.useState<number>(
+    initial?.minister_temperature ?? 0.6
+  );
+  const [ministerTopP, setMinisterTopP] = React.useState<number>(
+    initial?.minister_top_p ?? 0.9
+  );
+  const [simulatorTemperature, setSimulatorTemperature] = React.useState<number>(
+    initial?.simulator_temperature ?? 0.5
+  );
+  const [simulatorTopP, setSimulatorTopP] = React.useState<number>(
+    initial?.simulator_top_p ?? 0.5
+  );
+  const [extractorTemperature, setExtractorTemperature] = React.useState<number>(
+    initial?.extractor_temperature ?? 0.1
+  );
+  const [extractorTopP, setExtractorTopP] = React.useState<number>(
+    initial?.extractor_top_p ?? 0.1
   );
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState("");
@@ -257,8 +314,18 @@ export function GameSettingsModal({
         body: JSON.stringify({
           hitl_min_decisions: minDecisions,
           court_chat_debate_rounds: courtChatDebateRounds,
+          court_chat_stream_speed: courtChatStreamSpeed,
           max_decree_issues: maxDecreeIssues,
           issue_log_limit: issueLogLimit,
+          secret_order_person_limit: secretOrderPersonLimit,
+          secret_order_total_limit: secretOrderTotalLimit,
+          character_limit: characterLimit,
+          minister_temperature: ministerTemperature,
+          minister_top_p: ministerTopP,
+          simulator_temperature: simulatorTemperature,
+          simulator_top_p: simulatorTopP,
+          extractor_temperature: extractorTemperature,
+          extractor_top_p: extractorTopP,
         }),
       });
       await onSaved();
@@ -274,15 +341,15 @@ export function GameSettingsModal({
         <h2>游戏设置</h2>
         {err && <div className="menu-error">{err}</div>}
         <label>
-          每回合最多重大抉择数{" "}
+          每回合最多遇阻纠偏数{" "}
           <small className="menu-hint">
-            （月末推演最多弹几个需皇帝亲裁的决策点。0=关闭重大抉择；改动下一回合生效。）
+            （月末推演最多弹几个承办遇阻后的亲裁纠偏。0=关闭遇阻纠偏；改动下一回合生效。）
           </small>
           <select
             value={minDecisions}
             onChange={(e) => setMinDecisions(Number(e.target.value))}
           >
-            <option value={0}>0 · 关闭重大抉择</option>
+            <option value={0}>0 · 关闭遇阻纠偏</option>
             <option value={1}>1 · 每回合最多 1 个</option>
             <option value={2}>2 · 每回合最多 2 个</option>
             <option value={3}>3 · 每回合最多 3 个</option>
@@ -310,6 +377,22 @@ export function GameSettingsModal({
           </select>
         </label>
         <label>
+          朝会流式速度{" "}
+          <small className="menu-hint">
+            （控制朝会群臣文字逐段显示的默认速度。1=慢，3=默认，5=最快；朝会面板内可临时再调。）
+          </small>
+          <select
+            value={courtChatStreamSpeed}
+            onChange={(e) => setCourtChatStreamSpeed(Number(e.target.value))}
+          >
+            <option value={1}>1 · 慢</option>
+            <option value={2}>2 · 稍慢</option>
+            <option value={3}>3 · 默认</option>
+            <option value={4}>4 · 快</option>
+            <option value={5}>5 · 最快</option>
+          </select>
+        </label>
+        <label>
           decree 局势上限{" "}
           <small className="menu-hint">
             （皇帝手动新建与大模型从诏书抽取的 decree 来源局势，共用此 active 总上限。默认 10。
@@ -325,6 +408,120 @@ export function GameSettingsModal({
             <option value={25}>25 · 很多（token ↑↑↑）</option>
             <option value={30}>30 · 上限（token 大幅增加）</option>
           </select>
+        </label>
+        <label>
+          密令个人上限{" "}
+          <small className="menu-hint">
+            （同一承办人同时进行中的 active 密令数量。默认 1；调高会让单个大臣背更多暗线。）
+          </small>
+          <select
+            value={secretOrderPersonLimit}
+            onChange={(e) => setSecretOrderPersonLimit(Number(e.target.value))}
+          >
+            <option value={1}>1 · 默认</option>
+            <option value={2}>2 · 较忙</option>
+            <option value={3}>3 · 多线承办</option>
+            <option value={5}>5 · 重臣密办</option>
+            <option value={10}>10 · 上限</option>
+          </select>
+        </label>
+        <label>
+          密令总上限{" "}
+          <small className="menu-hint">
+            （全朝同时进行中的 active 密令总数。默认 5；调高会增加月末推演携带的密令盘面。）
+          </small>
+          <select
+            value={secretOrderTotalLimit}
+            onChange={(e) => setSecretOrderTotalLimit(Number(e.target.value))}
+          >
+            <option value={5}>5 · 默认</option>
+            <option value={8}>8 · 略增</option>
+            <option value={10}>10 · 较多</option>
+            <option value={15}>15 · 很多</option>
+            <option value={20}>20 · 密网</option>
+            <option value={50}>50 · 上限</option>
+          </select>
+        </label>
+        <label>
+          朝臣人物上限{" "}
+          <small className="menu-hint">
+            （本局未归档朝臣建档上限，后宫不计入。朝臣越多，大臣名册、召对背景与月末推演上下文越长，<b>token 消耗会增加。</b>）
+          </small>
+          <select
+            value={characterLimit}
+            onChange={(e) => setCharacterLimit(Number(e.target.value))}
+          >
+            <option value={80}>80 · 节省 token</option>
+            <option value={120}>120 · 默认</option>
+            <option value={160}>160 · 较多（token ↑）</option>
+            <option value={220}>220 · 很多（token ↑↑）</option>
+            <option value={300}>300 · 上限（token 大幅增加）</option>
+          </select>
+        </label>
+        <label>
+          Agent 采样参数{" "}
+          <small className="menu-hint">
+            （temperature / top_p，范围 0-1。默认沿用代码原值：大臣 0.6/0.9，推演 0.5/0.5，结算 0.1/0.1。）
+          </small>
+          <div className="agent-sampling-grid">
+            <span>大臣</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={ministerTemperature}
+              onChange={(e) => setMinisterTemperature(Number(e.target.value))}
+              aria-label="大臣 temperature"
+            />
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={ministerTopP}
+              onChange={(e) => setMinisterTopP(Number(e.target.value))}
+              aria-label="大臣 top_p"
+            />
+            <span>推演</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={simulatorTemperature}
+              onChange={(e) => setSimulatorTemperature(Number(e.target.value))}
+              aria-label="推演 temperature"
+            />
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={simulatorTopP}
+              onChange={(e) => setSimulatorTopP(Number(e.target.value))}
+              aria-label="推演 top_p"
+            />
+            <span>结算</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={extractorTemperature}
+              onChange={(e) => setExtractorTemperature(Number(e.target.value))}
+              aria-label="结算 temperature"
+            />
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={extractorTopP}
+              onChange={(e) => setExtractorTopP(Number(e.target.value))}
+              aria-label="结算 top_p"
+            />
+          </div>
         </label>
         <label>
           局势日志注入条数{" "}
