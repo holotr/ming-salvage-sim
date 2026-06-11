@@ -1243,15 +1243,12 @@ def extract_scores_by_modules_with_agno(
         secret_orders=secret_orders,
     )
     fiscal_cfg = base_payload.get("fiscal_config") if isinstance(base_payload.get("fiscal_config"), dict) else None
-    # 预分配容量，避免并发写入时 dict resize 竞争
-    module_inputs: Dict[str, object] = {m: None for m in EXTRACTION_MODULES}
     # sanitizer 是共享单实例，解析失败（小概率）才用；并行下加锁串行化这一步，避免并发调用同一 agent。
     sanitizer_lock = threading.Lock()
 
-    def _run_one(module: str) -> Dict[str, object]:
+    def _run_one(module: str) -> tuple[str, Dict[str, object], Dict[str, object]]:
         agent = agents[module]
         payload = _payload_for_module(base_payload, module)
-        module_inputs[module] = payload
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
         tlog(f"[extractor/{module}] user payload total={len(payload_json)} chars (~{len(payload_json)//1.5:.0f} tok)")
 
@@ -1276,7 +1273,8 @@ def extract_scores_by_modules_with_agno(
                         if isinstance(sanitizer_err, LLMUnavailable):
                             raise
                         raise parse_err
-                return _sanitize_module_output(module, parsed, fiscal_config=fiscal_cfg)
+                sanitized = _sanitize_module_output(module, parsed, fiscal_config=fiscal_cfg)
+                return module, payload, sanitized
             except LLMUnavailable:
                 # 超时/连接失败立即上抛，不重试
                 raise
@@ -1289,18 +1287,22 @@ def extract_scores_by_modules_with_agno(
                     raise
 
     module_outputs: Dict[str, Dict[str, object]] = {}
+    module_inputs: Dict[str, object] = {}
     first, rest = EXTRACTION_MODULES[0], EXTRACTION_MODULES[1:]
     # 1) 串行暖缓存：第 1 个模块单独跑，建好共享 system 前缀的 prompt 缓存。
     tlog(f"[extractor] 串行暖缓存 module={first}")
-    module_outputs[first] = _run_one(first)
+    module, payload, output = _run_one(first)
+    module_inputs[module] = payload
+    module_outputs[module] = output
     # 2) 并行：后 3 个模块共用已暖好的前缀缓存，并发命中。
     if rest:
         tlog(f"[extractor] 并行抽取 modules={list(rest)}")
         with ThreadPoolExecutor(max_workers=len(rest)) as pool:
             futures = {pool.submit(_run_one, m): m for m in rest}
             for fut in as_completed(futures):
-                m = futures[fut]
-                module_outputs[m] = fut.result()  # 子线程异常在此重抛，与串行同行为
+                module, payload, output = fut.result()
+                module_inputs[module] = payload
+                module_outputs[module] = output  # 子线程异常在此重抛，与串行同行为
     merged = _merge_module_outputs(module_outputs)
     merged = filter_unmentioned_personnel_changes(
         merged,

@@ -588,6 +588,16 @@ def apply_annual_population_flows(
 
 def apply_fixed_period_flows(db: GameDB, state: GameState) -> List[Dict[str, object]]:
     """月度财政 tick：固定收支（compute_budget_lines 定额）+ 军饷逐军 + 建筑逐项落账，LLM 推演前完成。"""
+    # 幂等性检查：避免读档重试时重复执行
+    check = db.conn.execute(
+        "SELECT COUNT(*) as cnt FROM economy_ledger WHERE turn = ? AND category IN ('田赋', '辽饷', '各军军饷')",
+        (state.turn,)
+    ).fetchone()
+    if check and check["cnt"] > 0:
+        from ming_sim.token_stats import tlog
+        tlog(f"[apply_fixed_period_flows] turn={state.turn} 已执行过，跳过（幂等）")
+        return []
+
     flows: List[Dict[str, object]] = []
 
     def _income(account: str, amount: int, category: str, reason: str) -> None:
