@@ -1271,7 +1271,10 @@ def extract_scores_by_modules_with_agno(
                     except LLMUnavailable:
                         raise  # sanitizer 超时直接上抛
                     except Exception as sanitizer_err:
+                        # sanitizer 也失败，但必须保留超时异常的优先级
                         tlog(f"[sanitizer/{module}] sanitizer 也失败：{sanitizer_err}；回退重试原 extractor")
+                        if isinstance(sanitizer_err, LLMUnavailable):
+                            raise
                         raise parse_err
                 return _sanitize_module_output(module, parsed, fiscal_config=fiscal_cfg)
             except LLMUnavailable:

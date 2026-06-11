@@ -271,6 +271,9 @@ def run_agent_stream_text(
         tlog(f"[{tag}] …{merged[-160:]}")
 
     streamed = "".join(pieces).strip()
+    # 检测流式截断：有内容但无终结事件
+    if pieces and final_output is None:
+        abort_llm_contract(tag, "流式有内容但无终结事件（可能被截断）", streamed[:200])
     if streamed:
         text = streamed
         fail_if_llm_error(text, "LLM 调用")
