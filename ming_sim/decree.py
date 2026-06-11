@@ -441,10 +441,18 @@ def _settle_after_narrative(
             relevant_memories=relevant_memories,
             secret_orders=secret_orders_for_sim,
         )
+    except LLMUnavailable:
+        # LLM 超时/不可用：直接抛出，让用户读档重来（固定财政等已落库但未推进回合）
+        raise
     except Exception as exc:
-        print(f"[WARN] 结算抽取失败：{exc}；本{TURN_UNIT}数值不变。")
-        extracted = {}
-        extractor_output = f"[抽取失败] {exc}"
+        # 其他异常（解析错误等）也应让用户读档，避免盲目推进造成状态不一致
+        print(f"[ERROR] 结算抽取失败：{exc}；需读档重试。")
+        from ming_sim.exceptions import LLMUnavailable as LLMUnavailableImport
+        raise LLMUnavailableImport(
+            f"结算抽取失败：{exc}",
+            code="extractor_failed",
+            provider_message=str(exc),
+        ) from exc
 
     tlog("结算 4/4 落库 + inertia/ongoing")
     _emit("stage", "落库与事项推进")
@@ -629,7 +637,7 @@ def _generate_ending_summary(
         }
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
         tlog(f"[ending-summary/INPUT] chapters={len(chapters)} ({len(payload_json)}字)")
-        summary_text = run_agent_text(ending_agent, payload_json, tag="ending-summary").strip()
+        summary_text = run_agent_stream_text(ending_agent, payload_json, tag="ending-summary").strip()
         tlog(f"[ending-summary/OUTPUT] ({len(summary_text)}字)")
     except Exception as exc:
         tlog(f"[ending-summary] LLM 失败，走保底：{exc}")

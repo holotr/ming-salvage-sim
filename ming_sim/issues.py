@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Optional
 from agno.agent import Agent
 from agno.db.sqlite import SqliteDb
 
-from ming_sim.agents import parse_agent_json, run_agent_text
+from ming_sim.agents import parse_agent_json, run_agent_stream_text
 from ming_sim.constants import (
     TURN_UNIT, REGION_SCORE_FIELDS, ARMY_SCORE_FIELDS, FISCAL_SCORE_FIELDS,
     REGION_FIELD_ALIASES, ARMY_FIELD_ALIASES, BUILDING_CATEGORIES,
@@ -611,7 +611,7 @@ def make_issue_log_compactor(
         if len(original) <= 80:
             return original
         try:
-            raw = run_agent_text(
+            raw = run_agent_stream_text(
                 agent,
                 json.dumps({"text": original}, ensure_ascii=False),
                 tag="issue-log-compact",

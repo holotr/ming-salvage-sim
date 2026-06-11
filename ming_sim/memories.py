@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from agno.agent import Agent
 
-from ming_sim.agents import run_agent_text
+from ming_sim.agents import run_agent_stream_text
 from ming_sim.assets import strip_json_fence
 from ming_sim.constants import TURN_UNIT
 from ming_sim.db import GameDB
@@ -240,7 +240,7 @@ def record_chapter_memory(
         }
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
         tlog(f"[chapter-memory/INPUT] turn={state.turn} ({len(payload_json)}字)")
-        raw = run_agent_text(agent, payload_json, tag="chapter-memory").strip()
+        raw = run_agent_stream_text(agent, payload_json, tag="chapter-memory").strip()
         tlog(f"[chapter-memory/OUTPUT] turn={state.turn} ({len(raw)}字):\n{raw}")
         body, tags = _parse_chapter_output(raw)
     except Exception as exc:
@@ -302,7 +302,7 @@ def record_minister_recaps(agent: Agent, db: GameDB, state: GameState) -> int:
                 ),
             }
             payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
-            raw = run_agent_text(agent, payload_json, tag="minister-recap").strip()
+            raw = run_agent_stream_text(agent, payload_json, tag="minister-recap").strip()
             recap = _parse_recap_output(raw)
             if not recap:
                 tlog(f"[minister-recap] {name} 纪要为空，跳过")

@@ -740,13 +740,13 @@ def generate_scenario_file(
     parse_agent_json 顶层须 object（事件是数组），此处拆封返回内层内容。
     解析彻底失败抛 LLMContractError，由调用方决定降级（标该文件 failed）。"""
     agent = create_scenario_generator_agent(llm_config, agno_db, target)
-    raw = run_agent_text(agent, user_prompt, tag=f"scenario-gen/{target}")
+    raw = run_agent_stream_text(agent, user_prompt, tag=f"scenario-gen/{target}")
     try:
         parsed = parse_agent_json(raw, f"剧本生成-{target}")
     except Exception as parse_err:
         tlog(f"[scenario-gen/{target}] 主输出解析失败：{parse_err}；调 sanitizer 重整")
         sanitizer = create_json_sanitizer_agent(llm_config, agno_db)
-        cleaned = run_agent_text(sanitizer, raw, tag=f"scenario-gen/{target}/sanitize")
+        cleaned = run_agent_stream_text(sanitizer, raw, tag=f"scenario-gen/{target}/sanitize")
         parsed = parse_agent_json(cleaned, f"剧本生成-{target}（sanitizer）")
     if not isinstance(parsed, dict) or "file" not in parsed:
         raise LLMContractError(f"剧本生成-{target}：输出缺顶层 file 键。")

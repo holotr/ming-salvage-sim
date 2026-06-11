@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -1242,27 +1243,42 @@ def extract_scores_by_modules_with_agno(
         secret_orders=secret_orders,
     )
     fiscal_cfg = base_payload.get("fiscal_config") if isinstance(base_payload.get("fiscal_config"), dict) else None
-    module_inputs: Dict[str, object] = {}
+    # 预分配容量，避免并发写入时 dict resize 竞争
+    module_inputs: Dict[str, object] = {m: None for m in EXTRACTION_MODULES}
     # sanitizer 是共享单实例，解析失败（小概率）才用；并行下加锁串行化这一步，避免并发调用同一 agent。
     sanitizer_lock = threading.Lock()
 
     def _run_one(module: str) -> Dict[str, object]:
         agent = agents[module]
         payload = _payload_for_module(base_payload, module)
-        module_inputs[module] = payload  # 各线程写不同 key，dict 单键赋值原子（GIL），安全
+        module_inputs[module] = payload
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=False)
         tlog(f"[extractor/{module}] user payload total={len(payload_json)} chars (~{len(payload_json)//1.5:.0f} tok)")
-        raw = run_agent_text(agent, payload_json, tag=f"extractor/{module}")
-        try:
-            parsed = parse_agent_json(raw, f"结算抽取-{module}")
-        except Exception as parse_err:
-            if sanitizer is None:
-                raise
-            tlog(f"[extractor/{module}] 主输出解析失败：{parse_err}；调 sanitizer 重整")
-            with sanitizer_lock:
-                cleaned = run_agent_text(sanitizer, raw, tag=f"sanitizer/{module}")
-            parsed = parse_agent_json(cleaned, f"结算抽取-{module}（sanitizer）")
-        return _sanitize_module_output(module, parsed, fiscal_config=fiscal_cfg)
+
+        for attempt in range(3):
+            try:
+                raw = run_agent_stream_text(agent, payload_json, tag=f"extractor/{module}")
+                try:
+                    parsed = parse_agent_json(raw, f"结算抽取-{module}")
+                except Exception as parse_err:
+                    if sanitizer is None:
+                        raise
+                    tlog(f"[extractor/{module}] 主输出解析失败：{parse_err}；调 sanitizer 重整")
+                    try:
+                        with sanitizer_lock:
+                            cleaned = run_agent_stream_text(sanitizer, raw, tag=f"sanitizer/{module}")
+                        parsed = parse_agent_json(cleaned, f"结算抽取-{module}（sanitizer）")
+                    except Exception as sanitizer_err:
+                        tlog(f"[sanitizer/{module}] sanitizer 也失败：{sanitizer_err}；回退重试原 extractor")
+                        raise parse_err
+                return _sanitize_module_output(module, parsed, fiscal_config=fiscal_cfg)
+            except Exception as exc:
+                if attempt < 2:
+                    tlog(f"[extractor/{module}] 失败（尝试 {attempt + 1}/3）：{exc}；重试中...")
+                    time.sleep(1)
+                else:
+                    tlog(f"[extractor/{module}] 3次尝试均失败：{exc}")
+                    raise
 
     module_outputs: Dict[str, Dict[str, object]] = {}
     first, rest = EXTRACTION_MODULES[0], EXTRACTION_MODULES[1:]
