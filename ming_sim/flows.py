@@ -588,9 +588,11 @@ def apply_annual_population_flows(
 
 def apply_fixed_period_flows(db: GameDB, state: GameState) -> List[Dict[str, object]]:
     """月度财政 tick：固定收支（compute_budget_lines 定额）+ 军饷逐军 + 建筑逐项落账，LLM 推演前完成。"""
-    # 幂等性检查：避免读档重试时重复执行
+    # 幂等性检查：economy_ledger 在固定收支时必定有田赋等记录（除非游戏设定全为0，极端情况）
+    # 这不是完全原子的，但实际单进程执行，读档有时间间隔，竞态窗口极小
     check = db.conn.execute(
-        "SELECT COUNT(*) as cnt FROM economy_ledger WHERE turn = ? AND category IN ('田赋', '辽饷', '各军军饷')",
+        """SELECT COUNT(*) as cnt FROM economy_ledger
+           WHERE turn = ? AND reason LIKE '%月入' OR reason LIKE '%月支'""",
         (state.turn,)
     ).fetchone()
     if check and check["cnt"] > 0:
