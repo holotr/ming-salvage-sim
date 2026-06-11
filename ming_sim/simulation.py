@@ -1268,10 +1268,15 @@ def extract_scores_by_modules_with_agno(
                         with sanitizer_lock:
                             cleaned = run_agent_stream_text(sanitizer, raw, tag=f"sanitizer/{module}")
                         parsed = parse_agent_json(cleaned, f"结算抽取-{module}（sanitizer）")
+                    except LLMUnavailable:
+                        raise  # sanitizer 超时直接上抛
                     except Exception as sanitizer_err:
                         tlog(f"[sanitizer/{module}] sanitizer 也失败：{sanitizer_err}；回退重试原 extractor")
                         raise parse_err
                 return _sanitize_module_output(module, parsed, fiscal_config=fiscal_cfg)
+            except LLMUnavailable:
+                # 超时/连接失败立即上抛，不重试
+                raise
             except Exception as exc:
                 if attempt < 2:
                     tlog(f"[extractor/{module}] 失败（尝试 {attempt + 1}/3）：{exc}；重试中...")

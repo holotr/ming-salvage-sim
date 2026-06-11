@@ -447,8 +447,7 @@ def _settle_after_narrative(
     except Exception as exc:
         # 其他异常（解析错误等）也应让用户读档，避免盲目推进造成状态不一致
         print(f"[ERROR] 结算抽取失败：{exc}；需读档重试。")
-        from ming_sim.exceptions import LLMUnavailable as LLMUnavailableImport
-        raise LLMUnavailableImport(
+        raise LLMUnavailable(
             f"结算抽取失败：{exc}",
             code="extractor_failed",
             provider_message=str(exc),
